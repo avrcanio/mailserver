@@ -13,6 +13,7 @@ docker-data/dms/mail-state/
 docker-data/dms/mail-logs/
 docker-data/dms/config/postfix-accounts.cf
 docker-data/dms/config/postfix-accounts.cf.bak
+docker-data/dms/config/dovecot-quotas.cf
 docker-data/dms/config/opendkim/keys/*
 !docker-data/dms/config/opendkim/keys/.gitkeep
 backups/*.tar.gz

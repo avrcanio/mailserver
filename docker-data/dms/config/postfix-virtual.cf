@@ -1,3 +1,5 @@
 # Aliases and forwarding entries are maintained via:
 #   ./scripts/mail.sh alias add <source> <destination>
 #   ./scripts/mail.sh relay add <source> <destination>
+abuse@finestar.hr avrcan@finestar.hr
+postmaster@finestar.hr avrcan@finestar.hr
