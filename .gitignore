@@ -1,5 +1,7 @@
 .env
 .env.local
+.codex
+AGENTS.md
 docker-data/certbot/secrets/*
 !docker-data/certbot/secrets/.gitkeep
 docker-data/certbot/certs/*

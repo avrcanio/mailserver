@@ -1,0 +1,2 @@
+mail._domainkey.qubitmdm.online qubitmdm.online:mail:/etc/opendkim/keys/qubitmdm.online/mail.private
+mail._domainkey.finestar.hr finestar.hr:mail:/etc/opendkim/keys/finestar.hr/mail.private

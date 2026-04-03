@@ -19,40 +19,37 @@ Traefik se ne koristi za mail promet. Mail portovi idu direktno na host.
 
 ## Brzi Start
 
-1. Kopiraj [`.env.example`](/opt/stacks/mailserver/.env.example) u `.env` i popuni stvarne vrijednosti.
-2. Kreiraj Cloudflare credentials file:
-
-```bash
-cat > docker-data/certbot/secrets/cloudflare.ini <<'EOF'
-dns_cloudflare_api_token = REPLACE_ME
-EOF
-chmod 600 docker-data/certbot/secrets/cloudflare.ini
-```
-
-3. Podigni stack:
+1. Kopiraj [`.env.example`](/opt/stacks/mailserver/.env.example) u `.env` i popuni stvarne vrijednosti, ukljucujuci `CLOUDFLARE_DNS_API_TOKEN`.
+2. Podigni stack:
 
 ```bash
 docker compose up -d
 ```
 
-4. Zatrazi prvi certifikat:
+3. Zatrazi prvi certifikat:
 
 ```bash
 ./scripts/certbot-renew.sh
 docker compose restart mailserver
 ```
 
-5. Generiraj DKIM kljuceve:
+4. Generiraj DKIM kljuceve:
 
 ```bash
 ./scripts/mail.sh config dkim
 ```
 
-6. Dodaj prvi mailbox:
+5. Dodaj prvi mailbox:
 
 ```bash
 ./scripts/mail.sh email add info@example.com 'StrongPasswordHere'
 ```
+
+Sigurnosna napomena:
+
+- `CLOUDFLARE_DNS_API_TOKEN` ostaje samo u lokalnom `.env`
+- token koji je vec bio javno podijeljen treba rotirati odmah nakon prvog uspjesnog izdavanja certifikata
+- `scripts/certbot-renew.sh` generira privremeni `cloudflare.ini` samo tijekom izvrsavanja i brise ga pri izlazu
 
 ## Upravljanje mailboxima
 
@@ -95,7 +92,7 @@ Napomena:
 
 ## Certifikati
 
-Certifikat se obnavlja preko helper skripte [scripts/certbot-renew.sh](/opt/stacks/mailserver/scripts/certbot-renew.sh). Nakon uspjesnog renewala restartaj `mailserver` da DMS ucita novi certifikat.
+Certifikat se obnavlja preko helper skripte [scripts/certbot-renew.sh](/opt/stacks/mailserver/scripts/certbot-renew.sh). Skripta cita Cloudflare token iz lokalnog `.env`, generira privremeni credentials file samo za trajanje certbot procesa i nakon uspjesnog renewala treba restartati `mailserver` da DMS ucita novi certifikat.
 
 Rucni poziv:
 
