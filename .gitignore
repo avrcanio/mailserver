@@ -1,0 +1,17 @@
+.env
+.env.local
+docker-data/certbot/secrets/*
+!docker-data/certbot/secrets/.gitkeep
+docker-data/certbot/certs/*
+!docker-data/certbot/certs/.gitkeep
+docker-data/certbot/logs/*
+!docker-data/certbot/logs/.gitkeep
+docker-data/dms/mail-data/
+docker-data/dms/mail-state/
+docker-data/dms/mail-logs/
+docker-data/dms/config/postfix-accounts.cf
+docker-data/dms/config/postfix-accounts.cf.bak
+docker-data/dms/config/opendkim/keys/*
+!docker-data/dms/config/opendkim/keys/.gitkeep
+backups/*.tar.gz
+backups/*.sha256

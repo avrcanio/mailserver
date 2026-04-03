@@ -1,0 +1,34 @@
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:15.1.0
+    container_name: mailserver
+    hostname: ${MAIL_HOSTNAME}
+    domainname: ${MAIL_DOMAIN}
+    env_file:
+      - ./mailserver.env
+    environment:
+      OVERRIDE_HOSTNAME: ${MAIL_HOSTNAME}
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS}
+      TZ: ${TZ}
+      SSL_CERT_PATH: /etc/letsencrypt/live/${MAIL_HOSTNAME}/fullchain.pem
+      SSL_KEY_PATH: /etc/letsencrypt/live/${MAIL_HOSTNAME}/privkey.pem
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - ./docker-data/dms/mail-data:/var/mail
+      - ./docker-data/dms/mail-state:/var/mail-state
+      - ./docker-data/dms/mail-logs:/var/log/mail
+      - ./docker-data/dms/config:/tmp/docker-mailserver
+      - ./docker-data/certbot/certs:/etc/letsencrypt
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test: "ss --listening --ipv4 --tcp | grep --silent ':smtp' || exit 1"
+      timeout: 3s
+      retries: 0
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    stop_grace_period: 1m
