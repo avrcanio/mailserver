@@ -18,3 +18,10 @@ docker-data/dms/config/opendkim/keys/*
 !docker-data/dms/config/opendkim/keys/.gitkeep
 backups/*.tar.gz
 backups/*.sha256
+import/Todo el correo, con Spam y Papelera incluidos-002.mbox
+import/takeout-20241203T164817Z-001.zip
+uzorita.hr.txt
+mailserver.env
+dalekopro.hr.txt
+docker-data/dms/config/opendkim/KeyTable
+docker-data/dms/config/opendkim/SigningTable
