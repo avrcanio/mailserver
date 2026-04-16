@@ -15,6 +15,13 @@ CSRF_TRUSTED_ORIGINS = [
 DATABASE_URL = os.environ["DATABASE_URL"]
 db_url = urlparse(DATABASE_URL)
 
+
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -90,3 +97,10 @@ MAILSERVER_CONTAINER_NAME = os.environ.get("MAILSERVER_CONTAINER_NAME", "mailser
 BLOCKLIST_REJECT_MESSAGE = os.environ.get("BLOCKLIST_REJECT_MESSAGE", "Blocked by local policy")
 MAIL_NOTIFY_HOOK_SECRET = os.environ.get("MAIL_NOTIFY_HOOK_SECRET", "")
 DEVICE_REGISTRATION_SECRET = os.environ.get("DEVICE_REGISTRATION_SECRET", "")
+MAIL_IMAP_HOST = os.environ.get("MAIL_IMAP_HOST", os.environ.get("MAIL_HOSTNAME", "mail.example.com"))
+MAIL_IMAP_PORT = int(os.environ.get("MAIL_IMAP_PORT", "993"))
+MAIL_IMAP_USE_SSL = env_bool("MAIL_IMAP_USE_SSL", True)
+MAIL_SMTP_HOST = os.environ.get("MAIL_SMTP_HOST", os.environ.get("MAIL_HOSTNAME", "mail.example.com"))
+MAIL_SMTP_PORT = int(os.environ.get("MAIL_SMTP_PORT", "587"))
+MAIL_SMTP_USE_STARTTLS = env_bool("MAIL_SMTP_USE_STARTTLS", True)
+MAIL_CLIENT_TIMEOUT_SECONDS = int(os.environ.get("MAIL_CLIENT_TIMEOUT_SECONDS", "15"))

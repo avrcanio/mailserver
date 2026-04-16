@@ -1,0 +1,330 @@
+import imaplib
+import re
+import socket
+import ssl
+from email.header import decode_header, make_header
+from email import policy
+from email.parser import BytesParser
+from email.utils import getaddresses, parsedate_to_datetime
+
+from django.conf import settings
+
+from .exceptions import MailAuthError, MailConnectionError, MailProtocolError, MailTimeoutError
+from .schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary, MailboxCredentials
+
+
+_LIST_RE = re.compile(rb'\((?P<flags>.*?)\)\s+"?(?P<delimiter>[^"\s]*)"?\s+(?P<name>.+)$')
+_UID_RE = re.compile(rb"\bUID\s+(\d+)\b", re.IGNORECASE)
+_SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)\b", re.IGNORECASE)
+_FLAGS_RE = re.compile(rb"\bFLAGS\s+\((.*?)\)", re.IGNORECASE)
+
+
+class ImapClient:
+    def __init__(self, host=None, port=None, use_ssl=None, timeout=None):
+        self.host = host or settings.MAIL_IMAP_HOST
+        self.port = int(port or settings.MAIL_IMAP_PORT)
+        self.use_ssl = settings.MAIL_IMAP_USE_SSL if use_ssl is None else use_ssl
+        self.timeout = int(timeout or settings.MAIL_CLIENT_TIMEOUT_SECONDS)
+        self.connection = None
+
+    def connect(self):
+        try:
+            if self.use_ssl:
+                context = ssl.create_default_context()
+                self.connection = imaplib.IMAP4_SSL(self.host, self.port, ssl_context=context, timeout=self.timeout)
+            else:
+                self.connection = imaplib.IMAP4(self.host, self.port, timeout=self.timeout)
+            return self
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out connecting to IMAP server {self.host}:{self.port}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"Could not connect to IMAP server {self.host}:{self.port}: {exc}") from exc
+
+    def login(self, credentials: MailboxCredentials):
+        connection = self._require_connection()
+        try:
+            status, data = connection.login(credentials.email, credentials.password)
+        except imaplib.IMAP4.error as exc:
+            raise MailAuthError("IMAP authentication failed") from exc
+        except socket.timeout as exc:
+            raise MailTimeoutError("Timed out during IMAP authentication") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP authentication connection failure: {exc}") from exc
+        if status != "OK":
+            detail = _decode_first(data)
+            raise MailAuthError(f"IMAP authentication failed: {detail}".rstrip(": "))
+        return self
+
+    def logout(self):
+        if self.connection is None:
+            return
+        try:
+            self.connection.logout()
+        except imaplib.IMAP4.error:
+            pass
+        finally:
+            self.connection = None
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.logout()
+
+    def list_folders(self):
+        connection = self._require_connection()
+        try:
+            status, data = connection.list()
+        except socket.timeout as exc:
+            raise MailTimeoutError("Timed out listing IMAP folders") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP folder listing connection failure: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError("IMAP folder listing failed") from exc
+        self._expect_ok(status, data, "IMAP folder listing failed")
+        return [_parse_folder(line) for line in data or [] if line]
+
+    def select_folder(self, folder="INBOX", readonly=True):
+        connection = self._require_connection()
+        try:
+            status, data = connection.select(folder, readonly=readonly)
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out selecting IMAP folder {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP folder selection connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP folder selection failed for {folder}") from exc
+        self._expect_ok(status, data, f"IMAP folder selection failed for {folder}")
+
+    def fetch_message_summaries(self, folder="INBOX", limit=50):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=True)
+        if limit < 1:
+            return []
+        try:
+            status, data = connection.uid("search", None, "ALL")
+            self._expect_ok(status, data, f"IMAP search failed for {folder}")
+            uids = (data[0] or b"").split()
+            selected_uids = list(reversed(uids[-limit:]))
+            summaries = []
+            for uid in selected_uids:
+                status, fetch_data = connection.uid(
+                    "fetch",
+                    uid,
+                    "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])",
+                )
+                self._expect_ok(status, fetch_data, f"IMAP summary fetch failed for UID {uid.decode()}")
+                summaries.append(_parse_summary_response(folder, uid.decode(), fetch_data))
+            return summaries
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching IMAP summaries for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP summary fetch connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP summary fetch failed for {folder}") from exc
+
+    def fetch_message_detail(self, folder, uid):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=True)
+        try:
+            status, data = connection.uid("fetch", str(uid), "(FLAGS RFC822.SIZE RFC822)")
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching IMAP message {uid}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP message fetch connection failure for UID {uid}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP message fetch failed for UID {uid}") from exc
+        self._expect_ok(status, data, f"IMAP message fetch failed for UID {uid}")
+        return _parse_detail_response(folder, str(uid), data)
+
+    def _require_connection(self):
+        if self.connection is None:
+            raise MailConnectionError("IMAP client is not connected")
+        return self.connection
+
+    @staticmethod
+    def _expect_ok(status, data, message):
+        if status != "OK":
+            detail = _decode_first(data)
+            raise MailProtocolError(f"{message}: {detail}".rstrip(": "))
+
+
+def _parse_folder(line):
+    raw = line if isinstance(line, bytes) else str(line).encode("utf-8")
+    match = _LIST_RE.search(raw)
+    if not match:
+        raise MailProtocolError(f"Could not parse IMAP folder line: {_safe_decode(raw)}")
+    flags = tuple(flag.lstrip("\\") for flag in _safe_decode(match.group("flags")).split() if flag)
+    delimiter_value = _safe_decode(match.group("delimiter"))
+    delimiter = None if delimiter_value.upper() == "NIL" else delimiter_value or None
+    name = _decode_mailbox_name(match.group("name"))
+    return MailFolderSummary(name=name, delimiter=delimiter, flags=flags)
+
+
+def _parse_summary_response(folder, fallback_uid, fetch_data):
+    try:
+        metadata, payload = _first_fetch_tuple(fetch_data)
+        message = BytesParser(policy=policy.default).parsebytes(payload or b"")
+        return MailMessageSummary(
+            uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
+            folder=folder,
+            subject=_header_value(message, "subject"),
+            sender=_header_value(message, "from"),
+            to=_address_header(_header_value(message, "to")),
+            cc=_address_header(_header_value(message, "cc")),
+            date=_parsed_date(_header_value(message, "date")),
+            message_id=_header_value(message, "message-id"),
+            flags=_parse_flags(metadata),
+            size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
+        )
+    except MailProtocolError:
+        raise
+    except Exception as exc:
+        raise MailProtocolError(f"Could not parse IMAP summary response: {exc}") from exc
+
+
+def _parse_detail_response(folder, fallback_uid, fetch_data):
+    try:
+        metadata, payload = _first_fetch_tuple(fetch_data)
+        message = BytesParser(policy=policy.default).parsebytes(payload or b"")
+        text_body, html_body, attachments = _extract_message_parts(message)
+        return MailMessageDetail(
+            uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
+            folder=folder,
+            subject=_header_value(message, "subject"),
+            sender=_header_value(message, "from"),
+            to=_address_header(_header_value(message, "to")),
+            cc=_address_header(_header_value(message, "cc")),
+            date=_parsed_date(_header_value(message, "date")),
+            message_id=_header_value(message, "message-id"),
+            flags=_parse_flags(metadata),
+            size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
+            text_body=text_body,
+            html_body=html_body,
+            attachments=tuple(attachments),
+        )
+    except MailProtocolError:
+        raise
+    except Exception as exc:
+        raise MailProtocolError(f"Could not parse IMAP message response: {exc}") from exc
+
+
+def _first_fetch_tuple(fetch_data):
+    for item in fetch_data or []:
+        if isinstance(item, tuple) and len(item) >= 2:
+            return item[0] or b"", item[1] or b""
+    raise MailProtocolError("IMAP fetch response did not include message data")
+
+
+def _extract_message_parts(message):
+    text_parts = []
+    html_parts = []
+    attachments = []
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        content_type = part.get_content_type()
+        disposition = part.get_content_disposition()
+        filename = part.get_filename()
+        if filename or disposition == "attachment":
+            attachments.append(
+                MailAttachmentSummary(
+                    filename=filename,
+                    content_type=content_type,
+                    size=_payload_size(part),
+                    disposition=disposition,
+                )
+            )
+            continue
+        if content_type == "text/plain":
+            text_parts.append(_part_content(part))
+        elif content_type == "text/html":
+            html_parts.append(_part_content(part))
+    return "\n".join(filter(None, text_parts)), "\n".join(filter(None, html_parts)), attachments
+
+
+def _part_content(part):
+    try:
+        return part.get_content()
+    except LookupError as exc:
+        raise MailProtocolError(f"Unsupported message charset: {exc}") from exc
+
+
+def _payload_size(part):
+    payload = part.get_payload(decode=True)
+    if payload is not None:
+        return len(payload)
+    raw_payload = part.get_payload()
+    if isinstance(raw_payload, str):
+        return len(raw_payload.encode(part.get_content_charset() or "utf-8", errors="replace"))
+    return None
+
+
+def _header_value(message, name):
+    value = message.get(name, "")
+    if value is None:
+        return ""
+    try:
+        return str(make_header(decode_header(str(value))))
+    except (LookupError, UnicodeError, ValueError) as exc:
+        raise MailProtocolError(f"Could not decode message header {name}: {exc}") from exc
+
+
+def _metadata_value(pattern, metadata):
+    match = pattern.search(metadata or b"")
+    if not match:
+        return None
+    return _safe_decode(match.group(1))
+
+
+def _parse_flags(metadata):
+    match = _FLAGS_RE.search(metadata or b"")
+    if not match:
+        return ()
+    return tuple(flag.lstrip("\\") for flag in _safe_decode(match.group(1)).split() if flag)
+
+
+def _address_header(value):
+    if not value:
+        return ()
+    return tuple(address for _, address in getaddresses([value]) if address)
+
+
+def _parsed_date(value):
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _decode_first(data):
+    if not data:
+        return ""
+    return _safe_decode(data[0])
+
+
+def _decode_mailbox_name(value):
+    decoded = _safe_decode(value).strip()
+    if decoded.startswith('"') and decoded.endswith('"'):
+        return decoded[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return decoded
+
+
+def _safe_decode(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
