@@ -27,6 +27,11 @@ class MailboxService:
             client.login(credentials)
             return client.fetch_message_detail(folder=folder, uid=uid)
 
+    def get_attachment(self, credentials, folder, uid, attachment_id):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.fetch_attachment(folder=folder, uid=uid, attachment_id=attachment_id)
+
     def move_messages_to_trash(self, credentials, folder, uids):
         with self.imap_client_factory() as client:
             client.login(credentials)

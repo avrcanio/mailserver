@@ -9,9 +9,10 @@ from email.utils import getaddresses, parsedate_to_datetime
 
 from django.conf import settings
 
-from .exceptions import MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailTimeoutError
+from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailTimeoutError
 from .schemas import (
     MailAttachmentSummary,
+    MailAttachmentContent,
     MailFolderSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
@@ -145,6 +146,18 @@ class ImapClient:
             raise MailProtocolError(f"IMAP summary fetch failed for {folder}") from exc
 
     def fetch_message_detail(self, folder, uid):
+        metadata, message = self._fetch_full_message(folder, uid)
+        return _parse_detail_message(folder, str(uid), metadata, message)
+
+    def fetch_attachment(self, folder, uid, attachment_id):
+        metadata, message = self._fetch_full_message(folder, uid)
+        attachments = _extract_attachments(message)
+        for attachment in attachments:
+            if attachment.summary.id == attachment_id:
+                return attachment
+        raise MailAttachmentNotFoundError(f"Attachment {attachment_id} was not found")
+
+    def _fetch_full_message(self, folder, uid):
         connection = self._require_connection()
         self.select_folder(folder, readonly=True)
         try:
@@ -156,7 +169,11 @@ class ImapClient:
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP message fetch failed for UID {uid}") from exc
         self._expect_ok(status, data, f"IMAP message fetch failed for UID {uid}")
-        return _parse_detail_response(folder, str(uid), data)
+        metadata, payload = _first_fetch_tuple(data)
+        try:
+            return metadata, BytesParser(policy=policy.default).parsebytes(payload or b"")
+        except Exception as exc:
+            raise MailProtocolError(f"Could not parse IMAP message response: {exc}") from exc
 
     def move_messages_to_trash(self, folder, uids):
         connection = self._require_connection()
@@ -292,26 +309,30 @@ def _parse_detail_response(folder, fallback_uid, fetch_data):
     try:
         metadata, payload = _first_fetch_tuple(fetch_data)
         message = BytesParser(policy=policy.default).parsebytes(payload or b"")
-        text_body, html_body, attachments = _extract_message_parts(message)
-        return MailMessageDetail(
-            uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
-            folder=folder,
-            subject=_header_value(message, "subject"),
-            sender=_header_value(message, "from"),
-            to=_address_header(_header_value(message, "to")),
-            cc=_address_header(_header_value(message, "cc")),
-            date=_parsed_date(_header_value(message, "date")),
-            message_id=_header_value(message, "message-id"),
-            flags=_parse_flags(metadata),
-            size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
-            text_body=text_body,
-            html_body=html_body,
-            attachments=tuple(attachments),
-        )
+        return _parse_detail_message(folder, fallback_uid, metadata, message)
     except MailProtocolError:
         raise
     except Exception as exc:
         raise MailProtocolError(f"Could not parse IMAP message response: {exc}") from exc
+
+
+def _parse_detail_message(folder, fallback_uid, metadata, message):
+    text_body, html_body, attachments = _extract_message_parts(message)
+    return MailMessageDetail(
+        uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
+        folder=folder,
+        subject=_header_value(message, "subject"),
+        sender=_header_value(message, "from"),
+        to=_address_header(_header_value(message, "to")),
+        cc=_address_header(_header_value(message, "cc")),
+        date=_parsed_date(_header_value(message, "date")),
+        message_id=_header_value(message, "message-id"),
+        flags=_parse_flags(metadata),
+        size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
+        text_body=text_body,
+        html_body=html_body,
+        attachments=tuple(attachment.summary for attachment in attachments),
+    )
 
 
 def _first_fetch_tuple(fetch_data):
@@ -324,7 +345,7 @@ def _first_fetch_tuple(fetch_data):
 def _extract_message_parts(message):
     text_parts = []
     html_parts = []
-    attachments = []
+    attachments = _extract_attachments(message)
     parts = message.walk() if message.is_multipart() else [message]
     for part in parts:
         if part.is_multipart():
@@ -332,21 +353,44 @@ def _extract_message_parts(message):
         content_type = part.get_content_type()
         disposition = part.get_content_disposition()
         filename = part.get_filename()
-        if filename or disposition == "attachment":
-            attachments.append(
-                MailAttachmentSummary(
-                    filename=filename,
-                    content_type=content_type,
-                    size=_payload_size(part),
-                    disposition=disposition,
-                )
-            )
+        if _is_attachment_part(filename, disposition):
             continue
         if content_type == "text/plain":
             text_parts.append(_part_content(part))
         elif content_type == "text/html":
             html_parts.append(_part_content(part))
     return "\n".join(filter(None, text_parts)), "\n".join(filter(None, html_parts)), attachments
+
+
+def _extract_attachments(message):
+    attachments = []
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        filename = part.get_filename()
+        if not _is_attachment_part(filename, disposition):
+            continue
+        content = part.get_payload(decode=True) or b""
+        attachments.append(
+            MailAttachmentContent(
+                summary=MailAttachmentSummary(
+                    id=f"att_{len(attachments) + 1}",
+                    filename=filename,
+                    content_type=part.get_content_type(),
+                    size=len(content),
+                    disposition=disposition,
+                    is_inline=disposition == "inline",
+                ),
+                content=content,
+            )
+        )
+    return attachments
+
+
+def _is_attachment_part(filename, disposition):
+    return bool(filename) or disposition in {"attachment", "inline"}
 
 
 def _part_content(part):

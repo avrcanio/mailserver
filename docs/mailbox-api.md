@@ -152,15 +152,30 @@ Response:
     "html_body": "<p>HTML body</p>",
     "attachments": [
       {
+        "id": "att_1",
         "filename": "report.pdf",
         "content_type": "application/pdf",
         "size": 12345,
-        "disposition": "attachment"
+        "disposition": "attachment",
+        "is_inline": false
       }
     ]
   }
 }
 ```
+
+## Attachments
+
+Message detail includes attachment metadata with stable per-message IDs such as `att_1`, `att_2`, in MIME traversal order.
+
+`GET /api/mail/messages/42/attachments/att_1?folder=INBOX`
+
+Response is binary attachment content. The backend sets `Content-Type` from the MIME part and `Content-Disposition` with the filename when available.
+
+Attachment download errors:
+
+- missing or blank `folder`: `400 {"error": "invalid_folder"}`
+- unknown attachment ID: `404 {"error": "attachment_not_found"}`
 
 ## Delete
 
@@ -295,6 +310,24 @@ Request:
 ```
 
 Recipient fields accept either plain addresses such as `recipient@example.com` or mailbox-formatted values such as `Recipient Name <recipient@example.com>`. The backend normalizes them to one email address per item before sending. `Bcc` recipients are used only in the SMTP envelope and are not exposed in email headers.
+
+For attachments, send `multipart/form-data` to the same endpoint. Text fields keep the same names, and files use repeated `attachments` parts:
+
+```http
+POST /api/mail/send
+Content-Type: multipart/form-data
+Authorization: Token drf-token-key
+```
+
+```text
+to=recipient@example.com
+subject=Status
+text_body=Plain body
+attachments=@report.pdf
+attachments=@photo.jpg
+```
+
+Multipart recipient fields may be repeated, or `to`, `cc`, and `bcc` may contain comma-separated address values. Attachment limits are 10 MB per file and 25 MB total per send request. Oversized files return `attachment_too_large`; oversized total payloads return `attachments_too_large`.
 
 Response:
 

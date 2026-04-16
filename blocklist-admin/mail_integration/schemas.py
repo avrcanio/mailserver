@@ -17,10 +17,18 @@ class MailFolderSummary:
 
 @dataclass(frozen=True)
 class MailAttachmentSummary:
+    id: str
     filename: str | None
     content_type: str
     size: int | None = None
     disposition: str | None = None
+    is_inline: bool = False
+
+
+@dataclass(frozen=True)
+class MailAttachmentContent:
+    summary: MailAttachmentSummary
+    content: bytes
 
 
 @dataclass(frozen=True)
@@ -92,3 +100,11 @@ class SendMailRequest:
     bcc: tuple[str, ...] = field(default_factory=tuple)
     reply_to: str | None = None
     from_display_name: str = ""
+    attachments: tuple["SendMailAttachment", ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class SendMailAttachment:
+    filename: str
+    content_type: str
+    content: bytes

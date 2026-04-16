@@ -80,10 +80,12 @@ class FolderSerializer(serializers.Serializer):
 
 
 class AttachmentSerializer(serializers.Serializer):
+    id = serializers.CharField()
     filename = serializers.CharField(allow_null=True, required=False)
     content_type = serializers.CharField()
     size = serializers.IntegerField(allow_null=True, required=False)
     disposition = serializers.CharField(allow_null=True, required=False)
+    is_inline = serializers.BooleanField()
 
 
 class MessageSummarySerializer(serializers.Serializer):
@@ -144,6 +146,10 @@ class SendMailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     status = serializers.CharField()
     message_id = serializers.CharField(allow_null=True)
+
+
+class SendMailMultipartRequestSerializer(SendMailRequestSerializer):
+    attachments = serializers.ListField(child=serializers.FileField(), required=False)
 
 
 class DeleteMessagesRequestSerializer(serializers.Serializer):

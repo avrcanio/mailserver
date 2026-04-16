@@ -6,14 +6,16 @@ from unittest.mock import Mock, patch
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
-from mail_integration.exceptions import MailAuthError, MailConnectionError, MailInvalidOperationError, MailSendError
+from mail_integration.exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailSendError
 from mail_integration.schemas import (
+    MailAttachmentContent,
     MailAttachmentSummary,
     MailFolderSummary,
     MailMessageDetail,
@@ -370,10 +372,12 @@ class MailApiTests(TestCase):
             html_body="<p>HTML body</p>",
             attachments=(
                 MailAttachmentSummary(
+                    id="att_1",
                     filename="report.pdf",
                     content_type="application/pdf",
                     size=12345,
                     disposition="attachment",
+                    is_inline=False,
                 ),
             ),
         )
@@ -385,7 +389,9 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["message"]["uid"], "42")
         self.assertEqual(payload["message"]["text_body"], "Plain body")
         self.assertEqual(payload["message"]["html_body"], "<p>HTML body</p>")
+        self.assertEqual(payload["message"]["attachments"][0]["id"], "att_1")
         self.assertEqual(payload["message"]["attachments"][0]["filename"], "report.pdf")
+        self.assertFalse(payload["message"]["attachments"][0]["is_inline"])
         credentials = service.get_message_detail.call_args.args[0]
         self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(service.get_message_detail.call_args.kwargs, {"folder": "INBOX", "uid": "42"})
@@ -399,6 +405,48 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"], "mail_connection_failed")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_attachment_download_returns_binary_response(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.get_attachment.return_value = MailAttachmentContent(
+            summary=MailAttachmentSummary(
+                id="att_1",
+                filename="report.pdf",
+                content_type="application/pdf",
+                size=11,
+                disposition="attachment",
+                is_inline=False,
+            ),
+            content=b"pdf content",
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_attachment", kwargs={"uid": "42", "attachment_id": "att_1"}), {"folder": "INBOX"}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"pdf content")
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn("report.pdf", response["Content-Disposition"])
+        credentials = service.get_attachment.call_args.args[0]
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(service.get_attachment.call_args.kwargs, {"folder": "INBOX", "uid": "42", "attachment_id": "att_1"})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_attachment_download_validates_folder_and_not_found(self, service_class):
+        headers = self.auth_headers()
+        missing_folder = self.client.get(reverse("mailops:api_mail_attachment", kwargs={"uid": "42", "attachment_id": "att_1"}), **headers)
+        service_class.return_value.get_attachment.side_effect = MailAttachmentNotFoundError("missing")
+        missing_attachment = self.client.get(
+            reverse("mailops:api_mail_attachment", kwargs={"uid": "42", "attachment_id": "att_99"}),
+            {"folder": "INBOX"},
+            **headers,
+        )
+
+        self.assertEqual(missing_folder.status_code, 400)
+        self.assertEqual(missing_folder.json()["error"], "invalid_folder")
+        self.assertEqual(missing_attachment.status_code, 404)
+        self.assertEqual(missing_attachment.json()["error"], "attachment_not_found")
 
     @patch("mailops.api.MailboxService")
     def test_mail_messages_delete_batch_returns_move_result(self, service_class):
@@ -720,6 +768,60 @@ class MailApiTests(TestCase):
         self.assertEqual(request.text_body, "Plain body")
         self.assertEqual(request.html_body, "<p>HTML body</p>")
         self.assertEqual(request.from_display_name, "Sender Name")
+        self.assertEqual(request.attachments, ())
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_accepts_multipart_attachments(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.send_mail.return_value = "<sent@example.com>"
+        attachment = SimpleUploadedFile("report.txt", b"report content", content_type="text/plain")
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={
+                "to": "Recipient Name <to@example.com>",
+                "cc": "copy@example.com, other@example.com",
+                "subject": "Status",
+                "text_body": "Plain body",
+                "attachments": attachment,
+            },
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        request = service.send_mail.call_args.args[1]
+        self.assertEqual(request.to, ("to@example.com",))
+        self.assertEqual(request.cc, ("copy@example.com", "other@example.com"))
+        self.assertEqual(len(request.attachments), 1)
+        self.assertEqual(request.attachments[0].filename, "report.txt")
+        self.assertEqual(request.attachments[0].content_type, "text/plain")
+        self.assertEqual(request.attachments[0].content, b"report content")
+
+    def test_mail_send_rejects_oversized_multipart_attachments(self):
+        headers = self.auth_headers()
+        with override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=40 * 1024 * 1024):
+            too_large = SimpleUploadedFile("large.bin", b"x" * (10 * 1024 * 1024 + 1), content_type="application/octet-stream")
+            single_response = self.client.post(
+                reverse("mailops:api_mail_send"),
+                data={"to": "to@example.com", "subject": "Hi", "text_body": "Body", "attachments": too_large},
+                **headers,
+            )
+
+            files = [
+                SimpleUploadedFile(f"part-{index}.bin", b"x" * (6 * 1024 * 1024), content_type="application/octet-stream")
+                for index in range(5)
+            ]
+            total_response = self.client.post(
+                reverse("mailops:api_mail_send"),
+                data={"to": "to@example.com", "subject": "Hi", "text_body": "Body", "attachments": files},
+                **headers,
+            )
+
+        self.assertEqual(single_response.status_code, 400)
+        self.assertEqual(single_response.json()["error"], "attachment_too_large")
+        self.assertEqual(total_response.status_code, 400)
+        self.assertEqual(total_response.json()["error"], "attachments_too_large")
 
     def test_mail_send_normalizes_display_name_recipients_and_rejects_invalid_addresses(self):
         headers = self.auth_headers()
@@ -813,6 +915,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/{uid}/delete")
         self.assertContains(schema, "/api/mail/messages/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/restore")
+        self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/mail/new/")

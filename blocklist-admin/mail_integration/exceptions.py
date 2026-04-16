@@ -22,5 +22,9 @@ class MailInvalidOperationError(MailIntegrationError):
     """Raised when a requested mailbox operation is intentionally unsupported."""
 
 
+class MailAttachmentNotFoundError(MailIntegrationError):
+    """Raised when a requested message attachment cannot be found."""
+
+
 class MailSendError(MailIntegrationError):
     """Raised when SMTP accepts a connection but fails to send mail."""

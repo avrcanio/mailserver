@@ -108,6 +108,16 @@ def build_email_message(from_email, request: SendMailRequest):
         message.set_content(request.html_body, subtype="html")
     else:
         message.set_content(request.text_body)
+    for attachment in request.attachments:
+        maintype, _, subtype = attachment.content_type.partition("/")
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+        message.add_attachment(
+            attachment.content,
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.filename,
+        )
     return message
 
 

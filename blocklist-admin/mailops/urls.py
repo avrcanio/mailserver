@@ -18,6 +18,7 @@ urlpatterns = [
     path("api/mail/messages/restore", api.RestoreMessagesView.as_view(), name="api_mail_messages_restore"),
     path("api/mail/messages/<str:uid>/delete", api.DeleteMessageView.as_view(), name="api_mail_message_delete"),
     path("api/mail/messages/<str:uid>/restore", api.RestoreMessageView.as_view(), name="api_mail_message_restore"),
+    path("api/mail/messages/<str:uid>/attachments/<str:attachment_id>", api.AttachmentDownloadView.as_view(), name="api_mail_attachment"),
     path("api/mail/messages/<str:uid>", api.MessageDetailView.as_view(), name="api_mail_message_detail"),
     path("api/mail/send", api.SendMailView.as_view(), name="api_mail_send"),
     path("api/devices/", api.DeviceRegistrationView.as_view(), name="register_device"),

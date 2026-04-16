@@ -1,15 +1,21 @@
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from email.utils import getaddresses
+
+from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.http import HttpResponse
+from django.utils.http import content_disposition_header
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from mail_integration.exceptions import (
+    MailAttachmentNotFoundError,
     MailAuthError,
     MailConnectionError,
     MailIntegrationError,
@@ -19,7 +25,7 @@ from mail_integration.exceptions import (
     MailTimeoutError,
 )
 from mail_integration.mailbox_service import MailboxService
-from mail_integration.schemas import MailboxCredentials, SendMailRequest
+from mail_integration.schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
 
 from .api_serializers import (
     DeviceRegistrationRequestSerializer,
@@ -37,6 +43,7 @@ from .api_serializers import (
     MessageSummariesResponseSerializer,
     RestoreMessagesRequestSerializer,
     RestoreMessagesResponseSerializer,
+    SendMailMultipartRequestSerializer,
     SendMailRequestSerializer,
     SendMailResponseSerializer,
 )
@@ -46,6 +53,8 @@ from .services import send_mail_notification
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
 MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
+MAX_SEND_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
+MAX_SEND_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024
 
 
 def create_mailbox_token(email, password):
@@ -168,10 +177,12 @@ def detail_payload(detail):
             "html_body": detail.html_body,
             "attachments": [
                 {
+                    "id": attachment.id,
                     "filename": attachment.filename,
                     "content_type": attachment.content_type,
                     "size": attachment.size,
                     "disposition": attachment.disposition,
+                    "is_inline": attachment.is_inline,
                 }
                 for attachment in detail.attachments
             ],
@@ -263,6 +274,57 @@ def restore_invalid_operation_response(exc):
     if error == "restore_target_is_trash":
         return Response({"error": "restore_target_is_trash"}, status=status.HTTP_400_BAD_REQUEST)
     return Response({"error": "invalid_restore_operation"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def send_form_data(data):
+    if not hasattr(data, "getlist"):
+        return data
+    normalized = {}
+    for field in ("to", "cc", "bcc"):
+        values = []
+        for value in data.getlist(field):
+            if not isinstance(value, str):
+                values.append(value)
+                continue
+            parsed = getaddresses([value])
+            if len(parsed) > 1:
+                values.extend(address for _, address in parsed)
+            else:
+                values.append(value)
+        if values:
+            normalized[field] = values
+    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name"):
+        values = data.getlist(field)
+        if values:
+            normalized[field] = values[-1]
+    return normalized
+
+
+def uploaded_send_attachments(files):
+    attachments = []
+    total_size = 0
+    for uploaded_file in files.getlist("attachments"):
+        size = uploaded_file.size or 0
+        if size > MAX_SEND_ATTACHMENT_SIZE_BYTES:
+            return None, Response({"error": "attachment_too_large"}, status=status.HTTP_400_BAD_REQUEST)
+        total_size += size
+        if total_size > MAX_SEND_ATTACHMENTS_TOTAL_BYTES:
+            return None, Response({"error": "attachments_too_large"}, status=status.HTTP_400_BAD_REQUEST)
+        filename = (uploaded_file.name or "").strip()
+        if not filename:
+            return None, Response({"error": "invalid_attachment_payload"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            content = uploaded_file.read()
+        except OSError:
+            return None, Response({"error": "invalid_attachment_payload"}, status=status.HTTP_400_BAD_REQUEST)
+        attachments.append(
+            SendMailAttachment(
+                filename=filename,
+                content_type=uploaded_file.content_type or "application/octet-stream",
+                content=content,
+            )
+        )
+    return tuple(attachments), None
 
 
 class LoginView(APIView):
@@ -418,6 +480,34 @@ class MessageDetailView(APIView):
         return Response({"account_email": credentials.email, "folder": folder, "message": detail_payload(detail)})
 
 
+class AttachmentDownloadView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_attachment_download",
+        parameters=[OpenApiParameter("folder", str, required=True, description="Mailbox folder name.")],
+        responses={200: OpenApiTypes.BINARY, 400: ErrorSerializer, 401: ErrorSerializer, 404: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request, uid, attachment_id):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "").strip()
+        if not folder:
+            return Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            attachment = MailboxService().get_attachment(credentials, folder=folder, uid=uid, attachment_id=attachment_id)
+        except MailAttachmentNotFoundError:
+            return Response({"error": "attachment_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        response = HttpResponse(attachment.content, content_type=attachment.summary.content_type or "application/octet-stream")
+        if attachment.summary.filename:
+            response["Content-Disposition"] = content_disposition_header(False, attachment.summary.filename)
+        return response
+
+
 class DeleteMessagesView(APIView):
     authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
     permission_classes = MAILBOX_API_PERMISSION_CLASSES
@@ -539,18 +629,29 @@ class RestoreMessageView(APIView):
 class SendMailView(APIView):
     authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
     permission_classes = MAILBOX_API_PERMISSION_CLASSES
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     @extend_schema(
-        request=SendMailRequestSerializer,
+        request={
+            "application/json": SendMailRequestSerializer,
+            "multipart/form-data": SendMailMultipartRequestSerializer,
+        },
         responses={200: SendMailResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
     )
     def post(self, request):
         credentials, error = require_mailbox_credentials(request)
         if error:
             return error
-        serializer = SendMailRequestSerializer(data=request.data)
+        is_multipart = request.content_type and request.content_type.startswith("multipart/form-data")
+        data = send_form_data(request.data) if is_multipart else request.data
+        serializer = SendMailRequestSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        attachments = ()
+        if is_multipart:
+            attachments, error = uploaded_send_attachments(request.FILES)
+            if error:
+                return error
         send_request = SendMailRequest(
             to=tuple(data["to"]),
             cc=tuple(data.get("cc", ())),
@@ -560,6 +661,7 @@ class SendMailView(APIView):
             text_body=data.get("text_body", ""),
             html_body=data.get("html_body", ""),
             from_display_name=data.get("from_display_name", ""),
+            attachments=attachments,
         )
         try:
             message_id = MailboxService().send_mail(credentials, send_request)

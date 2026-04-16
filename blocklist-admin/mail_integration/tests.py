@@ -7,10 +7,10 @@ from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase, override_settings
 
-from .exceptions import MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailSendError, MailTimeoutError
+from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailSendError, MailTimeoutError
 from .imap_client import ImapClient
 from .mailbox_service import MailboxService
-from .schemas import MailboxCredentials, SendMailRequest
+from .schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
 from .smtp_client import SmtpClient, build_email_message
 
 
@@ -187,11 +187,42 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(detail.subject, "Message detail")
         self.assertIn("Plain body", detail.text_body)
         self.assertIn("<strong>HTML body</strong>", detail.html_body)
+        self.assertEqual(detail.attachments[0].id, "att_1")
         self.assertEqual(detail.attachments[0].filename, "report.txt")
         self.assertEqual(detail.attachments[0].content_type, "text/plain")
         self.assertEqual(detail.attachments[0].disposition, "attachment")
+        self.assertFalse(detail.attachments[0].is_inline)
         connection.select.assert_called_once_with("INBOX", readonly=True)
         connection.uid.assert_called_once_with("fetch", "7", "(FLAGS RFC822.SIZE RFC822)")
+
+    def test_fetch_attachment_returns_selected_attachment_content(self):
+        raw_message = _raw_detail_message(text_body="Plain body", attach=True)
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.return_value = (
+            "OK",
+            [(b"7 (UID 7 FLAGS () RFC822.SIZE 2048 RFC822 {999}", raw_message)],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            attachment = ImapClient().connect().fetch_attachment("INBOX", "7", "att_1")
+
+        self.assertEqual(attachment.summary.id, "att_1")
+        self.assertEqual(attachment.summary.filename, "report.txt")
+        self.assertEqual(attachment.content, b"report content")
+
+    def test_fetch_attachment_raises_not_found_for_unknown_attachment_id(self):
+        raw_message = _raw_detail_message(text_body="Plain body", attach=True)
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.return_value = (
+            "OK",
+            [(b"7 (UID 7 FLAGS () RFC822.SIZE 2048 RFC822 {999}", raw_message)],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            with self.assertRaises(MailAttachmentNotFoundError):
+                ImapClient().connect().fetch_attachment("INBOX", "7", "att_99")
 
     def test_fetch_message_detail_extracts_plain_text_only(self):
         detail = _detail_from_raw_message(_raw_detail_message(text_body="Plain only"))
@@ -510,6 +541,35 @@ class SmtpClientTests(SimpleTestCase):
         self.assertEqual(connection.send_message.call_args.kwargs["to_addrs"], ["to@example.com", "cc@example.com", "bcc@example.com"])
         self.assertEqual(message_id, sent_message["Message-ID"])
 
+    def test_send_with_attachments_builds_multipart_mixed_message(self):
+        connection = Mock()
+
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            SmtpClient().connect().send_mail(
+                MailboxCredentials("sender@example.com", "secret"),
+                SendMailRequest(
+                    to=("to@example.com",),
+                    subject="With attachment",
+                    text_body="Plain body",
+                    html_body="<p>HTML body</p>",
+                    attachments=(
+                        SendMailAttachment(filename="report.txt", content_type="text/plain", content=b"report content"),
+                        SendMailAttachment(filename="data.bin", content_type="application/octet-stream", content=b"\x00\x01"),
+                    ),
+                ),
+            )
+
+        sent_message = connection.send_message.call_args.args[0]
+        self.assertEqual(sent_message.get_content_type(), "multipart/mixed")
+        part_types = [part.get_content_type() for part in sent_message.walk()]
+        self.assertIn("multipart/alternative", part_types)
+        self.assertIn("text/plain", part_types)
+        self.assertIn("text/html", part_types)
+        attachments = list(sent_message.iter_attachments())
+        self.assertEqual([attachment.get_filename() for attachment in attachments], ["report.txt", "data.bin"])
+        self.assertEqual(attachments[0].get_content(), "report content")
+        self.assertEqual(attachments[1].get_payload(decode=True), b"\x00\x01")
+
     def test_smtp_errors_are_normalized(self):
         with patch("mail_integration.smtp_client.smtplib.SMTP", side_effect=socket.timeout):
             with self.assertRaises(MailTimeoutError):
@@ -588,6 +648,7 @@ class MailboxServiceTests(SimpleTestCase):
         entered.fetch_message_summaries.return_value = ["summary"]
         entered.fetch_message_summary_page.return_value = "summary-page"
         entered.fetch_message_detail.return_value = "detail"
+        entered.fetch_attachment.return_value = "attachment"
         entered.move_messages_to_trash.return_value = "move-result"
         entered.restore_messages_from_trash.return_value = "restore-result"
 
@@ -597,13 +658,15 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.list_message_summaries(credentials, folder="Archive", limit=10), ["summary"])
         self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
+        self.assertEqual(service.get_attachment(credentials, folder="Archive", uid="99", attachment_id="att_1"), "attachment")
         self.assertEqual(service.move_messages_to_trash(credentials, folder="Archive", uids=("99",)), "move-result")
         self.assertEqual(service.restore_messages_from_trash(credentials, folder="Trash", target_folder="INBOX", uids=("99",)), "restore-result")
-        self.assertEqual(entered.login.call_count, 6)
+        self.assertEqual(entered.login.call_count, 7)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
+        entered.fetch_attachment.assert_called_once_with(folder="Archive", uid="99", attachment_id="att_1")
         entered.move_messages_to_trash.assert_called_once_with(folder="Archive", uids=("99",))
         entered.restore_messages_from_trash.assert_called_once_with(folder="Trash", target_folder="INBOX", uids=("99",))
 
