@@ -204,6 +204,8 @@ Portal je pripremljen i za kasnije sirenje prema:
 - DNS i DKIM operacijama
 - health, reject i auth observability pregledima
 
+Interni mailbox JSON endpointi za staff korisnike dokumentirani su u [docs/mailbox-api.md](/opt/stacks/mailserver/docs/mailbox-api.md).
+
 Provjera odbijanja:
 
 ```bash
