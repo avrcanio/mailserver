@@ -32,3 +32,65 @@ services:
       - NET_ADMIN
     restart: unless-stopped
     stop_grace_period: 1m
+
+  blocklist-db:
+    image: postgres:16-alpine
+    container_name: mailserver-blocklist-db
+    environment:
+      POSTGRES_DB: ${BLOCKLIST_DB_NAME:-mailblocklist}
+      POSTGRES_USER: ${BLOCKLIST_DB_USER:-mailblocklist}
+      POSTGRES_PASSWORD: ${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ}
+    volumes:
+      - ./docker-data/blocklist-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BLOCKLIST_DB_USER:-mailblocklist} -d ${BLOCKLIST_DB_NAME:-mailblocklist}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mailadmin:
+    build:
+      context: ./blocklist-admin
+    container_name: mailserver-mailadmin
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@blocklist-db:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
+      DJANGO_SECRET_KEY: ${MAILADMIN_SECRET_KEY:-change-me-too}
+      DJANGO_ALLOWED_HOSTS: ${MAILADMIN_ALLOWED_HOSTS:-mailadmin.example.com,127.0.0.1,localhost}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${MAILADMIN_CSRF_TRUSTED_ORIGINS:-https://mailadmin.example.com}
+      DJANGO_SUPERUSER_USERNAME: ${MAILADMIN_SUPERUSER_USERNAME:-admin}
+      DJANGO_SUPERUSER_PASSWORD: ${MAILADMIN_SUPERUSER_PASSWORD:-change-me}
+      DJANGO_SUPERUSER_EMAIL: ${MAILADMIN_SUPERUSER_EMAIL:-admin@example.com}
+      MAILADMIN_HOST: ${MAILADMIN_HOST:-mailadmin.example.com}
+      BLOCKLIST_CONFIG_PATH: /app/shared-config/postfix-sender-blocklist
+      MAILSERVER_CONTAINER_NAME: mailserver
+      BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
+    ports:
+      - "127.0.0.1:8081:8000"
+    volumes:
+      - ./docker-data/dms/config:/app/shared-config
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - default
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.mailadmin.rule=Host(`${MAILADMIN_HOST}`)
+      - traefik.http.routers.mailadmin.entrypoints=websecure
+      - traefik.http.routers.mailadmin.tls=true
+      - traefik.http.routers.mailadmin.tls.certresolver=cloudflare
+      - traefik.http.services.mailadmin.loadbalancer.server.port=8000
+    depends_on:
+      blocklist-db:
+        condition: service_healthy
+      mailserver:
+        condition: service_started
+    restart: unless-stopped
+
+networks:
+  proxy:
+    external: true

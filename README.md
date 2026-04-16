@@ -5,6 +5,8 @@ Produkcijski Docker mail stack za dedicated server s vise domena, direktnim slan
 ## Stack
 
 - `docker-mailserver` za SMTP/IMAP, virtual mailboxe, DKIM, DMARC i osnovnu antispam zastitu
+ - Django `mailadmin` portal za interni mail ops, blocklist CRUD i operativne akcije
+- `postgres` za spremanje blocklist pravila
 - `certbot/dns-cloudflare` kroz helper skriptu za Let’s Encrypt certifikate preko DNS challengea
 - bind mount volumeni za mailboxe, state, logove, config i certifikate
 
@@ -25,6 +27,22 @@ Traefik se ne koristi za mail promet. Mail portovi idu direktno na host.
 ```bash
 docker compose up -d
 ```
+
+Interni Django mail admin ce nakon toga biti dostupan lokalno na:
+
+```text
+http://127.0.0.1:8081
+```
+
+Predvidena poddomena za reverse proxy/TLS izlaganje je:
+
+```text
+https://${MAILADMIN_HOST}
+```
+
+Prijava ide preko Django admin korisnika iz lokalnog `.env`.
+
+Primjer host-level reverse proxy konfiguracije za `mailadmin.finestar.hr` nalazi se u [docs/mailadmin-nginx.conf.example](/opt/stacks/mailserver/docs/mailadmin-nginx.conf.example).
 
 3. Zatrazi prvi certifikat:
 
@@ -129,6 +147,12 @@ docker compose ps
 docker compose logs -f mailserver
 ```
 
+- mailadmin:
+
+```bash
+docker compose logs -f mailadmin
+```
+
 - backup:
 
 ```bash
@@ -153,6 +177,37 @@ Nakon deploya potvrdi:
 - `SPF`, `DKIM`, `DMARC` su `pass`
 - `PTR` i `HELO` su uskladeni s `${MAIL_HOSTNAME}`
 
-## Buduci Django/API sloj
+## Django Mailadmin Portal
 
-Ovaj repo namjerno zadrzava mailbox provisioning u datotekama i DMS admin komandama. Kasniji Django admin/API moze koristiti ove skripte ili izvoditi iste `docker-mailserver setup` komande kroz zaseban servisni sloj.
+`mailadmin` je interni Django-based mail ops portal pripremljen za poddomenu `mailadmin.finestar.hr`.
+
+V1 ukljucuje:
+
+- Django admin login i interni dashboard
+- CRUD za `sender_email` i `sender_domain` blocklist pravila
+- rucni `Apply to Postfix`
+- pregled zadnjeg apply rezultata i greske
+
+Operativni tok:
+
+1. Otvori `http://127.0.0.1:8081/admin/` ili reverse proxied `https://${MAILADMIN_HOST}/admin/`
+2. Prijavi se Django admin korisnikom iz `.env`
+3. U adminu dodaj ili izmijeni `Sender blocklist rules`
+4. Otvori dashboard na `/`
+5. Klikni `Apply to Postfix`
+6. Potvrdi u logovima da je Postfix reloadan i da se poruke odbijaju na ulazu
+
+Portal je pripremljen i za kasnije sirenje prema:
+
+- mailbox upravljanju
+- alias i relay pravilima
+- DNS i DKIM operacijama
+- health, reject i auth observability pregledima
+
+Provjera odbijanja:
+
+```bash
+docker compose logs -f mailserver
+```
+
+Trazi `reject` dogadaj za blokiranog posiljatelja. Ocekivano je da mail bude odbijen tokom SMTP sesije i da se ne pojavi ni u inboxu ni u spamu.

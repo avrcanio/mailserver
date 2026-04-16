@@ -1,1 +1,2 @@
 inet_protocols = ipv4
+dms_smtpd_sender_restrictions = permit_sasl_authenticated, permit_mynetworks, check_sender_access texthash:/tmp/docker-mailserver/postfix-sender-blocklist, reject_unknown_sender_domain

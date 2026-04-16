@@ -1,0 +1,4 @@
+# Managed by mailadmin.
+# Rendered from Django mailadmin and reloaded into Postfix.
+contafaktura.no REJECT Blocked by local policy
+nxjzfd.com REJECT Blocked by local policy

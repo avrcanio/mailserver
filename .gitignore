@@ -25,3 +25,8 @@ mailserver.env
 dalekopro.hr.txt
 docker-data/dms/config/opendkim/KeyTable
 docker-data/dms/config/opendkim/SigningTable
+docker-data/blocklist-db/*
+!docker-data/blocklist-db/.gitkeep
+blocklist-admin/__pycache__/
+blocklist-admin/.pytest_cache/
+blocklist-admin/staticfiles/

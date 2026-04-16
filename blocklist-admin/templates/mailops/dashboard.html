@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mailadmin</title>
+    <style>
+      :root {
+        --bg: #f6f0e7;
+        --panel: #fffaf3;
+        --ink: #1f2933;
+        --accent: #a23b24;
+        --muted: #6b7280;
+        --ok: #216e39;
+        --err: #8b2f1f;
+        --border: #dccdb9;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        background:
+          radial-gradient(circle at top left, rgba(162, 59, 36, 0.15), transparent 28%),
+          linear-gradient(180deg, #fbf6ef 0%, var(--bg) 100%);
+        color: var(--ink);
+      }
+      .shell { max-width: 1120px; margin: 0 auto; padding: 32px 20px 48px; }
+      .masthead { display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 24px; }
+      h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.3rem); letter-spacing: -0.04em; }
+      .subtitle { color: var(--muted); max-width: 720px; margin-top: 8px; }
+      .grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 18px; }
+      .panel {
+        background: rgba(255, 250, 243, 0.92);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 22px;
+        box-shadow: 0 16px 40px rgba(69, 43, 24, 0.08);
+      }
+      .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+      .button, button {
+        appearance: none;
+        border: 0;
+        border-radius: 999px;
+        background: var(--accent);
+        color: white;
+        padding: 11px 18px;
+        text-decoration: none;
+        font: inherit;
+        cursor: pointer;
+      }
+      .button.secondary { background: #eadcca; color: var(--ink); }
+      .status { display: inline-block; border-radius: 999px; padding: 4px 10px; font-size: 0.9rem; }
+      .status.success { background: rgba(33, 110, 57, 0.12); color: var(--ok); }
+      .status.error { background: rgba(139, 47, 31, 0.12); color: var(--err); }
+      .card-list { display: grid; gap: 12px; }
+      .rule { border: 1px solid rgba(220, 205, 185, 0.8); border-radius: 14px; padding: 14px; }
+      .rule strong { display: block; font-size: 1.05rem; }
+      .muted { color: var(--muted); }
+      ul { margin: 12px 0 0; padding-left: 20px; }
+      .messages { display: grid; gap: 10px; margin-bottom: 18px; }
+      .message { padding: 12px 14px; border-radius: 12px; }
+      .message.success { background: rgba(33, 110, 57, 0.12); color: var(--ok); }
+      .message.error { background: rgba(139, 47, 31, 0.12); color: var(--err); }
+      code { font-family: "SFMono-Regular", Consolas, monospace; }
+      @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } .masthead { flex-direction: column; align-items: start; } }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="masthead">
+        <div>
+          <h1>Mailadmin</h1>
+          <div class="subtitle">Internal mail operations portal for <strong>{{ mailadmin_host }}</strong>, prepared for <code>mailadmin.finestar.hr</code>.</div>
+        </div>
+      </div>
+
+      {% if messages %}
+        <div class="messages">
+          {% for message in messages %}
+            <div class="message {{ message.tags }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <div class="grid">
+        <div class="panel">
+          <h2>Sender Blocklist</h2>
+          <p class="muted">Manage sender rejects through Django admin, then apply the rendered access map to Postfix.</p>
+          <div class="actions">
+            <a class="button" href="/admin/mailops/senderblocklistrule/">Open Rules</a>
+            <a class="button secondary" href="/admin/">Open Django Admin</a>
+            <form method="post" action="{% url 'mailops:apply' %}">
+              {% csrf_token %}
+              <button type="submit">Apply to Postfix</button>
+            </form>
+          </div>
+          <div class="card-list" style="margin-top: 18px;">
+            {% for rule in rules %}
+              <div class="rule">
+                <div class="muted">{{ rule.get_kind_display }}</div>
+                <strong>{{ rule.value }}</strong>
+                <div class="muted">
+                  {% if rule.enabled %}Enabled{% else %}Disabled{% endif %}
+                  {% if rule.note %} · {{ rule.note }}{% endif %}
+                </div>
+              </div>
+            {% empty %}
+              <div class="rule">
+                <strong>No rules yet</strong>
+                <div class="muted">Add your first sender email or sender domain rule in Django admin.</div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Apply Status</h2>
+          {% if last_apply %}
+            <p><span class="status {{ last_apply.status }}">{{ last_apply.get_status_display }}</span></p>
+            <p class="muted">{{ last_apply.created_at }}</p>
+            <p>{{ last_apply.message|default:"No message" }}</p>
+            <p class="muted">
+              {% if last_apply.applied_by %}By {{ last_apply.applied_by.username }}{% else %}By system{% endif %}
+            </p>
+          {% else %}
+            <p class="muted">No apply runs yet.</p>
+          {% endif %}
+
+          <h2 style="margin-top: 28px;">Roadmap Hooks</h2>
+          <ul>
+            <li>Mailbox lifecycle and password reset operations</li>
+            <li>Alias, relay and catch-all management</li>
+            <li>DNS, DKIM and certificate status views</li>
+            <li>Reject logs, auth failures and health summaries</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
