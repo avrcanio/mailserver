@@ -40,13 +40,13 @@ def create_mailbox_token(email, password):
     normalized_email = email.strip().lower()
     user = get_or_create_mailbox_user(normalized_email)
     token, _ = Token.objects.get_or_create(user=user)
-    MailboxTokenCredential.objects.update_or_create(
-        token=token,
-        defaults={
-            "mailbox_email": normalized_email,
-            "mailbox_password": password,
-        },
-    )
+    try:
+        token_credential = token.mailbox_credential
+    except MailboxTokenCredential.DoesNotExist:
+        token_credential = MailboxTokenCredential(token=token)
+    token_credential.mailbox_email = normalized_email
+    token_credential.set_mailbox_password(password)
+    token_credential.save()
     return token
 
 
@@ -93,7 +93,7 @@ def mailbox_credentials_from_request(request):
         token_credential = token.mailbox_credential
     except MailboxTokenCredential.DoesNotExist:
         return None
-    return MailboxCredentials(email=token_credential.mailbox_email, password=token_credential.mailbox_password)
+    return MailboxCredentials(email=token_credential.mailbox_email, password=token_credential.get_mailbox_password())
 
 
 def require_mailbox_credentials(request):

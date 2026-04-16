@@ -189,6 +189,24 @@ Response:
 - Swagger UI: `GET /api/docs/`
 - ReDoc: `GET /api/redoc/`
 
+## Credential Encryption
+
+Mailbox passwords stored in `MailboxTokenCredential.mailbox_password` are encrypted at rest with Fernet and use the `fernet:v1:` storage prefix. The backend decrypts them only in memory when creating IMAP/SMTP credentials for protected mail operations.
+
+Required environment:
+
+```bash
+MAILBOX_CREDENTIAL_ENCRYPTION_KEY=fernet-key
+```
+
+Generate a key with:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Losing this key makes stored mailbox credentials undecryptable. Key rotation is intentionally left for a follow-up; for now, configure the key, rebuild, run migrations, and recreate `mailadmin`.
+
 ## Errors
 
 Unauthenticated mailbox API requests return:

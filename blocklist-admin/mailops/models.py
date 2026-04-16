@@ -3,6 +3,8 @@ import re
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from .credential_crypto import decrypt_mailbox_password, encrypt_mailbox_password
+
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -173,6 +175,12 @@ class MailboxTokenCredential(models.Model):
 
     def clean(self):
         self.mailbox_email = self.mailbox_email.strip().lower()
+
+    def set_mailbox_password(self, plaintext):
+        self.mailbox_password = encrypt_mailbox_password(plaintext)
+
+    def get_mailbox_password(self):
+        return decrypt_mailbox_password(self.mailbox_password)
 
     def save(self, *args, **kwargs):
         self.full_clean()

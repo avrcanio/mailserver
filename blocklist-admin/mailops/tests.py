@@ -1,8 +1,11 @@
 import json
+import importlib
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
+from django.apps import apps
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -12,10 +15,20 @@ from rest_framework.authtoken.models import Token
 from mail_integration.exceptions import MailAuthError, MailConnectionError, MailSendError
 from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary
 
-from .api import create_mailbox_token
+from .api import create_mailbox_token, mailbox_credentials_from_request
+from .credential_crypto import (
+    ENCRYPTED_VALUE_PREFIX,
+    CredentialEncryptionError,
+    decrypt_mailbox_password,
+    encrypt_mailbox_password,
+)
 from .models import DeviceRegistration, MailboxTokenCredential, PushNotificationLog
 
 
+TEST_ENCRYPTION_KEY = "DhbKZLv4bil01DI7X2u09Q69vebV7py6A9m9q0gOCfg="
+
+
+@override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY=TEST_ENCRYPTION_KEY)
 class MailApiTests(TestCase):
     def setUp(self):
         self.account_email = "user@example.com"
@@ -45,6 +58,9 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["folder_count"], 2)
         self.assertTrue(payload["token"])
         self.assertEqual(payload["user"]["email"], self.account_email)
+        serialized_payload = json.dumps(payload)
+        self.assertNotIn(self.password, serialized_payload)
+        self.assertNotIn(ENCRYPTED_VALUE_PREFIX, serialized_payload)
 
         User = get_user_model()
         user = User.objects.get(username=self.account_email)
@@ -57,7 +73,9 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["token"], token.key)
         credential = MailboxTokenCredential.objects.get(token=token)
         self.assertEqual(credential.mailbox_email, self.account_email)
-        self.assertEqual(credential.mailbox_password, self.password)
+        self.assertTrue(credential.mailbox_password.startswith(ENCRYPTED_VALUE_PREFIX))
+        self.assertNotIn(self.password, credential.mailbox_password)
+        self.assertEqual(credential.get_mailbox_password(), self.password)
 
     @patch("mailops.api.MailboxService")
     def test_login_reuses_token_and_updates_stored_password(self, service_class):
@@ -77,7 +95,10 @@ class MailApiTests(TestCase):
         self.assertEqual(second_response.status_code, 200)
         self.assertEqual(first_response.json()["token"], second_response.json()["token"])
         self.assertEqual(Token.objects.count(), 1)
-        self.assertEqual(MailboxTokenCredential.objects.get().mailbox_password, "new-password")
+        credential = MailboxTokenCredential.objects.get()
+        self.assertTrue(credential.mailbox_password.startswith(ENCRYPTED_VALUE_PREFIX))
+        self.assertNotIn("new-password", credential.mailbox_password)
+        self.assertEqual(credential.get_mailbox_password(), "new-password")
 
     @patch("mailops.api.MailboxService")
     def test_login_maps_bad_mailbox_credentials(self, service_class):
@@ -111,6 +132,26 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["authenticated"], True)
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["user"]["email"], self.account_email)
+        serialized_payload = json.dumps(payload)
+        self.assertNotIn(self.password, serialized_payload)
+        self.assertNotIn(ENCRYPTED_VALUE_PREFIX, serialized_payload)
+
+    def test_mailbox_credentials_from_request_decrypts_password(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        request = Mock(auth=token)
+
+        credentials = mailbox_credentials_from_request(request)
+
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
+
+    def test_legacy_plaintext_runtime_read_is_rejected(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        MailboxTokenCredential.objects.filter(token=token).update(mailbox_password="legacy-plaintext")
+        credential = MailboxTokenCredential.objects.get(token=token)
+
+        with self.assertRaises(CredentialEncryptionError):
+            credential.get_mailbox_password()
 
     def test_logout_revokes_current_token_and_mailbox_credentials(self):
         token = create_mailbox_token(self.account_email, self.password)
@@ -158,6 +199,49 @@ class MailApiTests(TestCase):
         self.assertEqual(missing_token.json()["error"], "not_authenticated")
         self.assertEqual(invalid_token.status_code, 401)
         self.assertEqual(invalid_token.json()["error"], "not_authenticated")
+
+    def test_credential_crypto_requires_valid_key(self):
+        with override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY=""):
+            with self.assertRaises(ImproperlyConfigured):
+                encrypt_mailbox_password("secret")
+        with override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY="not-a-fernet-key"):
+            with self.assertRaises(ImproperlyConfigured):
+                decrypt_mailbox_password(f"{ENCRYPTED_VALUE_PREFIX}bad")
+
+    def test_legacy_plaintext_migration_encrypts_existing_rows(self):
+        migration = importlib.import_module("mailops.migrations.0004_encrypt_mailbox_token_credentials")
+        user = get_user_model().objects.create_user(username="legacy@example.com", email="legacy@example.com")
+        token = Token.objects.create(user=user)
+        encrypted_user = get_user_model().objects.create_user(username="encrypted@example.com", email="encrypted@example.com")
+        encrypted_token = Token.objects.create(user=encrypted_user)
+        MailboxTokenCredential.objects.create(
+            token=token,
+            mailbox_email="legacy@example.com",
+            mailbox_password="legacy-secret",
+        )
+        already_encrypted = encrypt_mailbox_password("already-secret")
+        MailboxTokenCredential.objects.create(
+            token=encrypted_token,
+            mailbox_email="encrypted@example.com",
+            mailbox_password=already_encrypted,
+        )
+
+        migration.encrypt_legacy_mailbox_passwords(apps, None)
+        migration.encrypt_legacy_mailbox_passwords(apps, None)
+
+        legacy_credential = MailboxTokenCredential.objects.get(token=token)
+        encrypted_credential = MailboxTokenCredential.objects.get(token=encrypted_token)
+        self.assertTrue(legacy_credential.mailbox_password.startswith(ENCRYPTED_VALUE_PREFIX))
+        self.assertNotIn("legacy-secret", legacy_credential.mailbox_password)
+        self.assertEqual(legacy_credential.get_mailbox_password(), "legacy-secret")
+        self.assertEqual(encrypted_credential.mailbox_password, already_encrypted)
+
+    def test_legacy_plaintext_migration_requires_encryption_key(self):
+        migration = importlib.import_module("mailops.migrations.0004_encrypt_mailbox_token_credentials")
+
+        with override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY=""):
+            with self.assertRaises(ImproperlyConfigured):
+                migration.encrypt_legacy_mailbox_passwords(apps, None)
 
     def test_mail_endpoint_rejects_invalid_token(self):
         response = self.client.get(reverse("mailops:api_me"), HTTP_AUTHORIZATION="Token invalid")
@@ -403,7 +487,11 @@ class MailApiTests(TestCase):
         call_command("spectacular", file="/tmp/test-mailadmin-schema.yaml", validate=True)
 
 
-@override_settings(DEVICE_REGISTRATION_SECRET="device-secret", MAIL_NOTIFY_HOOK_SECRET="hook-secret")
+@override_settings(
+    DEVICE_REGISTRATION_SECRET="device-secret",
+    MAIL_NOTIFY_HOOK_SECRET="hook-secret",
+    MAILBOX_CREDENTIAL_ENCRYPTION_KEY=TEST_ENCRYPTION_KEY,
+)
 class PushApiTests(TestCase):
     def setUp(self):
         self.account_email = "user@example.com"
