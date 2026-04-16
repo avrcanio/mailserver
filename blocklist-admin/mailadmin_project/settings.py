@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework.authtoken",
     "drf_spectacular",
     "mailops",
 ]
@@ -108,7 +109,11 @@ MAIL_SMTP_USE_STARTTLS = env_bool("MAIL_SMTP_USE_STARTTLS", True)
 MAIL_CLIENT_TIMEOUT_SECONDS = int(os.environ.get("MAIL_CLIENT_TIMEOUT_SECONDS", "15"))
 
 REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "EXCEPTION_HANDLER": "mailops.api_exceptions.mailbox_api_exception_handler",
     "UNAUTHENTICATED_USER": None,
 }
 

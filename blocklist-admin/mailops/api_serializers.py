@@ -6,8 +6,14 @@ class LoginRequestSerializer(serializers.Serializer):
     password = serializers.CharField(trim_whitespace=False, write_only=True)
 
 
+class UserIdentitySerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    email = serializers.EmailField()
+
+
 class IdentitySerializer(serializers.Serializer):
     authenticated = serializers.BooleanField()
+    user = UserIdentitySerializer(required=False)
     account_email = serializers.EmailField()
     token = serializers.CharField(required=False)
     folder_count = serializers.IntegerField(required=False)

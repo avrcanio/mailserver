@@ -153,3 +153,30 @@ class PushNotificationLog(models.Model):
 
     def __str__(self):
         return f"{self.account_email}: {self.status} @ {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
+class MailboxTokenCredential(models.Model):
+    token = models.OneToOneField(
+        "authtoken.Token",
+        on_delete=models.CASCADE,
+        related_name="mailbox_credential",
+    )
+    mailbox_email = models.EmailField(unique=True, db_index=True)
+    mailbox_password = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["mailbox_email"]
+        verbose_name = "Mailbox token credential"
+        verbose_name_plural = "Mailbox token credentials"
+
+    def clean(self):
+        self.mailbox_email = self.mailbox_email.strip().lower()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.mailbox_email

@@ -2,16 +2,18 @@ import json
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
+from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from rest_framework.authtoken.models import Token
 
 from mail_integration.exceptions import MailAuthError, MailConnectionError, MailSendError
 from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary
 
 from .api import create_mailbox_token
-from .models import DeviceRegistration, PushNotificationLog
+from .models import DeviceRegistration, MailboxTokenCredential, PushNotificationLog
 
 
 class MailApiTests(TestCase):
@@ -21,7 +23,7 @@ class MailApiTests(TestCase):
 
     def auth_headers(self):
         token = create_mailbox_token(self.account_email, self.password)
-        return {"HTTP_AUTHORIZATION": f"Token {token}"}
+        return {"HTTP_AUTHORIZATION": f"Token {token.key}"}
 
     @patch("mailops.api.MailboxService")
     def test_login_success_returns_token(self, service_class):
@@ -42,6 +44,40 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["folder_count"], 2)
         self.assertTrue(payload["token"])
+        self.assertEqual(payload["user"]["email"], self.account_email)
+
+        User = get_user_model()
+        user = User.objects.get(username=self.account_email)
+        self.assertEqual(user.email, self.account_email)
+        self.assertTrue(user.is_active)
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.is_superuser)
+        self.assertFalse(user.has_usable_password())
+        token = Token.objects.get(user=user)
+        self.assertEqual(payload["token"], token.key)
+        credential = MailboxTokenCredential.objects.get(token=token)
+        self.assertEqual(credential.mailbox_email, self.account_email)
+        self.assertEqual(credential.mailbox_password, self.password)
+
+    @patch("mailops.api.MailboxService")
+    def test_login_reuses_token_and_updates_stored_password(self, service_class):
+        service_class.return_value.list_folders.return_value = []
+        first_response = self.client.post(
+            reverse("mailops:api_login"),
+            data={"email": self.account_email, "password": "old-password"},
+            content_type="application/json",
+        )
+        second_response = self.client.post(
+            reverse("mailops:api_login"),
+            data={"email": self.account_email, "password": "new-password"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(first_response.json()["token"], second_response.json()["token"])
+        self.assertEqual(Token.objects.count(), 1)
+        self.assertEqual(MailboxTokenCredential.objects.get().mailbox_password, "new-password")
 
     @patch("mailops.api.MailboxService")
     def test_login_maps_bad_mailbox_credentials(self, service_class):
@@ -55,8 +91,11 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"], "mail_auth_failed")
+        self.assertEqual(get_user_model().objects.count(), 0)
+        self.assertEqual(Token.objects.count(), 0)
+        self.assertEqual(MailboxTokenCredential.objects.count(), 0)
 
-    def test_me_requires_mailbox_session(self):
+    def test_me_requires_token(self):
         response = self.client.get(reverse("mailops:api_me"))
 
         self.assertEqual(response.status_code, 401)
@@ -68,7 +107,25 @@ class MailApiTests(TestCase):
         response = self.client.get(reverse("mailops:api_me"), **headers)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"authenticated": True, "account_email": self.account_email})
+        payload = response.json()
+        self.assertEqual(payload["authenticated"], True)
+        self.assertEqual(payload["account_email"], self.account_email)
+        self.assertEqual(payload["user"]["email"], self.account_email)
+
+    def test_mail_endpoint_rejects_invalid_token(self):
+        response = self.client.get(reverse("mailops:api_me"), HTTP_AUTHORIZATION="Token invalid")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "not_authenticated")
+
+    def test_mail_endpoint_rejects_token_without_mailbox_credentials(self):
+        user = get_user_model().objects.create_user(username="empty@example.com", email="empty@example.com")
+        token = Token.objects.create(user=user)
+
+        response = self.client.get(reverse("mailops:api_me"), HTTP_AUTHORIZATION=f"Token {token.key}")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "mailbox_credentials_missing")
 
     @patch("mailops.api.MailboxService")
     def test_mail_folders_returns_service_results(self, service_class):
@@ -125,13 +182,13 @@ class MailApiTests(TestCase):
         self.assertEqual(credentials.password, self.password)
         self.assertEqual(service.list_message_summaries.call_args.kwargs, {"folder": "INBOX", "limit": 25})
 
-    def test_mail_messages_requires_session_and_validates_limit(self):
-        missing_session = self.client.get(reverse("mailops:api_mail_messages"))
+    def test_mail_messages_requires_token_and_validates_limit(self):
+        missing_token = self.client.get(reverse("mailops:api_mail_messages"))
         headers = self.auth_headers()
         invalid_limit = self.client.get(reverse("mailops:api_mail_messages"), {"limit": 500}, **headers)
 
-        self.assertEqual(missing_session.status_code, 401)
-        self.assertEqual(missing_session.json()["error"], "not_authenticated")
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
         self.assertEqual(invalid_limit.status_code, 400)
         self.assertEqual(invalid_limit.json()["error"], "invalid_limit")
 
@@ -230,8 +287,8 @@ class MailApiTests(TestCase):
         self.assertEqual(request.html_body, "<p>HTML body</p>")
         self.assertEqual(request.from_display_name, "Sender Name")
 
-    def test_mail_send_requires_session_and_validates_required_fields(self):
-        missing_session = self.client.post(reverse("mailops:api_mail_send"), data={}, content_type="application/json")
+    def test_mail_send_requires_token_and_validates_required_fields(self):
+        missing_token = self.client.post(reverse("mailops:api_mail_send"), data={}, content_type="application/json")
         headers = self.auth_headers()
 
         missing_to = self.client.post(
@@ -253,8 +310,8 @@ class MailApiTests(TestCase):
             **headers,
         )
 
-        self.assertEqual(missing_session.status_code, 401)
-        self.assertEqual(missing_session.json()["error"], "not_authenticated")
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
         self.assertEqual(missing_to.status_code, 400)
         self.assertIn("to", missing_to.json())
         self.assertEqual(missing_subject.status_code, 400)

@@ -1,6 +1,8 @@
 # Mailadmin Mailbox API
 
-These Django REST Framework endpoints expose the MVP backend mail API for mobile clients. The client logs in once with mailbox credentials and then sends the returned token in the `Authorization` header for mailbox operations.
+These Django REST Framework endpoints expose the MVP backend mail API for mobile clients. The client logs in once with mailbox credentials, receives a Django-user-backed DRF API token, and sends that token in the `Authorization` header for later mailbox operations.
+
+Mailbox credentials are validated through the mail integration layer and stored server-side against the DRF token. Android stores only the backend-issued token.
 
 ## Auth
 
@@ -20,8 +22,12 @@ Response:
 ```json
 {
   "authenticated": true,
+  "user": {
+    "id": 12,
+    "email": "user@finestar.hr"
+  },
   "account_email": "user@finestar.hr",
-  "token": "server-generated-token",
+  "token": "drf-token-key",
   "folder_count": 5
 }
 ```
@@ -29,10 +35,10 @@ Response:
 Use the returned token on later requests:
 
 ```http
-Authorization: Token server-generated-token
+Authorization: Token drf-token-key
 ```
 
-`Bearer server-generated-token` is also accepted.
+The token belongs to a non-staff active Django user whose `email` and `username` match the mailbox email.
 
 `GET /api/auth/me`
 
@@ -41,6 +47,10 @@ Response:
 ```json
 {
   "authenticated": true,
+  "user": {
+    "id": 12,
+    "email": "user@finestar.hr"
+  },
   "account_email": "user@finestar.hr"
 }
 ```
@@ -165,6 +175,12 @@ Unauthenticated mailbox API requests return:
 
 ```json
 {"error": "not_authenticated"}
+```
+
+Valid DRF tokens without a stored mailbox credential record return:
+
+```json
+{"error": "mailbox_credentials_missing"}
 ```
 
 Mail integration failures are normalized:

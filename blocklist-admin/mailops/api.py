@@ -1,7 +1,9 @@
-from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
-from importlib import import_module
-from django.conf import settings
+from drf_spectacular.utils import OpenApiParameter, extend_schema
+from django.contrib.auth import get_user_model
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.authtoken.models import Token
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -19,52 +21,80 @@ from .api_serializers import (
     SendMailRequestSerializer,
     SendMailResponseSerializer,
 )
+from .models import MailboxTokenCredential
 
 
-MAILBOX_EMAIL_SESSION_KEY = "mailbox_email"
-MAILBOX_PASSWORD_SESSION_KEY = "mailbox_password"
+MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
+MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
 
 
 def create_mailbox_token(email, password):
-    session = _session_store()
-    session[MAILBOX_EMAIL_SESSION_KEY] = email.strip().lower()
-    session[MAILBOX_PASSWORD_SESSION_KEY] = password
-    session.create()
-    return session.session_key
+    normalized_email = email.strip().lower()
+    user = get_or_create_mailbox_user(normalized_email)
+    token, _ = Token.objects.get_or_create(user=user)
+    MailboxTokenCredential.objects.update_or_create(
+        token=token,
+        defaults={
+            "mailbox_email": normalized_email,
+            "mailbox_password": password,
+        },
+    )
+    return token
 
 
-def mailbox_credentials_from_token(request):
-    token = _authorization_token(request)
-    if not token:
+def get_or_create_mailbox_user(email):
+    User = get_user_model()
+    normalized_email = email.strip().lower()
+    user = User.objects.filter(email__iexact=normalized_email).first()
+    created = False
+    if user is None:
+        user, created = User.objects.get_or_create(
+            username=normalized_email,
+            defaults={
+                "email": normalized_email,
+                "is_active": True,
+                "is_staff": False,
+                "is_superuser": False,
+            },
+        )
+
+    changed = False
+    for field, value in {
+        "username": normalized_email,
+        "email": normalized_email,
+        "is_active": True,
+        "is_staff": False,
+        "is_superuser": False,
+    }.items():
+        if getattr(user, field) != value:
+            setattr(user, field, value)
+            changed = True
+    if created or user.has_usable_password():
+        user.set_unusable_password()
+        changed = True
+    if changed:
+        user.save(update_fields=["username", "email", "is_active", "is_staff", "is_superuser", "password"])
+    return user
+
+
+def mailbox_credentials_from_request(request):
+    token = request.auth
+    if not isinstance(token, Token):
         return None
-    session = _session_store(session_key=token)
-    if not session.exists(token):
+    try:
+        token_credential = token.mailbox_credential
+    except MailboxTokenCredential.DoesNotExist:
         return None
-    email = session.get(MAILBOX_EMAIL_SESSION_KEY)
-    password = session.get(MAILBOX_PASSWORD_SESSION_KEY)
-    if not email or not password:
-        return None
-    return MailboxCredentials(email=email, password=password)
+    return MailboxCredentials(email=token_credential.mailbox_email, password=token_credential.mailbox_password)
 
 
 def require_mailbox_credentials(request):
-    credentials = mailbox_credentials_from_token(request)
-    if credentials is None:
+    if not request.user or not request.user.is_authenticated:
         return None, Response({"error": "not_authenticated"}, status=status.HTTP_401_UNAUTHORIZED)
+    credentials = mailbox_credentials_from_request(request)
+    if credentials is None:
+        return None, Response({"error": "mailbox_credentials_missing"}, status=status.HTTP_401_UNAUTHORIZED)
     return credentials, None
-
-
-def _authorization_token(request):
-    header = request.headers.get("Authorization", "")
-    scheme, _, token = header.partition(" ")
-    if scheme.lower() not in {"token", "bearer"} or not token.strip():
-        return None
-    return token.strip()
-
-
-def _session_store(session_key=None):
-    engine = import_module(settings.SESSION_ENGINE)
-    return engine.SessionStore(session_key=session_key)
 
 
 def mail_error_response(exc):
@@ -149,24 +179,44 @@ class LoginView(APIView):
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         token = create_mailbox_token(email, password)
-        return Response({"authenticated": True, "account_email": email, "token": token, "folder_count": len(folders)})
+        return Response(
+            {
+                "authenticated": True,
+                "user": {
+                    "id": token.user_id,
+                    "email": token.user.email,
+                },
+                "account_email": email,
+                "token": token.key,
+                "folder_count": len(folders),
+            }
+        )
 
 
 class MeView(APIView):
-    authentication_classes = []
-    permission_classes = []
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
 
     @extend_schema(responses={200: IdentitySerializer, 401: ErrorSerializer})
     def get(self, request):
         credentials, error = require_mailbox_credentials(request)
         if error:
             return error
-        return Response({"authenticated": True, "account_email": credentials.email})
+        return Response(
+            {
+                "authenticated": True,
+                "user": {
+                    "id": request.user.id,
+                    "email": request.user.email,
+                },
+                "account_email": credentials.email,
+            }
+        )
 
 
 class FolderListView(APIView):
-    authentication_classes = []
-    permission_classes = []
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
 
     @extend_schema(responses={200: FoldersResponseSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer})
     def get(self, request):
@@ -181,8 +231,8 @@ class FolderListView(APIView):
 
 
 class MessageListView(APIView):
-    authentication_classes = []
-    permission_classes = []
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
 
     @extend_schema(
         operation_id="mail_messages_list",
@@ -217,8 +267,8 @@ class MessageListView(APIView):
 
 
 class MessageDetailView(APIView):
-    authentication_classes = []
-    permission_classes = []
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
 
     @extend_schema(
         operation_id="mail_messages_detail",
@@ -238,8 +288,8 @@ class MessageDetailView(APIView):
 
 
 class SendMailView(APIView):
-    authentication_classes = []
-    permission_classes = []
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
 
     @extend_schema(
         request=SendMailRequestSerializer,
