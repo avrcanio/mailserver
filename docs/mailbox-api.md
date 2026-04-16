@@ -217,6 +217,64 @@ For a single message, use the same behavior through:
 POST /api/mail/messages/123/delete?folder=INBOX
 ```
 
+## Restore
+
+Restore moves messages from Trash into an explicit non-Trash target folder. The backend does not infer the original folder.
+
+`POST /api/mail/messages/restore`
+
+Request:
+
+```json
+{
+  "folder": "Trash",
+  "target_folder": "INBOX",
+  "uids": ["123", "124"]
+}
+```
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "Trash",
+  "target_folder": "INBOX",
+  "success": true,
+  "partial": false,
+  "restored": ["123", "124"],
+  "failed": []
+}
+```
+
+Partial failures still return HTTP 200 and identify the failed UIDs:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "Trash",
+  "target_folder": "INBOX",
+  "success": false,
+  "partial": true,
+  "restored": ["123"],
+  "failed": [
+    {
+      "uid": "124",
+      "error": "restore_failed",
+      "detail": "IMAP restore failed for UID 124"
+    }
+  ]
+}
+```
+
+For a single message, use:
+
+```http
+POST /api/mail/messages/123/restore?folder=Trash&target_folder=INBOX
+```
+
+Restore requires the source folder to resolve to the server Trash folder, and the target folder must be a non-Trash folder.
+
 ## Send
 
 `POST /api/mail/send`

@@ -16,6 +16,7 @@ from .schemas import (
     MailMessageDetail,
     MailMessageMoveFailure,
     MailMessageMoveToTrashResult,
+    MailMessageRestoreResult,
     MailMessageSummary,
     MailMessageSummaryPage,
     MailboxCredentials,
@@ -175,6 +176,26 @@ class ImapClient:
                 moved.append(uid)
         return MailMessageMoveToTrashResult(trash_folder=trash_folder, moved_to_trash=tuple(moved), failed=tuple(failed))
 
+    def restore_messages_from_trash(self, folder, target_folder, uids):
+        connection = self._require_connection()
+        normalized_uids = tuple(str(uid) for uid in uids)
+        trash_folder = self._resolve_trash_folder()
+        if not _same_folder(folder, trash_folder):
+            raise MailInvalidOperationError("restore_source_not_trash")
+        if _same_folder(target_folder, trash_folder) or _same_folder(target_folder, folder):
+            raise MailInvalidOperationError("restore_target_is_trash")
+        self.select_folder(folder, readonly=False)
+        restored = []
+        failed = []
+        for uid in normalized_uids:
+            try:
+                self._move_message(uid, target_folder, "restore")
+            except MailProtocolError as exc:
+                failed.append(MailMessageMoveFailure(uid=uid, error="restore_failed", detail=str(exc)))
+            else:
+                restored.append(uid)
+        return MailMessageRestoreResult(target_folder=target_folder, restored=tuple(restored), failed=tuple(failed))
+
     def _resolve_trash_folder(self):
         folders = self.list_folders()
         for folder in folders:
@@ -187,36 +208,39 @@ class ImapClient:
         raise MailProtocolError("Could not resolve IMAP Trash folder")
 
     def _move_message_to_trash(self, uid, trash_folder):
+        self._move_message(uid, trash_folder, "move")
+
+    def _move_message(self, uid, target_folder, operation_name):
         connection = self._require_connection()
         try:
-            status, data = connection.uid("MOVE", uid, trash_folder)
+            status, data = connection.uid("MOVE", uid, target_folder)
             if status == "OK":
                 return
             move_error = _decode_first(data)
-            self._copy_and_mark_deleted(uid, trash_folder)
+            self._copy_and_mark_deleted(uid, target_folder, operation_name)
             return
         except socket.timeout as exc:
-            raise MailTimeoutError(f"Timed out moving IMAP message {uid} to Trash") from exc
+            raise MailTimeoutError(f"Timed out during IMAP {operation_name} for UID {uid}") from exc
         except (OSError, ssl.SSLError) as exc:
-            raise MailConnectionError(f"IMAP move-to-trash connection failure for UID {uid}: {exc}") from exc
+            raise MailConnectionError(f"IMAP {operation_name} connection failure for UID {uid}: {exc}") from exc
         except imaplib.IMAP4.error as exc:
             try:
-                self._copy_and_mark_deleted(uid, trash_folder)
+                self._copy_and_mark_deleted(uid, target_folder, operation_name)
                 return
             except socket.timeout as fallback_exc:
-                raise MailTimeoutError(f"Timed out moving IMAP message {uid} to Trash") from fallback_exc
+                raise MailTimeoutError(f"Timed out during IMAP {operation_name} for UID {uid}") from fallback_exc
             except (OSError, ssl.SSLError) as fallback_exc:
-                raise MailConnectionError(f"IMAP move-to-trash connection failure for UID {uid}: {fallback_exc}") from fallback_exc
+                raise MailConnectionError(f"IMAP {operation_name} connection failure for UID {uid}: {fallback_exc}") from fallback_exc
             except imaplib.IMAP4.error as fallback_exc:
-                raise MailProtocolError(f"IMAP move failed for UID {uid}: {fallback_exc}") from fallback_exc
-        raise MailProtocolError(f"IMAP move failed for UID {uid}: {move_error}")
+                raise MailProtocolError(f"IMAP {operation_name} failed for UID {uid}: {fallback_exc}") from fallback_exc
+        raise MailProtocolError(f"IMAP {operation_name} failed for UID {uid}: {move_error}")
 
-    def _copy_and_mark_deleted(self, uid, trash_folder):
+    def _copy_and_mark_deleted(self, uid, target_folder, operation_name):
         connection = self._require_connection()
-        status, data = connection.uid("COPY", uid, trash_folder)
-        self._expect_ok(status, data, f"IMAP copy to Trash failed for UID {uid}")
+        status, data = connection.uid("COPY", uid, target_folder)
+        self._expect_ok(status, data, f"IMAP {operation_name} copy failed for UID {uid}")
         status, data = connection.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
-        self._expect_ok(status, data, f"IMAP mark deleted failed for UID {uid}")
+        self._expect_ok(status, data, f"IMAP {operation_name} mark deleted failed for UID {uid}")
 
     def _require_connection(self):
         if self.connection is None:

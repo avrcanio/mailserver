@@ -19,6 +19,7 @@ from mail_integration.schemas import (
     MailMessageDetail,
     MailMessageMoveFailure,
     MailMessageMoveToTrashResult,
+    MailMessageRestoreResult,
     MailMessageSummary,
     MailMessageSummaryPage,
 )
@@ -532,6 +533,159 @@ class MailApiTests(TestCase):
         self.assertEqual(connection_response.json()["error"], "mail_connection_failed")
 
     @patch("mailops.api.MailboxService")
+    def test_mail_messages_restore_batch_returns_restore_result(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.restore_messages_from_trash.return_value = MailMessageRestoreResult(
+            target_folder="INBOX",
+            restored=("123", "124"),
+            failed=(),
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "INBOX", "uids": [123, "124"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "account_email": self.account_email,
+                "folder": "Trash",
+                "target_folder": "INBOX",
+                "success": True,
+                "partial": False,
+                "restored": ["123", "124"],
+                "failed": [],
+            },
+        )
+        credentials = service.restore_messages_from_trash.call_args.args[0]
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
+        self.assertEqual(service.restore_messages_from_trash.call_args.kwargs, {"folder": "Trash", "target_folder": "INBOX", "uids": ("123", "124")})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_restore_single_uses_query_folders(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.restore_messages_from_trash.return_value = MailMessageRestoreResult(
+            target_folder="Archive",
+            restored=("42",),
+            failed=(),
+        )
+
+        response = self.client.post(f'{reverse("mailops:api_mail_message_restore", kwargs={"uid": "42"})}?folder=Trash&target_folder=Archive', **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["restored"], ["42"])
+        self.assertEqual(
+            service_class.return_value.restore_messages_from_trash.call_args.kwargs,
+            {"folder": "Trash", "target_folder": "Archive", "uids": ("42",)},
+        )
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_restore_serializes_partial_failures(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.restore_messages_from_trash.return_value = MailMessageRestoreResult(
+            target_folder="INBOX",
+            restored=("123",),
+            failed=(MailMessageMoveFailure(uid="124", error="restore_failed", detail="IMAP restore failed for UID 124"),),
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "INBOX", "uids": ["123", "124"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["restored"], ["123"])
+        self.assertEqual(payload["failed"][0]["uid"], "124")
+        self.assertEqual(payload["failed"][0]["error"], "restore_failed")
+
+    def test_mail_messages_restore_requires_token_and_validates_payload(self):
+        missing_token = self.client.post(reverse("mailops:api_mail_messages_restore"), data={}, content_type="application/json")
+        headers = self.auth_headers()
+        missing_folder = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"target_folder": "INBOX", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+        missing_target = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+        empty_uids = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "INBOX", "uids": []},
+            content_type="application/json",
+            **headers,
+        )
+        invalid_uid = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "INBOX", "uids": ["abc"]},
+            content_type="application/json",
+            **headers,
+        )
+        single_missing_target = self.client.post(f'{reverse("mailops:api_mail_message_restore", kwargs={"uid": "42"})}?folder=Trash', **headers)
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(missing_folder.status_code, 400)
+        self.assertEqual(missing_folder.json()["error"], "invalid_folder")
+        self.assertEqual(missing_target.status_code, 400)
+        self.assertEqual(missing_target.json()["error"], "invalid_target_folder")
+        self.assertEqual(empty_uids.status_code, 400)
+        self.assertEqual(empty_uids.json()["error"], "empty_uid_list")
+        self.assertEqual(invalid_uid.status_code, 400)
+        self.assertEqual(invalid_uid.json()["error"], "invalid_uid")
+        self.assertEqual(single_missing_target.status_code, 400)
+        self.assertEqual(single_missing_target.json()["error"], "invalid_target_folder")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_restore_maps_invalid_operations_and_mail_errors(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.restore_messages_from_trash.side_effect = MailInvalidOperationError("restore_source_not_trash")
+        source_response = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "INBOX", "target_folder": "Archive", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        service_class.return_value.restore_messages_from_trash.side_effect = MailInvalidOperationError("restore_target_is_trash")
+        target_response = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "Trash", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        service_class.return_value.restore_messages_from_trash.side_effect = MailConnectionError("down")
+        connection_response = self.client.post(
+            reverse("mailops:api_mail_messages_restore"),
+            data={"folder": "Trash", "target_folder": "INBOX", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(source_response.status_code, 400)
+        self.assertEqual(source_response.json()["error"], "restore_source_not_trash")
+        self.assertEqual(target_response.status_code, 400)
+        self.assertEqual(target_response.json()["error"], "restore_target_is_trash")
+        self.assertEqual(connection_response.status_code, 502)
+        self.assertEqual(connection_response.json()["error"], "mail_connection_failed")
+
+    @patch("mailops.api.MailboxService")
     def test_mail_send_calls_service_and_returns_message_id(self, service_class):
         headers = self.auth_headers()
         service = service_class.return_value
@@ -657,6 +811,8 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/auth/logout")
         self.assertContains(schema, "/api/mail/messages/delete")
         self.assertContains(schema, "/api/mail/messages/{uid}/delete")
+        self.assertContains(schema, "/api/mail/messages/restore")
+        self.assertContains(schema, "/api/mail/messages/{uid}/restore")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/mail/new/")

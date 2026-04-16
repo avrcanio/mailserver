@@ -303,6 +303,95 @@ class ImapClientTests(SimpleTestCase):
             with self.assertRaises(MailTimeoutError):
                 ImapClient().connect().move_messages_to_trash("INBOX", ("123",))
 
+    def test_restore_messages_from_trash_resolves_source_and_uses_uid_move(self):
+        connection = Mock()
+        connection.list.return_value = (
+            "OK",
+            [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Trash) "/" "Trash"',
+            ],
+        )
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"restored"]),
+            ("OK", [b"restored"]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            result = ImapClient().connect().restore_messages_from_trash("Trash", "INBOX", ("123", "124"))
+
+        self.assertEqual(result.target_folder, "INBOX")
+        self.assertEqual(result.restored, ("123", "124"))
+        self.assertEqual(result.failed, ())
+        connection.select.assert_called_once_with("Trash", readonly=False)
+        connection.uid.assert_any_call("MOVE", "123", "INBOX")
+        connection.uid.assert_any_call("MOVE", "124", "INBOX")
+
+    def test_restore_messages_from_trash_falls_back_to_copy_and_deleted_flag(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Trash"'])
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("NO", [b"MOVE unsupported"]),
+            ("OK", [b"copied"]),
+            ("OK", [b"stored"]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            result = ImapClient().connect().restore_messages_from_trash("Trash", "INBOX", ("123",))
+
+        self.assertEqual(result.target_folder, "INBOX")
+        self.assertEqual(result.restored, ("123",))
+        self.assertEqual(result.failed, ())
+        connection.uid.assert_any_call("MOVE", "123", "INBOX")
+        connection.uid.assert_any_call("COPY", "123", "INBOX")
+        connection.uid.assert_any_call("STORE", "123", "+FLAGS.SILENT", r"(\Deleted)")
+
+    def test_restore_messages_from_trash_reports_partial_failures(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Trash"'])
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"restored"]),
+            ("NO", [b"MOVE unsupported"]),
+            ("NO", [b"copy failed"]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            result = ImapClient().connect().restore_messages_from_trash("Trash", "INBOX", ("123", "124"))
+
+        self.assertEqual(result.restored, ("123",))
+        self.assertEqual(len(result.failed), 1)
+        self.assertEqual(result.failed[0].uid, "124")
+        self.assertEqual(result.failed[0].error, "restore_failed")
+        self.assertIn("copy", result.failed[0].detail.lower())
+
+    def test_restore_messages_from_trash_rejects_non_trash_source_and_trash_target(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Trash) "/" "Trash"'])
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            with self.assertRaisesRegex(MailInvalidOperationError, "restore_source_not_trash"):
+                ImapClient().connect().restore_messages_from_trash("INBOX", "Archive", ("123",))
+
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Trash) "/" "Trash"'])
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            with self.assertRaisesRegex(MailInvalidOperationError, "restore_target_is_trash"):
+                ImapClient().connect().restore_messages_from_trash("Trash", "Trash", ("123",))
+
+    def test_restore_messages_from_trash_normalizes_timeout_errors(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "Trash"'])
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = socket.timeout
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            with self.assertRaises(MailTimeoutError):
+                ImapClient().connect().restore_messages_from_trash("Trash", "INBOX", ("123",))
+
     def test_auth_timeout_connection_and_protocol_errors_are_normalized(self):
         with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", side_effect=socket.timeout):
             with self.assertRaises(MailTimeoutError):
@@ -500,6 +589,7 @@ class MailboxServiceTests(SimpleTestCase):
         entered.fetch_message_summary_page.return_value = "summary-page"
         entered.fetch_message_detail.return_value = "detail"
         entered.move_messages_to_trash.return_value = "move-result"
+        entered.restore_messages_from_trash.return_value = "restore-result"
 
         service = MailboxService(imap_client_factory=lambda: imap_client)
 
@@ -508,12 +598,14 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
         self.assertEqual(service.move_messages_to_trash(credentials, folder="Archive", uids=("99",)), "move-result")
-        self.assertEqual(entered.login.call_count, 5)
+        self.assertEqual(service.restore_messages_from_trash(credentials, folder="Trash", target_folder="INBOX", uids=("99",)), "restore-result")
+        self.assertEqual(entered.login.call_count, 6)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
         entered.move_messages_to_trash.assert_called_once_with(folder="Archive", uids=("99",))
+        entered.restore_messages_from_trash.assert_called_once_with(folder="Trash", target_folder="INBOX", uids=("99",))
 
     def test_service_send_method_routes_to_smtp_client(self):
         credentials = MailboxCredentials("sender@example.com", "secret")

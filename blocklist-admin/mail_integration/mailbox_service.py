@@ -32,6 +32,11 @@ class MailboxService:
             client.login(credentials)
             return client.move_messages_to_trash(folder=folder, uids=uids)
 
+    def restore_messages_from_trash(self, credentials, folder, target_folder, uids):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.restore_messages_from_trash(folder=folder, target_folder=target_folder, uids=uids)
+
     def send_mail(self, credentials, request):
         with self.smtp_client_factory() as client:
             client.login(credentials)

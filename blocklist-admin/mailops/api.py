@@ -35,6 +35,8 @@ from .api_serializers import (
     MailHookResponseSerializer,
     MessageDetailResponseSerializer,
     MessageSummariesResponseSerializer,
+    RestoreMessagesRequestSerializer,
+    RestoreMessagesResponseSerializer,
     SendMailRequestSerializer,
     SendMailResponseSerializer,
 )
@@ -198,6 +200,26 @@ def delete_result_payload(credentials, folder, result):
     }
 
 
+def restore_result_payload(credentials, folder, result):
+    failed = [
+        {
+            "uid": failure.uid,
+            "error": failure.error,
+            "detail": failure.detail,
+        }
+        for failure in result.failed
+    ]
+    return {
+        "account_email": credentials.email,
+        "folder": folder,
+        "target_folder": result.target_folder,
+        "success": bool(result.restored) and not failed,
+        "partial": bool(result.restored) and bool(failed),
+        "restored": list(result.restored),
+        "failed": failed,
+    }
+
+
 def validate_delete_payload(data):
     if "folder" not in data or not str(data.get("folder") or "").strip():
         return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
@@ -212,6 +234,35 @@ def validate_delete_payload(data):
             return None, Response({"error": "invalid_uid"}, status=status.HTTP_400_BAD_REQUEST)
         return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
     return serializer.validated_data, None
+
+
+def validate_restore_payload(data):
+    if "folder" not in data or not str(data.get("folder") or "").strip():
+        return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+    if "target_folder" not in data or not str(data.get("target_folder") or "").strip():
+        return None, Response({"error": "invalid_target_folder"}, status=status.HTTP_400_BAD_REQUEST)
+    if "uids" not in data:
+        return None, Response({"error": "empty_uid_list"}, status=status.HTTP_400_BAD_REQUEST)
+    serializer = RestoreMessagesRequestSerializer(data=data)
+    if not serializer.is_valid():
+        if "uids" in serializer.errors:
+            errors = serializer.errors["uids"]
+            if any(getattr(error, "code", None) == "empty" for error in errors):
+                return None, Response({"error": "empty_uid_list"}, status=status.HTTP_400_BAD_REQUEST)
+            return None, Response({"error": "invalid_uid"}, status=status.HTTP_400_BAD_REQUEST)
+        if "target_folder" in serializer.errors:
+            return None, Response({"error": "invalid_target_folder"}, status=status.HTTP_400_BAD_REQUEST)
+        return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+    return serializer.validated_data, None
+
+
+def restore_invalid_operation_response(exc):
+    error = str(exc)
+    if error == "restore_source_not_trash":
+        return Response({"error": "restore_source_not_trash"}, status=status.HTTP_400_BAD_REQUEST)
+    if error == "restore_target_is_trash":
+        return Response({"error": "restore_target_is_trash"}, status=status.HTTP_400_BAD_REQUEST)
+    return Response({"error": "invalid_restore_operation"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LoginView(APIView):
@@ -417,6 +468,72 @@ class DeleteMessageView(APIView):
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response(delete_result_payload(credentials, data["folder"], result))
+
+
+class RestoreMessagesView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_restore",
+        request=RestoreMessagesRequestSerializer,
+        responses={200: RestoreMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def post(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        data, error = validate_restore_payload(request.data)
+        if error:
+            return error
+        try:
+            result = MailboxService().restore_messages_from_trash(
+                credentials,
+                folder=data["folder"],
+                target_folder=data["target_folder"],
+                uids=tuple(data["uids"]),
+            )
+        except MailInvalidOperationError as exc:
+            return restore_invalid_operation_response(exc)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(restore_result_payload(credentials, data["folder"], result))
+
+
+class RestoreMessageView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_restore_single",
+        request=None,
+        parameters=[
+            OpenApiParameter("folder", str, required=True, description="Source Trash folder name."),
+            OpenApiParameter("target_folder", str, required=True, description="Restore target mailbox folder name."),
+        ],
+        responses={200: RestoreMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def post(self, request, uid):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "").strip()
+        target_folder = (request.query_params.get("target_folder") or "").strip()
+        data, error = validate_restore_payload({"folder": folder, "target_folder": target_folder, "uids": [uid]})
+        if error:
+            return error
+        try:
+            result = MailboxService().restore_messages_from_trash(
+                credentials,
+                folder=data["folder"],
+                target_folder=data["target_folder"],
+                uids=tuple(data["uids"]),
+            )
+        except MailInvalidOperationError as exc:
+            return restore_invalid_operation_response(exc)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(restore_result_payload(credentials, data["folder"], result))
 
 
 class SendMailView(APIView):

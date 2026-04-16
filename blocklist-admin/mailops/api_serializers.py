@@ -167,6 +167,22 @@ class DeleteMessagesResponseSerializer(serializers.Serializer):
     failed = DeleteMessageFailureSerializer(many=True)
 
 
+class RestoreMessagesRequestSerializer(serializers.Serializer):
+    folder = serializers.CharField(allow_blank=False)
+    target_folder = serializers.CharField(allow_blank=False)
+    uids = serializers.ListField(child=MailboxUidField(), allow_empty=False)
+
+
+class RestoreMessagesResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folder = serializers.CharField()
+    target_folder = serializers.CharField()
+    success = serializers.BooleanField()
+    partial = serializers.BooleanField()
+    restored = serializers.ListField(child=serializers.CharField())
+    failed = DeleteMessageFailureSerializer(many=True)
+
+
 class DeviceRegistrationRequestSerializer(serializers.Serializer):
     account_email = serializers.EmailField(required=False)
     accountEmail = serializers.EmailField(required=False)
