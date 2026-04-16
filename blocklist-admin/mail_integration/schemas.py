@@ -63,3 +63,4 @@ class SendMailRequest:
     cc: tuple[str, ...] = field(default_factory=tuple)
     bcc: tuple[str, ...] = field(default_factory=tuple)
     reply_to: str | None = None
+    from_display_name: str = ""

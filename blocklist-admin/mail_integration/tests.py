@@ -1,6 +1,7 @@
 import imaplib
 import socket
 import smtplib
+import ssl
 from email.message import EmailMessage
 from unittest.mock import Mock, patch
 
@@ -10,7 +11,7 @@ from .exceptions import MailAuthError, MailConnectionError, MailProtocolError, M
 from .imap_client import ImapClient
 from .mailbox_service import MailboxService
 from .schemas import MailboxCredentials, SendMailRequest
-from .smtp_client import SmtpClient
+from .smtp_client import SmtpClient, build_email_message
 
 
 @override_settings(
@@ -208,7 +209,47 @@ class ImapClientTests(SimpleTestCase):
     MAIL_CLIENT_TIMEOUT_SECONDS=15,
 )
 class SmtpClientTests(SimpleTestCase):
-    def test_send_mail_builds_message_and_recipient_envelope(self):
+    def test_login_and_quit_lifecycle(self):
+        connection = Mock()
+
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection) as smtp:
+            client = SmtpClient().connect().login(MailboxCredentials("sender@example.com", "secret"))
+            client.quit()
+
+        smtp.assert_called_once_with("mail.finestar.test", 587, timeout=15)
+        connection.starttls.assert_called_once()
+        connection.login.assert_called_once_with("sender@example.com", "secret")
+        connection.quit.assert_called_once()
+
+    def test_plain_text_send_builds_single_text_message(self):
+        connection = Mock()
+
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            SmtpClient().connect().send_mail(
+                MailboxCredentials("sender@example.com", "secret"),
+                SendMailRequest(to=("to@example.com",), subject="Plain", text_body="Plain body"),
+            )
+
+        sent_message = connection.send_message.call_args.args[0]
+        self.assertFalse(sent_message.is_multipart())
+        self.assertEqual(sent_message.get_content_type(), "text/plain")
+        self.assertEqual(sent_message.get_content().strip(), "Plain body")
+
+    def test_html_send_builds_single_html_message(self):
+        connection = Mock()
+
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            SmtpClient().connect().send_mail(
+                MailboxCredentials("sender@example.com", "secret"),
+                SendMailRequest(to=("to@example.com",), subject="HTML", html_body="<p>HTML body</p>"),
+            )
+
+        sent_message = connection.send_message.call_args.args[0]
+        self.assertFalse(sent_message.is_multipart())
+        self.assertEqual(sent_message.get_content_type(), "text/html")
+        self.assertEqual(sent_message.get_content().strip(), "<p>HTML body</p>")
+
+    def test_multipart_send_builds_alternative_message_and_recipient_envelope(self):
         connection = Mock()
 
         with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
@@ -220,20 +261,27 @@ class SmtpClientTests(SimpleTestCase):
                     cc=("cc@example.com",),
                     bcc=("bcc@example.com",),
                     reply_to="reply@example.com",
-                    subject="Status",
+                    subject="Status Čakovec",
                     text_body="Plain body",
                     html_body="<p>HTML body</p>",
+                    from_display_name="Finestar Čakovec",
                 ),
             )
 
         connection.starttls.assert_called_once()
         connection.login.assert_called_once_with("sender@example.com", "secret")
         sent_message = connection.send_message.call_args.args[0]
-        self.assertEqual(sent_message["From"], "sender@example.com")
+        self.assertEqual(str(sent_message["From"]), "Finestar Čakovec <sender@example.com>")
         self.assertEqual(sent_message["To"], "to@example.com")
         self.assertEqual(sent_message["Cc"], "cc@example.com")
         self.assertEqual(sent_message["Reply-To"], "reply@example.com")
+        self.assertEqual(str(sent_message["Subject"]), "Status Čakovec")
+        self.assertIn("Date", sent_message)
         self.assertNotIn("Bcc", sent_message)
+        self.assertTrue(sent_message.is_multipart())
+        self.assertEqual(sent_message.get_content_type(), "multipart/alternative")
+        self.assertEqual([part.get_content_type() for part in sent_message.iter_parts()], ["text/plain", "text/html"])
+        self.assertEqual(sum(1 for _ in sent_message.walk() if "MIME-Version" in _), 1)
         self.assertEqual(connection.send_message.call_args.kwargs["to_addrs"], ["to@example.com", "cc@example.com", "bcc@example.com"])
         self.assertEqual(message_id, sent_message["Message-ID"])
 
@@ -247,10 +295,25 @@ class SmtpClientTests(SimpleTestCase):
                 SmtpClient().connect()
 
         connection = Mock()
+        connection.starttls.side_effect = ssl.SSLError("tls failed")
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            with self.assertRaises(MailConnectionError):
+                SmtpClient().connect()
+
+        connection = Mock()
         connection.login.side_effect = smtplib.SMTPAuthenticationError(535, b"bad")
         with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
             with self.assertRaises(MailAuthError):
                 SmtpClient().connect().login(MailboxCredentials("sender@example.com", "bad"))
+
+        connection = Mock()
+        connection.send_message.side_effect = socket.timeout
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            with self.assertRaises(MailTimeoutError):
+                SmtpClient().connect().send_mail(
+                    MailboxCredentials("sender@example.com", "secret"),
+                    SendMailRequest(to=("to@example.com",), subject="Hi", text_body="Body"),
+                )
 
         connection = Mock()
         connection.send_message.side_effect = smtplib.SMTPRecipientsRefused({})
@@ -260,6 +323,20 @@ class SmtpClientTests(SimpleTestCase):
                     MailboxCredentials("sender@example.com", "secret"),
                     SendMailRequest(to=("to@example.com",), subject="Hi", text_body="Body"),
                 )
+
+        connection = Mock()
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            with self.assertRaises(MailProtocolError):
+                SmtpClient().connect().send_mail(
+                    MailboxCredentials("not-an-email", "secret"),
+                    SendMailRequest(to=("to@example.com",), subject="Hi", text_body="Body", from_display_name="Sender"),
+                )
+
+    def test_message_building_rejects_missing_recipients_or_body(self):
+        with self.assertRaises(ValueError):
+            build_email_message("sender@example.com", SendMailRequest(to=(), subject="Hi", text_body="Body"))
+        with self.assertRaises(ValueError):
+            build_email_message("sender@example.com", SendMailRequest(to=("to@example.com",), subject="Hi"))
 
 
 class MailboxServiceTests(SimpleTestCase):
@@ -295,6 +372,18 @@ class MailboxServiceTests(SimpleTestCase):
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
+
+    def test_service_send_method_routes_to_smtp_client(self):
+        credentials = MailboxCredentials("sender@example.com", "secret")
+        request = SendMailRequest(to=("to@example.com",), subject="Hi", text_body="Body")
+        smtp_client = _context_client()
+        smtp_client.__enter__.return_value.send_mail.return_value = "<sent@example.com>"
+
+        service = MailboxService(smtp_client_factory=lambda: smtp_client)
+
+        self.assertEqual(service.send_mail(credentials, request), "<sent@example.com>")
+        smtp_client.__enter__.return_value.login.assert_called_once_with(credentials)
+        smtp_client.__enter__.return_value.send_mail.assert_called_once_with(credentials, request)
 
 
 def _raw_detail_message(text_body="", html_body="", attach=False):

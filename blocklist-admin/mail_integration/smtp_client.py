@@ -2,11 +2,12 @@ import smtplib
 import socket
 import ssl
 from email.message import EmailMessage
-from email.utils import make_msgid
+from email.headerregistry import Address
+from email.utils import format_datetime, localtime, make_msgid
 
 from django.conf import settings
 
-from .exceptions import MailAuthError, MailConnectionError, MailSendError, MailTimeoutError
+from .exceptions import MailAuthError, MailConnectionError, MailProtocolError, MailSendError, MailTimeoutError
 from .schemas import MailboxCredentials, SendMailRequest
 
 
@@ -43,8 +44,11 @@ class SmtpClient:
 
     def send_mail(self, credentials: MailboxCredentials, request: SendMailRequest):
         connection = self._require_connection()
-        message = build_email_message(credentials.email, request)
-        recipients = list(request.to) + list(request.cc) + list(request.bcc)
+        try:
+            message = build_email_message(credentials.email, request)
+            recipients = list(request.to) + list(request.cc) + list(request.bcc)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise MailProtocolError(f"Could not build SMTP message: {exc}") from exc
         try:
             connection.send_message(message, from_addr=credentials.email, to_addrs=recipients)
         except socket.timeout as exc:
@@ -80,19 +84,43 @@ class SmtpClient:
 
 
 def build_email_message(from_email, request: SendMailRequest):
+    if not request.to:
+        raise ValueError("At least one recipient is required")
+    if not request.text_body and not request.html_body:
+        raise ValueError("Either text_body or html_body is required")
+
     message = EmailMessage()
-    message["From"] = from_email
+    message["From"] = _from_header(from_email, request.from_display_name)
     message["To"] = ", ".join(request.to)
     if request.cc:
         message["Cc"] = ", ".join(request.cc)
     if request.reply_to:
         message["Reply-To"] = request.reply_to
     message["Subject"] = request.subject
+    message["Date"] = format_datetime(localtime())
     message["Message-ID"] = make_msgid()
 
-    if request.html_body:
-        message.set_content(request.text_body or "")
+    if request.text_body and request.html_body:
+        message.set_content(request.text_body)
         message.add_alternative(request.html_body, subtype="html")
+        _remove_nested_mime_version_headers(message)
+    elif request.html_body:
+        message.set_content(request.html_body, subtype="html")
     else:
-        message.set_content(request.text_body or "")
+        message.set_content(request.text_body)
     return message
+
+
+def _from_header(from_email, display_name):
+    if not display_name:
+        return from_email
+    local_part, separator, domain = from_email.partition("@")
+    if not separator or not local_part or not domain:
+        raise ValueError("Sender email must be a valid addr-spec")
+    return Address(display_name=display_name, username=local_part, domain=domain)
+
+
+def _remove_nested_mime_version_headers(message):
+    for part in message.iter_parts():
+        if "MIME-Version" in part:
+            del part["MIME-Version"]
