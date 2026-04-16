@@ -170,16 +170,18 @@ Request:
 
 ```json
 {
-  "to": ["recipient@example.com"],
+  "to": ["Recipient Name <recipient@example.com>"],
   "cc": ["copy@example.com"],
   "bcc": ["hidden@example.com"],
-  "reply_to": "reply@finestar.hr",
+  "reply_to": "Reply Person <reply@finestar.hr>",
   "subject": "Status",
   "text_body": "Plain body",
   "html_body": "<p>HTML body</p>",
   "from_display_name": "Finestar Mail"
 }
 ```
+
+Recipient fields accept either plain addresses such as `recipient@example.com` or mailbox-formatted values such as `Recipient Name <recipient@example.com>`. The backend normalizes them to one email address per item before sending. `Bcc` recipients are used only in the SMTP envelope and are not exposed in email headers.
 
 Response:
 

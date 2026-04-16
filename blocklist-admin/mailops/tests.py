@@ -400,10 +400,10 @@ class MailApiTests(TestCase):
         response = self.client.post(
             reverse("mailops:api_mail_send"),
             data={
-                "to": ["to@example.com"],
-                "cc": ["copy@example.com"],
-                "bcc": ["hidden@example.com"],
-                "reply_to": "reply@example.com",
+                "to": ["Recipient Name <to@example.com>"],
+                "cc": ["Copy Person <copy@example.com>"],
+                "bcc": ["Hidden Person <hidden@example.com>"],
+                "reply_to": "Reply Person <reply@example.com>",
                 "subject": "Status",
                 "text_body": "Plain body",
                 "html_body": "<p>HTML body</p>",
@@ -426,6 +426,35 @@ class MailApiTests(TestCase):
         self.assertEqual(request.text_body, "Plain body")
         self.assertEqual(request.html_body, "<p>HTML body</p>")
         self.assertEqual(request.from_display_name, "Sender Name")
+
+    def test_mail_send_normalizes_display_name_recipients_and_rejects_invalid_addresses(self):
+        headers = self.auth_headers()
+
+        invalid_recipient = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={"to": ["bad recipient"], "subject": "Hi", "text_body": "Body"},
+            content_type="application/json",
+            **headers,
+        )
+        multiple_recipients = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={"to": ["One <one@example.com>, Two <two@example.com>"], "subject": "Hi", "text_body": "Body"},
+            content_type="application/json",
+            **headers,
+        )
+        malformed_reply_to = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={"to": ["to@example.com"], "reply_to": "Reply <reply@example.com", "subject": "Hi", "text_body": "Body"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(invalid_recipient.status_code, 400)
+        self.assertIn("to", invalid_recipient.json())
+        self.assertEqual(multiple_recipients.status_code, 400)
+        self.assertIn("to", multiple_recipients.json())
+        self.assertEqual(malformed_reply_to.status_code, 400)
+        self.assertIn("reply_to", malformed_reply_to.json())
 
     def test_mail_send_requires_token_and_validates_required_fields(self):
         missing_token = self.client.post(reverse("mailops:api_mail_send"), data={}, content_type="application/json")

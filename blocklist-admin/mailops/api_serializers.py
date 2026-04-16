@@ -1,4 +1,37 @@
+from email.utils import getaddresses
+
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
 from rest_framework import serializers
+
+
+def normalize_mailbox_address(value):
+    raw_value = value.strip()
+    if not raw_value:
+        raise serializers.ValidationError("This field may not be blank.")
+    if ("<" in raw_value or ">" in raw_value) and not (
+        raw_value.count("<") == 1 and raw_value.count(">") == 1 and raw_value.index("<") < raw_value.index(">")
+    ):
+        raise serializers.ValidationError("Enter a valid email address.")
+    addresses = getaddresses([raw_value])
+    if len(addresses) != 1:
+        raise serializers.ValidationError("Enter one email address per list item.")
+    email = addresses[0][1].strip()
+    if not email:
+        raise serializers.ValidationError("Enter a valid email address.")
+    try:
+        validate_email(email)
+    except DjangoValidationError as exc:
+        raise serializers.ValidationError("Enter a valid email address.") from exc
+    return email
+
+
+class MailboxAddressField(serializers.CharField):
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        if value == "" and self.allow_blank:
+            return ""
+        return normalize_mailbox_address(value)
 
 
 class LoginRequestSerializer(serializers.Serializer):
@@ -80,13 +113,13 @@ class MessageDetailResponseSerializer(serializers.Serializer):
 
 
 class SendMailRequestSerializer(serializers.Serializer):
-    to = serializers.ListField(child=serializers.EmailField(), allow_empty=False)
+    to = serializers.ListField(child=MailboxAddressField(), allow_empty=False)
     subject = serializers.CharField(allow_blank=False)
     text_body = serializers.CharField(required=False, allow_blank=True, default="")
     html_body = serializers.CharField(required=False, allow_blank=True, default="")
-    cc = serializers.ListField(child=serializers.EmailField(), required=False, allow_empty=True, default=list)
-    bcc = serializers.ListField(child=serializers.EmailField(), required=False, allow_empty=True, default=list)
-    reply_to = serializers.EmailField(required=False, allow_blank=True, allow_null=True, default=None)
+    cc = serializers.ListField(child=MailboxAddressField(), required=False, allow_empty=True, default=list)
+    bcc = serializers.ListField(child=MailboxAddressField(), required=False, allow_empty=True, default=list)
+    reply_to = MailboxAddressField(required=False, allow_blank=True, allow_null=True, default=None)
     from_display_name = serializers.CharField(required=False, allow_blank=True, default="")
 
     def validate(self, attrs):
