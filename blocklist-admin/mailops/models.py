@@ -82,3 +82,74 @@ class ApplyLog(models.Model):
 
     def __str__(self):
         return f"{self.status} @ {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
+class DeviceRegistration(models.Model):
+    PLATFORM_ANDROID = "android"
+    PLATFORM_IOS = "ios"
+    PLATFORM_WEB = "web"
+    PLATFORM_UNKNOWN = "unknown"
+    PLATFORM_CHOICES = [
+        (PLATFORM_ANDROID, "Android"),
+        (PLATFORM_IOS, "iOS"),
+        (PLATFORM_WEB, "Web"),
+        (PLATFORM_UNKNOWN, "Unknown"),
+    ]
+
+    account_email = models.EmailField(db_index=True)
+    fcm_token = models.TextField(unique=True)
+    platform = models.CharField(max_length=16, choices=PLATFORM_CHOICES, default=PLATFORM_UNKNOWN)
+    app_version = models.CharField(max_length=64, blank=True, default="")
+    enabled = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["account_email", "-last_seen_at"]
+        verbose_name = "Device registration"
+        verbose_name_plural = "Device registrations"
+
+    def clean(self):
+        self.account_email = self.account_email.strip().lower()
+        self.platform = (self.platform or self.PLATFORM_UNKNOWN).strip().lower()
+        self.app_version = (self.app_version or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.account_email} ({self.platform})"
+
+
+class PushNotificationLog(models.Model):
+    STATUS_SUCCESS = "success"
+    STATUS_PARTIAL = "partial"
+    STATUS_SKIPPED = "skipped"
+    STATUS_ERROR = "error"
+    STATUS_CHOICES = [
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_PARTIAL, "Partial"),
+        (STATUS_SKIPPED, "Skipped"),
+        (STATUS_ERROR, "Error"),
+    ]
+
+    account_email = models.EmailField(db_index=True)
+    sender = models.CharField(max_length=255, blank=True, default="")
+    subject = models.CharField(max_length=255, blank=True, default="")
+    message_id = models.CharField(max_length=512, blank=True, default="")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES)
+    device_count = models.PositiveIntegerField(default=0)
+    success_count = models.PositiveIntegerField(default=0)
+    failure_count = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Push notification log"
+        verbose_name_plural = "Push notification logs"
+
+    def __str__(self):
+        return f"{self.account_email}: {self.status} @ {self.created_at:%Y-%m-%d %H:%M:%S}"

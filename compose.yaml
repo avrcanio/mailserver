@@ -22,6 +22,9 @@ services:
       - ./docker-data/dms/mail-state:/var/mail-state
       - ./docker-data/dms/mail-logs:/var/log/mail
       - ./docker-data/dms/config:/tmp/docker-mailserver
+      - ./docker-data/dms/config/dovecot-fcm-after.sieve:/usr/lib/dovecot/sieve-global/after/90-fcm-notify.sieve
+      - ./scripts/dovecot-fcm-notify.py:/usr/lib/dovecot/sieve-pipe/fcm-notify
+      - ./docker-data/dms/config/fcm-hook-secret:/run/secrets/fcm-hook-secret:ro
       - ./docker-data/certbot/certs:/etc/letsencrypt
       - /etc/localtime:/etc/localtime:ro
     healthcheck:
@@ -33,33 +36,15 @@ services:
     restart: unless-stopped
     stop_grace_period: 1m
 
-  blocklist-db:
-    image: postgres:16-alpine
-    container_name: mailserver-blocklist-db
-    environment:
-      POSTGRES_DB: ${BLOCKLIST_DB_NAME:-mailblocklist}
-      POSTGRES_USER: ${BLOCKLIST_DB_USER:-mailblocklist}
-      POSTGRES_PASSWORD: ${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}
-      PGDATA: /var/lib/postgresql/data/pgdata
-      TZ: ${TZ}
-    volumes:
-      - ./docker-data/blocklist-db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${BLOCKLIST_DB_USER:-mailblocklist} -d ${BLOCKLIST_DB_NAME:-mailblocklist}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   mailadmin:
     build:
       context: ./blocklist-admin
     container_name: mailserver-mailadmin
     environment:
       TZ: ${TZ}
-      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@blocklist-db:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
+      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@postgis:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
       DJANGO_SECRET_KEY: ${MAILADMIN_SECRET_KEY:-change-me-too}
-      DJANGO_ALLOWED_HOSTS: ${MAILADMIN_ALLOWED_HOSTS:-mailadmin.example.com,127.0.0.1,localhost}
+      DJANGO_ALLOWED_HOSTS: ${MAILADMIN_ALLOWED_HOSTS:-mailadmin.example.com,127.0.0.1,localhost},mailadmin
       DJANGO_CSRF_TRUSTED_ORIGINS: ${MAILADMIN_CSRF_TRUSTED_ORIGINS:-https://mailadmin.example.com}
       DJANGO_SUPERUSER_USERNAME: ${MAILADMIN_SUPERUSER_USERNAME:-admin}
       DJANGO_SUPERUSER_PASSWORD: ${MAILADMIN_SUPERUSER_PASSWORD:-change-me}
@@ -68,13 +53,18 @@ services:
       BLOCKLIST_CONFIG_PATH: /app/shared-config/postfix-sender-blocklist
       MAILSERVER_CONTAINER_NAME: mailserver
       BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
+      MAIL_NOTIFY_HOOK_SECRET: ${MAIL_NOTIFY_HOOK_SECRET}
+      DEVICE_REGISTRATION_SECRET: ${DEVICE_REGISTRATION_SECRET}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
     ports:
       - "127.0.0.1:8081:8000"
     volumes:
       - ./docker-data/dms/config:/app/shared-config
+      - ./docker-data/secrets/firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - default
+      - postgis
       - proxy
     labels:
       - traefik.enable=true
@@ -85,12 +75,12 @@ services:
       - traefik.http.routers.mailadmin.tls.certresolver=cloudflare
       - traefik.http.services.mailadmin.loadbalancer.server.port=8000
     depends_on:
-      blocklist-db:
-        condition: service_healthy
       mailserver:
         condition: service_started
     restart: unless-stopped
 
 networks:
+  postgis:
+    external: true
   proxy:
     external: true

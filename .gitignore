@@ -2,6 +2,11 @@
 .env.local
 .codex
 AGENTS.md
+fs-mail-*-firebase-adminsdk-*.json
+*firebase-adminsdk*.json
+google-services*.json
+docker-data/secrets/*
+!docker-data/secrets/.gitkeep
 docker-data/certbot/secrets/*
 !docker-data/certbot/secrets/.gitkeep
 docker-data/certbot/certs/*
@@ -14,6 +19,8 @@ docker-data/dms/mail-logs/
 docker-data/dms/config/postfix-accounts.cf
 docker-data/dms/config/postfix-accounts.cf.bak
 docker-data/dms/config/dovecot-quotas.cf
+docker-data/dms/config/fcm-hook-secret
+docker-data/dms/config/*.svbin
 docker-data/dms/config/opendkim/keys/*
 !docker-data/dms/config/opendkim/keys/.gitkeep
 backups/*.tar.gz
@@ -27,6 +34,8 @@ docker-data/dms/config/opendkim/KeyTable
 docker-data/dms/config/opendkim/SigningTable
 docker-data/blocklist-db/*
 !docker-data/blocklist-db/.gitkeep
+docker-data/blocklist-db-migration-backup/*
+!docker-data/blocklist-db-migration-backup/.gitkeep
 blocklist-admin/__pycache__/
 blocklist-admin/.pytest_cache/
 blocklist-admin/staticfiles/
