@@ -112,6 +112,53 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["user"]["email"], self.account_email)
 
+    def test_logout_revokes_current_token_and_mailbox_credentials(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        DeviceRegistration.objects.create(
+            account_email=self.account_email,
+            fcm_token="token-1",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+        headers = {"HTTP_AUTHORIZATION": f"Token {token.key}"}
+
+        response = self.client.post(reverse("mailops:api_logout"), data={}, content_type="application/json", **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"success": True})
+        self.assertFalse(Token.objects.filter(pk=token.pk).exists())
+        self.assertFalse(MailboxTokenCredential.objects.filter(token_id=token.pk).exists())
+
+        user = get_user_model().objects.get(email=self.account_email)
+        self.assertTrue(user.is_active)
+        self.assertFalse(user.is_staff)
+        self.assertTrue(DeviceRegistration.objects.get(fcm_token="token-1").enabled)
+
+        me_response = self.client.get(reverse("mailops:api_me"), **headers)
+        folders_response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
+        repeat_logout_response = self.client.post(reverse("mailops:api_logout"), data={}, content_type="application/json", **headers)
+
+        self.assertEqual(me_response.status_code, 401)
+        self.assertEqual(me_response.json()["error"], "not_authenticated")
+        self.assertEqual(folders_response.status_code, 401)
+        self.assertEqual(folders_response.json()["error"], "not_authenticated")
+        self.assertEqual(repeat_logout_response.status_code, 401)
+        self.assertEqual(repeat_logout_response.json()["error"], "not_authenticated")
+
+    def test_logout_requires_token(self):
+        missing_token = self.client.post(reverse("mailops:api_logout"), data={}, content_type="application/json")
+        invalid_token = self.client.post(
+            reverse("mailops:api_logout"),
+            data={},
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Token invalid",
+        )
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(invalid_token.status_code, 401)
+        self.assertEqual(invalid_token.json()["error"], "not_authenticated")
+
     def test_mail_endpoint_rejects_invalid_token(self):
         response = self.client.get(reverse("mailops:api_me"), HTTP_AUTHORIZATION="Token invalid")
 
@@ -345,6 +392,7 @@ class MailApiTests(TestCase):
 
         self.assertEqual(schema.status_code, 200)
         self.assertContains(schema, "/api/auth/login")
+        self.assertContains(schema, "/api/auth/logout")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/mail/new/")

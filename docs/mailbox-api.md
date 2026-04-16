@@ -55,6 +55,26 @@ Response:
 }
 ```
 
+`POST /api/auth/logout`
+
+Headers:
+
+```http
+Authorization: Token drf-token-key
+```
+
+Request body is optional and ignored.
+
+Response:
+
+```json
+{
+  "success": true
+}
+```
+
+Logout revokes only the current DRF token. The linked server-side mailbox credential is deleted automatically, so the same token can no longer access `/api/auth/me` or protected mail endpoints. The Django user and existing push device registrations remain unchanged.
+
 ## Folders
 
 `GET /api/mail/folders`

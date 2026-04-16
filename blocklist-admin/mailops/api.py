@@ -20,6 +20,7 @@ from .api_serializers import (
     FoldersResponseSerializer,
     IdentitySerializer,
     LoginRequestSerializer,
+    LogoutResponseSerializer,
     MailHookRequestSerializer,
     MailHookResponseSerializer,
     MessageDetailResponseSerializer,
@@ -225,6 +226,16 @@ class MeView(APIView):
                 "account_email": credentials.email,
             }
         )
+
+
+class LogoutView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(request=None, responses={200: LogoutResponseSerializer, 401: ErrorSerializer})
+    def post(self, request):
+        request.auth.delete()
+        return Response({"success": True})
 
 
 class FolderListView(APIView):

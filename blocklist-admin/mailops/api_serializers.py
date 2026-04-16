@@ -19,6 +19,10 @@ class IdentitySerializer(serializers.Serializer):
     folder_count = serializers.IntegerField(required=False)
 
 
+class LogoutResponseSerializer(serializers.Serializer):
+    success = serializers.BooleanField()
+
+
 class ErrorSerializer(serializers.Serializer):
     error = serializers.CharField()
     detail = serializers.CharField(required=False, allow_blank=True)

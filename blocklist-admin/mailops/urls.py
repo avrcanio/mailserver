@@ -11,6 +11,7 @@ urlpatterns = [
     path("apply/", views.apply_blocklist_view, name="apply"),
     path("api/auth/login", api.LoginView.as_view(), name="api_login"),
     path("api/auth/me", api.MeView.as_view(), name="api_me"),
+    path("api/auth/logout", api.LogoutView.as_view(), name="api_logout"),
     path("api/mail/folders", api.FolderListView.as_view(), name="api_mail_folders"),
     path("api/mail/messages", api.MessageListView.as_view(), name="api_mail_messages"),
     path("api/mail/messages/<str:uid>", api.MessageDetailView.as_view(), name="api_mail_message_detail"),
