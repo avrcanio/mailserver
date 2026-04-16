@@ -93,3 +93,51 @@ class SendMailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     status = serializers.CharField()
     message_id = serializers.CharField(allow_null=True)
+
+
+class DeviceRegistrationRequestSerializer(serializers.Serializer):
+    account_email = serializers.EmailField(required=False)
+    accountEmail = serializers.EmailField(required=False)
+    accountId = serializers.EmailField(required=False)
+    email = serializers.EmailField(required=False)
+    fcm_token = serializers.CharField(required=False, allow_blank=True)
+    fcmToken = serializers.CharField(required=False, allow_blank=True)
+    platform = serializers.CharField(required=False, allow_blank=True, default="", max_length=32)
+    app_version = serializers.CharField(required=False, allow_blank=True, default="", max_length=64)
+    appVersion = serializers.CharField(required=False, allow_blank=True, max_length=64)
+
+    def validate(self, attrs):
+        attrs["normalized_account_email"] = (
+            attrs.get("account_email") or attrs.get("accountEmail") or attrs.get("accountId") or attrs.get("email") or ""
+        ).strip().lower()
+        attrs["normalized_fcm_token"] = (attrs.get("fcm_token") or attrs.get("fcmToken") or "").strip()
+        platform = (attrs.get("platform") or "unknown").strip().lower()
+        attrs["normalized_platform"] = platform if platform in {"android", "ios", "web", "unknown"} else "unknown"
+        attrs["normalized_app_version"] = (attrs.get("app_version") or attrs.get("appVersion") or "").strip()
+        if not attrs["normalized_fcm_token"]:
+            raise serializers.ValidationError({"fcm_token": "This field is required."})
+        return attrs
+
+
+class DeviceRegistrationResponseSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    created = serializers.BooleanField()
+    id = serializers.IntegerField()
+    account_email = serializers.EmailField()
+
+
+class MailHookRequestSerializer(serializers.Serializer):
+    accountEmail = serializers.EmailField()
+    sender = serializers.CharField(required=False, allow_blank=True, default="")
+    subject = serializers.CharField(required=False, allow_blank=True, default="")
+    receivedAt = serializers.CharField(required=False, allow_blank=True, default="")
+    folder = serializers.CharField(required=False, allow_blank=True, default="")
+    uid = serializers.CharField(required=False, allow_blank=True, default="")
+    messageId = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class MailHookResponseSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    deviceCount = serializers.IntegerField()
+    successCount = serializers.IntegerField()
+    failureCount = serializers.IntegerField()

@@ -42,9 +42,19 @@ def _clean_data(value):
     return str(value)
 
 
+def _is_unregistered_fcm_error(exc):
+    code = str(getattr(exc, "code", "") or "").lower()
+    message = str(exc).lower()
+    return (
+        code in {"unregistered", "invalid-argument", "invalid_argument", "registration-token-not-registered"}
+        or "registration-token-not-registered" in message
+        or "requested entity was not found" in message
+    )
+
+
 def send_mail_notification(event):
     account_email = event["accountEmail"].strip().lower()
-    devices = list(DeviceRegistration.objects.filter(account_email=account_email, enabled=True))
+    devices = list(DeviceRegistration.objects.filter(account_email=account_email, enabled=True).order_by("id"))
     if not devices:
         PushNotificationLog.objects.create(
             account_email=account_email,
@@ -90,8 +100,7 @@ def send_mail_notification(event):
     for index, result in enumerate(response.responses):
         if result.success:
             continue
-        code = getattr(result.exception, "code", "")
-        if code in {"UNREGISTERED", "INVALID_ARGUMENT", "registration-token-not-registered"}:
+        if _is_unregistered_fcm_error(result.exception):
             invalid_tokens.append(devices[index].fcm_token)
     if invalid_tokens:
         DeviceRegistration.objects.filter(fcm_token__in=invalid_tokens).update(enabled=False)

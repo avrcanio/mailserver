@@ -346,6 +346,8 @@ class MailApiTests(TestCase):
         self.assertEqual(schema.status_code, 200)
         self.assertContains(schema, "/api/auth/login")
         self.assertContains(schema, "/api/mail/send")
+        self.assertContains(schema, "/api/devices/")
+        self.assertContains(schema, "/api/mail/new/")
         self.assertEqual(docs.status_code, 200)
         self.assertEqual(redoc.status_code, 200)
 
@@ -355,12 +357,55 @@ class MailApiTests(TestCase):
 
 @override_settings(DEVICE_REGISTRATION_SECRET="device-secret", MAIL_NOTIFY_HOOK_SECRET="hook-secret")
 class PushApiTests(TestCase):
-    def test_register_device_rejects_missing_secret(self):
-        response = self.client.post(reverse("mailops:register_device"), data={}, content_type="application/json")
+    def setUp(self):
+        self.account_email = "user@example.com"
+        self.password = "mail-secret"
+
+    def auth_headers(self, account_email=None):
+        token = create_mailbox_token(account_email or self.account_email, self.password)
+        return {
+            "Authorization": f"Token {token.key}",
+            "X-Device-Registration-Secret": "device-secret",
+        }
+
+    def test_register_device_requires_token(self):
+        response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"fcmToken": "token-1"},
+            content_type="application/json",
+            headers={"X-Device-Registration-Secret": "device-secret"},
+        )
 
         self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "not_authenticated")
+
+    def test_register_device_rejects_invalid_secret(self):
+        response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"fcmToken": "token-1"},
+            content_type="application/json",
+            headers={"Authorization": self.auth_headers()["Authorization"], "X-Device-Registration-Secret": "bad"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "unauthorized")
+
+    def test_register_device_rejects_token_without_mailbox_credentials(self):
+        user = get_user_model().objects.create_user(username="empty@example.com", email="empty@example.com")
+        token = Token.objects.create(user=user)
+
+        response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"fcmToken": "token-1"},
+            content_type="application/json",
+            headers={"Authorization": f"Token {token.key}", "X-Device-Registration-Secret": "device-secret"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "mailbox_credentials_missing")
 
     def test_register_device_creates_or_updates_token(self):
+        first_seen = timezone.now()
         response = self.client.post(
             reverse("mailops:register_device"),
             data={
@@ -370,19 +415,48 @@ class PushApiTests(TestCase):
                 "appVersion": "1.0.0",
             },
             content_type="application/json",
-            headers={"X-Device-Registration-Secret": "device-secret"},
+            headers=self.auth_headers(account_email="USER@Example.COM"),
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["account_email"], "user@example.com")
         device = DeviceRegistration.objects.get(fcm_token="token-1")
         self.assertEqual(device.account_email, "user@example.com")
         self.assertEqual(device.platform, "android")
+        self.assertEqual(device.app_version, "1.0.0")
         self.assertTrue(device.enabled)
+        self.assertGreaterEqual(device.last_seen_at, first_seen)
+
+        DeviceRegistration.objects.filter(pk=device.pk).update(enabled=False)
+        second_response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"accountEmail": "user@example.com", "fcm_token": "token-1", "platform": "Android", "app_version": "1.0.1"},
+            content_type="application/json",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["created"], False)
+        device.refresh_from_db()
+        self.assertEqual(device.app_version, "1.0.1")
+        self.assertTrue(device.enabled)
+
+    def test_register_device_rejects_account_email_mismatch(self):
+        response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"account_email": "other@example.com", "fcmToken": "token-1"},
+            content_type="application/json",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "account_email_mismatch")
 
     def test_new_mail_rejects_missing_secret(self):
         response = self.client.post(reverse("mailops:new_mail"), data={}, content_type="application/json")
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "unauthorized")
 
     @patch("mailops.services.get_firebase_app")
     @patch("mailops.services.messaging.send_each_for_multicast")
@@ -405,6 +479,8 @@ class PushApiTests(TestCase):
                 "body": "This must never be forwarded",
                 "messageId": "<m1@example.com>",
                 "receivedAt": "2026-04-16T07:00:00Z",
+                "folder": "INBOX",
+                "uid": "42",
             },
             content_type="application/json",
             headers={"X-Mail-Hook-Secret": "hook-secret"},
@@ -417,4 +493,75 @@ class PushApiTests(TestCase):
         self.assertEqual(message.notification.title, "Sender Name <sender@example.com>")
         self.assertEqual(message.notification.body, "Hello")
         self.assertEqual(message.data["accountEmail"], "user@example.com")
+        self.assertEqual(message.data["folder"], "INBOX")
+        self.assertEqual(message.data["uid"], "42")
+        self.assertEqual(message.data["messageId"], "<m1@example.com>")
         self.assertEqual(PushNotificationLog.objects.get().status, PushNotificationLog.STATUS_SUCCESS)
+
+    def test_new_mail_without_devices_is_successful_noop(self):
+        response = self.client.post(
+            reverse("mailops:new_mail"),
+            data={
+                "accountEmail": "user@example.com",
+                "sender": "Sender",
+                "subject": "Hello",
+                "receivedAt": "2026-04-16T07:00:00Z",
+            },
+            content_type="application/json",
+            headers={"X-Mail-Hook-Secret": "hook-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "skipped", "deviceCount": 0, "successCount": 0, "failureCount": 0})
+        self.assertEqual(PushNotificationLog.objects.get().status, PushNotificationLog.STATUS_SKIPPED)
+
+    @patch("mailops.services.get_firebase_app")
+    @patch("mailops.services.messaging.send_each_for_multicast")
+    def test_new_mail_disables_invalid_fcm_tokens_without_failing_delivery(self, send_multicast, get_app):
+        class FcmError(Exception):
+            code = "UNREGISTERED"
+
+        get_app.return_value = Mock()
+        send_multicast.return_value = Mock(
+            success_count=1,
+            failure_count=1,
+            responses=[
+                Mock(success=False, exception=FcmError("registration-token-not-registered")),
+                Mock(success=True),
+            ],
+        )
+        invalid_device = DeviceRegistration.objects.create(
+            account_email="user@example.com",
+            fcm_token="invalid-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+        valid_device = DeviceRegistration.objects.create(
+            account_email="user@example.com",
+            fcm_token="valid-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+
+        response = self.client.post(
+            reverse("mailops:new_mail"),
+            data={
+                "accountEmail": "user@example.com",
+                "sender": "Sender",
+                "subject": "Hello",
+                "receivedAt": "2026-04-16T07:00:00Z",
+            },
+            content_type="application/json",
+            headers={"X-Mail-Hook-Secret": "hook-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], PushNotificationLog.STATUS_PARTIAL)
+        invalid_device.refresh_from_db()
+        valid_device.refresh_from_db()
+        self.assertFalse(invalid_device.enabled)
+        self.assertTrue(valid_device.enabled)
+        log = PushNotificationLog.objects.get()
+        self.assertEqual(log.status, PushNotificationLog.STATUS_PARTIAL)
+        self.assertEqual(log.success_count, 1)
+        self.assertEqual(log.failure_count, 1)

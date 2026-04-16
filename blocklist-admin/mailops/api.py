@@ -1,5 +1,7 @@
 from drf_spectacular.utils import OpenApiParameter, extend_schema
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
@@ -12,16 +14,21 @@ from mail_integration.mailbox_service import MailboxService
 from mail_integration.schemas import MailboxCredentials, SendMailRequest
 
 from .api_serializers import (
+    DeviceRegistrationRequestSerializer,
+    DeviceRegistrationResponseSerializer,
     ErrorSerializer,
     FoldersResponseSerializer,
     IdentitySerializer,
     LoginRequestSerializer,
+    MailHookRequestSerializer,
+    MailHookResponseSerializer,
     MessageDetailResponseSerializer,
     MessageSummariesResponseSerializer,
     SendMailRequestSerializer,
     SendMailResponseSerializer,
 )
-from .models import MailboxTokenCredential
+from .models import DeviceRegistration, MailboxTokenCredential
+from .services import send_mail_notification
 
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
@@ -95,6 +102,12 @@ def require_mailbox_credentials(request):
     if credentials is None:
         return None, Response({"error": "mailbox_credentials_missing"}, status=status.HTTP_401_UNAUTHORIZED)
     return credentials, None
+
+
+def secret_matches(request, header_name, expected_secret):
+    if not expected_secret:
+        return False
+    return request.headers.get(header_name) == expected_secret
 
 
 def mail_error_response(exc):
@@ -317,3 +330,76 @@ class SendMailView(APIView):
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response({"account_email": credentials.email, "status": "sent", "message_id": message_id})
+
+
+class DeviceRegistrationView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        request=DeviceRegistrationRequestSerializer,
+        responses={200: DeviceRegistrationResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 403: ErrorSerializer},
+    )
+    def post(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        if not secret_matches(request, "X-Device-Registration-Secret", settings.DEVICE_REGISTRATION_SECRET):
+            return Response({"error": "unauthorized"}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = DeviceRegistrationRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        supplied_email = data["normalized_account_email"]
+        if supplied_email and supplied_email != credentials.email:
+            return Response({"error": "account_email_mismatch"}, status=status.HTTP_403_FORBIDDEN)
+
+        device, created = DeviceRegistration.objects.update_or_create(
+            fcm_token=data["normalized_fcm_token"],
+            defaults={
+                "account_email": credentials.email,
+                "platform": data["normalized_platform"],
+                "app_version": data["normalized_app_version"],
+                "enabled": True,
+                "last_seen_at": timezone.now(),
+            },
+        )
+        return Response(
+            {
+                "status": "ok",
+                "created": created,
+                "id": device.id,
+                "account_email": device.account_email,
+            }
+        )
+
+
+class NewMailHookView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    @extend_schema(
+        request=MailHookRequestSerializer,
+        responses={200: MailHookResponseSerializer, 400: ErrorSerializer, 403: ErrorSerializer, 502: ErrorSerializer},
+    )
+    def post(self, request):
+        if not secret_matches(request, "X-Mail-Hook-Secret", settings.MAIL_NOTIFY_HOOK_SECRET):
+            return Response({"error": "unauthorized"}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = MailHookRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        event = {
+            "accountEmail": data["accountEmail"].strip().lower(),
+            "sender": (data.get("sender") or "").strip()[:255],
+            "subject": (data.get("subject") or "").strip()[:255],
+            "receivedAt": (data.get("receivedAt") or timezone.now().isoformat()).strip(),
+            "folder": (data.get("folder") or "").strip(),
+            "uid": (data.get("uid") or "").strip(),
+            "messageId": (data.get("messageId") or "").strip(),
+        }
+        try:
+            result = send_mail_notification(event)
+        except Exception as exc:
+            return Response({"error": "notification_failed", "detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(result)
