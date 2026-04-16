@@ -1,5 +1,6 @@
 from django.urls import path
 
+from . import api
 from . import views
 
 
@@ -8,9 +9,12 @@ app_name = "mailops"
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
     path("apply/", views.apply_blocklist_view, name="apply"),
-    path("api/mail/messages/", views.mailbox_summaries_view, name="mailbox_summaries"),
-    path("api/mail/message/", views.mailbox_detail_view, name="mailbox_detail"),
-    path("api/mail/send/", views.mailbox_send_view, name="mailbox_send"),
+    path("api/auth/login", api.LoginView.as_view(), name="api_login"),
+    path("api/auth/me", api.MeView.as_view(), name="api_me"),
+    path("api/mail/folders", api.FolderListView.as_view(), name="api_mail_folders"),
+    path("api/mail/messages", api.MessageListView.as_view(), name="api_mail_messages"),
+    path("api/mail/messages/<str:uid>", api.MessageDetailView.as_view(), name="api_mail_message_detail"),
+    path("api/mail/send", api.SendMailView.as_view(), name="api_mail_send"),
     path("api/devices/", views.register_device_view, name="register_device"),
     path("api/mail/new/", views.new_mail_view, name="new_mail"),
 ]

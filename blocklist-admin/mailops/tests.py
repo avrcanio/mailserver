@@ -2,34 +2,101 @@ import json
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
-from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from mail_integration.exceptions import MailAuthError, MailSendError
-from mail_integration.schemas import MailAttachmentSummary, MailMessageDetail, MailMessageSummary
+from mail_integration.exceptions import MailAuthError, MailConnectionError, MailSendError
+from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary
 
+from .api import create_mailbox_token
 from .models import DeviceRegistration, PushNotificationLog
 
 
-class MailboxSummariesApiTests(TestCase):
+class MailApiTests(TestCase):
     def setUp(self):
-        self.staff_user = get_user_model().objects.create_user(
-            username="staff",
-            password="secret",
-            is_staff=True,
+        self.account_email = "user@example.com"
+        self.password = "mail-secret"
+
+    def auth_headers(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        return {"HTTP_AUTHORIZATION": f"Token {token}"}
+
+    @patch("mailops.api.MailboxService")
+    def test_login_success_returns_token(self, service_class):
+        service_class.return_value.list_folders.return_value = [
+            MailFolderSummary(name="INBOX", delimiter="/", flags=("HasNoChildren",)),
+            MailFolderSummary(name="Sent", delimiter="/", flags=("Sent",)),
+        ]
+
+        response = self.client.post(
+            reverse("mailops:api_login"),
+            data={"email": "USER@Example.COM", "password": self.password},
+            content_type="application/json",
         )
 
-    def test_mailbox_summaries_requires_staff_auth(self):
-        response = self.client.post(reverse("mailops:mailbox_summaries"), data={}, content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["authenticated"], True)
+        self.assertEqual(payload["account_email"], self.account_email)
+        self.assertEqual(payload["folder_count"], 2)
+        self.assertTrue(payload["token"])
 
-        self.assertEqual(response.status_code, 302)
-        self.assertIn("/admin/login/", response["Location"])
+    @patch("mailops.api.MailboxService")
+    def test_login_maps_bad_mailbox_credentials(self, service_class):
+        service_class.return_value.list_folders.side_effect = MailAuthError("bad credentials")
 
-    @patch("mailops.views.MailboxService")
-    def test_mailbox_summaries_returns_service_results(self, service_class):
-        self.client.force_login(self.staff_user)
+        response = self.client.post(
+            reverse("mailops:api_login"),
+            data={"email": self.account_email, "password": "bad"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "mail_auth_failed")
+
+    def test_me_requires_mailbox_session(self):
+        response = self.client.get(reverse("mailops:api_me"))
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "not_authenticated")
+
+    def test_me_returns_mailbox_identity(self):
+        headers = self.auth_headers()
+
+        response = self.client.get(reverse("mailops:api_me"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"authenticated": True, "account_email": self.account_email})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_folders_returns_service_results(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.list_folders.return_value = [
+            MailFolderSummary(name="INBOX", delimiter="/", flags=("HasNoChildren",)),
+        ]
+
+        response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["folders"][0], {"name": "INBOX", "delimiter": "/", "flags": ["HasNoChildren"]})
+        credentials = service_class.return_value.list_folders.call_args.args[0]
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
+
+    def test_legacy_mailbox_path_no_longer_accepts_post_password_payload(self):
+        response = self.client.post(
+            "/api/mail/messages/",
+            data={"accountEmail": self.account_email, "password": self.password},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_returns_service_results(self, service_class):
+        headers = self.auth_headers()
         service = service_class.return_value
         service.list_message_summaries.return_value = [
             MailMessageSummary(
@@ -46,68 +113,41 @@ class MailboxSummariesApiTests(TestCase):
             )
         ]
 
-        response = self.client.post(
-            reverse("mailops:mailbox_summaries"),
-            data={
-                "accountEmail": "USER@Example.COM",
-                "password": "mail-secret",
-                "folder": "INBOX",
-                "limit": 25,
-            },
-            content_type="application/json",
-        )
+        response = self.client.get(reverse("mailops:api_mail_messages"), {"folder": "INBOX", "limit": 25}, **headers)
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["accountEmail"], "user@example.com")
+        self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["messages"][0]["uid"], "42")
-        self.assertEqual(payload["messages"][0]["date"], "2026-04-16T07:00:00+00:00")
+        self.assertIn("2026-04-16T07:00:00", payload["messages"][0]["date"])
         credentials = service.list_message_summaries.call_args.args[0]
-        self.assertEqual(credentials.email, "user@example.com")
-        self.assertEqual(credentials.password, "mail-secret")
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
         self.assertEqual(service.list_message_summaries.call_args.kwargs, {"folder": "INBOX", "limit": 25})
 
-    def test_mailbox_summaries_validates_required_credentials(self):
-        self.client.force_login(self.staff_user)
+    def test_mail_messages_requires_session_and_validates_limit(self):
+        missing_session = self.client.get(reverse("mailops:api_mail_messages"))
+        headers = self.auth_headers()
+        invalid_limit = self.client.get(reverse("mailops:api_mail_messages"), {"limit": 500}, **headers)
 
-        response = self.client.post(
-            reverse("mailops:mailbox_summaries"),
-            data={"accountEmail": "user@example.com"},
-            content_type="application/json",
-        )
+        self.assertEqual(missing_session.status_code, 401)
+        self.assertEqual(missing_session.json()["error"], "not_authenticated")
+        self.assertEqual(invalid_limit.status_code, 400)
+        self.assertEqual(invalid_limit.json()["error"], "invalid_limit")
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "account_email_and_password_required")
-
-    def test_mailbox_summaries_validates_limit(self):
-        self.client.force_login(self.staff_user)
-
-        response = self.client.post(
-            reverse("mailops:mailbox_summaries"),
-            data={"accountEmail": "user@example.com", "password": "secret", "limit": 500},
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "invalid_limit")
-
-    @patch("mailops.views.MailboxService")
-    def test_mailbox_summaries_maps_mail_errors(self, service_class):
-        self.client.force_login(self.staff_user)
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_maps_mail_errors(self, service_class):
+        headers = self.auth_headers()
         service_class.return_value.list_message_summaries.side_effect = MailAuthError("bad credentials")
 
-        response = self.client.post(
-            reverse("mailops:mailbox_summaries"),
-            data={"accountEmail": "user@example.com", "password": "bad"},
-            content_type="application/json",
-        )
+        response = self.client.get(reverse("mailops:api_mail_messages"), **headers)
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"], "mail_auth_failed")
 
-    @patch("mailops.views.MailboxService")
-    def test_mailbox_detail_returns_service_result(self, service_class):
-        self.client.force_login(self.staff_user)
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_detail_returns_service_result(self, service_class):
+        headers = self.auth_headers()
         service = service_class.return_value
         service.get_message_detail.return_value = MailMessageDetail(
             uid="42",
@@ -132,66 +172,55 @@ class MailboxSummariesApiTests(TestCase):
             ),
         )
 
-        response = self.client.post(
-            reverse("mailops:mailbox_detail"),
-            data={
-                "accountEmail": "user@example.com",
-                "password": "mail-secret",
-                "folder": "INBOX",
-                "uid": "42",
-            },
-            content_type="application/json",
-        )
+        response = self.client.get(reverse("mailops:api_mail_message_detail", kwargs={"uid": "42"}), {"folder": "INBOX"}, **headers)
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["message"]["uid"], "42")
-        self.assertEqual(payload["message"]["textBody"], "Plain body")
-        self.assertEqual(payload["message"]["htmlBody"], "<p>HTML body</p>")
+        self.assertEqual(payload["message"]["text_body"], "Plain body")
+        self.assertEqual(payload["message"]["html_body"], "<p>HTML body</p>")
         self.assertEqual(payload["message"]["attachments"][0]["filename"], "report.pdf")
         credentials = service.get_message_detail.call_args.args[0]
-        self.assertEqual(credentials.email, "user@example.com")
+        self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(service.get_message_detail.call_args.kwargs, {"folder": "INBOX", "uid": "42"})
 
-    def test_mailbox_detail_requires_uid(self):
-        self.client.force_login(self.staff_user)
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_detail_maps_connection_errors(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.get_message_detail.side_effect = MailConnectionError("down")
 
-        response = self.client.post(
-            reverse("mailops:mailbox_detail"),
-            data={"accountEmail": "user@example.com", "password": "secret"},
-            content_type="application/json",
-        )
+        response = self.client.get(reverse("mailops:api_mail_message_detail", kwargs={"uid": "42"}), **headers)
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "uid_required")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "mail_connection_failed")
 
-    @patch("mailops.views.MailboxService")
-    def test_mailbox_send_calls_service_and_returns_message_id(self, service_class):
-        self.client.force_login(self.staff_user)
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_calls_service_and_returns_message_id(self, service_class):
+        headers = self.auth_headers()
         service = service_class.return_value
         service.send_mail.return_value = "<sent@example.com>"
 
         response = self.client.post(
-            reverse("mailops:mailbox_send"),
+            reverse("mailops:api_mail_send"),
             data={
-                "accountEmail": "sender@example.com",
-                "password": "mail-secret",
                 "to": ["to@example.com"],
                 "cc": ["copy@example.com"],
                 "bcc": ["hidden@example.com"],
-                "replyTo": "reply@example.com",
+                "reply_to": "reply@example.com",
                 "subject": "Status",
-                "textBody": "Plain body",
-                "htmlBody": "<p>HTML body</p>",
+                "text_body": "Plain body",
+                "html_body": "<p>HTML body</p>",
+                "from_display_name": "Sender Name",
             },
             content_type="application/json",
+            **headers,
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"accountEmail": "sender@example.com", "status": "sent", "messageId": "<sent@example.com>"})
+        self.assertEqual(response.json(), {"account_email": self.account_email, "status": "sent", "message_id": "<sent@example.com>"})
         credentials = service.send_mail.call_args.args[0]
         request = service.send_mail.call_args.args[1]
-        self.assertEqual(credentials.email, "sender@example.com")
+        self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(request.to, ("to@example.com",))
         self.assertEqual(request.cc, ("copy@example.com",))
         self.assertEqual(request.bcc, ("hidden@example.com",))
@@ -199,52 +228,72 @@ class MailboxSummariesApiTests(TestCase):
         self.assertEqual(request.subject, "Status")
         self.assertEqual(request.text_body, "Plain body")
         self.assertEqual(request.html_body, "<p>HTML body</p>")
+        self.assertEqual(request.from_display_name, "Sender Name")
 
-    def test_mailbox_send_validates_required_fields(self):
-        self.client.force_login(self.staff_user)
+    def test_mail_send_requires_session_and_validates_required_fields(self):
+        missing_session = self.client.post(reverse("mailops:api_mail_send"), data={}, content_type="application/json")
+        headers = self.auth_headers()
 
         missing_to = self.client.post(
-            reverse("mailops:mailbox_send"),
-            data={"accountEmail": "sender@example.com", "password": "secret", "subject": "Hi", "textBody": "Body"},
+            reverse("mailops:api_mail_send"),
+            data={"subject": "Hi", "text_body": "Body"},
             content_type="application/json",
+            **headers,
         )
         missing_subject = self.client.post(
-            reverse("mailops:mailbox_send"),
-            data={"accountEmail": "sender@example.com", "password": "secret", "to": ["to@example.com"], "textBody": "Body"},
+            reverse("mailops:api_mail_send"),
+            data={"to": ["to@example.com"], "text_body": "Body"},
             content_type="application/json",
+            **headers,
         )
         missing_body = self.client.post(
-            reverse("mailops:mailbox_send"),
-            data={"accountEmail": "sender@example.com", "password": "secret", "to": ["to@example.com"], "subject": "Hi"},
+            reverse("mailops:api_mail_send"),
+            data={"to": ["to@example.com"], "subject": "Hi"},
             content_type="application/json",
+            **headers,
         )
 
+        self.assertEqual(missing_session.status_code, 401)
+        self.assertEqual(missing_session.json()["error"], "not_authenticated")
         self.assertEqual(missing_to.status_code, 400)
-        self.assertEqual(missing_to.json()["error"], "to_required")
+        self.assertIn("to", missing_to.json())
         self.assertEqual(missing_subject.status_code, 400)
-        self.assertEqual(missing_subject.json()["error"], "subject_required")
+        self.assertIn("subject", missing_subject.json())
         self.assertEqual(missing_body.status_code, 400)
-        self.assertEqual(missing_body.json()["error"], "body_required")
+        self.assertIn("body", missing_body.json())
 
-    @patch("mailops.views.MailboxService")
-    def test_mailbox_send_maps_send_errors(self, service_class):
-        self.client.force_login(self.staff_user)
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_maps_send_errors(self, service_class):
+        headers = self.auth_headers()
         service_class.return_value.send_mail.side_effect = MailSendError("rejected")
 
         response = self.client.post(
-            reverse("mailops:mailbox_send"),
+            reverse("mailops:api_mail_send"),
             data={
-                "accountEmail": "sender@example.com",
-                "password": "secret",
                 "to": ["to@example.com"],
                 "subject": "Hi",
-                "textBody": "Body",
+                "text_body": "Body",
             },
             content_type="application/json",
+            **headers,
         )
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"], "mail_send_failed")
+
+    def test_schema_and_docs_endpoints_load(self):
+        schema = self.client.get(reverse("schema"))
+        docs = self.client.get(reverse("swagger-ui"))
+        redoc = self.client.get(reverse("redoc"))
+
+        self.assertEqual(schema.status_code, 200)
+        self.assertContains(schema, "/api/auth/login")
+        self.assertContains(schema, "/api/mail/send")
+        self.assertEqual(docs.status_code, 200)
+        self.assertEqual(redoc.status_code, 200)
+
+    def test_spectacular_schema_generation_command_runs(self):
+        call_command("spectacular", file="/tmp/test-mailadmin-schema.yaml", validate=True)
 
 
 @override_settings(DEVICE_REGISTRATION_SECRET="device-secret", MAIL_NOTIFY_HOOK_SECRET="hook-secret")

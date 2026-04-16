@@ -29,6 +29,8 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
+    "drf_spectacular",
     "mailops",
 ]
 
@@ -104,3 +106,15 @@ MAIL_SMTP_HOST = os.environ.get("MAIL_SMTP_HOST", os.environ.get("MAIL_HOSTNAME"
 MAIL_SMTP_PORT = int(os.environ.get("MAIL_SMTP_PORT", "587"))
 MAIL_SMTP_USE_STARTTLS = env_bool("MAIL_SMTP_USE_STARTTLS", True)
 MAIL_CLIENT_TIMEOUT_SECONDS = int(os.environ.get("MAIL_CLIENT_TIMEOUT_SECONDS", "15"))
+
+REST_FRAMEWORK = {
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "UNAUTHENTICATED_USER": None,
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Finestar Mailadmin API",
+    "DESCRIPTION": "Backend mail API for Finestar Android clients.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+}
