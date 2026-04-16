@@ -38,6 +38,13 @@ class MailMessageSummary:
 
 
 @dataclass(frozen=True)
+class MailMessageSummaryPage:
+    messages: tuple[MailMessageSummary, ...] = field(default_factory=tuple)
+    has_more: bool = False
+    next_before_uid: str | None = None
+
+
+@dataclass(frozen=True)
 class MailMessageDetail:
     uid: str
     folder: str

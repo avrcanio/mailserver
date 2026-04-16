@@ -124,6 +124,53 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(summaries, [])
         connection.uid.assert_not_called()
 
+    def test_fetch_message_summary_page_uses_before_uid_cursor(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"5"])
+        connection.uid.side_effect = [
+            ("OK", [b"101 102 103 104 105"]),
+            ("OK", [(b"102 (UID 102 FLAGS () RFC822.SIZE 20 BODY[HEADER.FIELDS ...] {20}", b"Subject: 102\r\n\r\n")]),
+            ("OK", [(b"101 (UID 101 FLAGS () RFC822.SIZE 10 BODY[HEADER.FIELDS ...] {20}", b"Subject: 101\r\n\r\n")]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_message_summary_page(folder="INBOX", limit=2, before_uid="103")
+
+        self.assertEqual([summary.uid for summary in page.messages], ["102", "101"])
+        self.assertFalse(page.has_more)
+        self.assertIsNone(page.next_before_uid)
+        connection.uid.assert_any_call("search", None, "ALL")
+        connection.uid.assert_any_call("fetch", b"102", "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
+        connection.uid.assert_any_call("fetch", b"101", "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
+
+    def test_fetch_message_summary_page_returns_pagination_metadata(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"5"])
+        connection.uid.side_effect = [
+            ("OK", [b"101 102 103 104 105"]),
+            ("OK", [(b"105 (UID 105 FLAGS () RFC822.SIZE 50 BODY[HEADER.FIELDS ...] {20}", b"Subject: 105\r\n\r\n")]),
+            ("OK", [(b"104 (UID 104 FLAGS () RFC822.SIZE 40 BODY[HEADER.FIELDS ...] {20}", b"Subject: 104\r\n\r\n")]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_message_summary_page(folder="INBOX", limit=2)
+
+        self.assertEqual([summary.uid for summary in page.messages], ["105", "104"])
+        self.assertTrue(page.has_more)
+        self.assertEqual(page.next_before_uid, "104")
+
+    def test_fetch_message_summary_page_empty_when_no_older_messages_remain(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.return_value = ("OK", [b"101 102"])
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_message_summary_page(folder="INBOX", limit=2, before_uid="101")
+
+        self.assertEqual(page.messages, ())
+        self.assertFalse(page.has_more)
+        self.assertIsNone(page.next_before_uid)
+
     def test_fetch_message_detail_extracts_bodies_and_attachment_metadata(self):
         raw_message = _raw_detail_message(text_body="Plain body", html_body="<p><strong>HTML body</strong></p>", attach=True)
         connection = Mock()
@@ -361,16 +408,19 @@ class MailboxServiceTests(SimpleTestCase):
         entered = imap_client.__enter__.return_value
         entered.list_folders.return_value = ["INBOX"]
         entered.fetch_message_summaries.return_value = ["summary"]
+        entered.fetch_message_summary_page.return_value = "summary-page"
         entered.fetch_message_detail.return_value = "detail"
 
         service = MailboxService(imap_client_factory=lambda: imap_client)
 
         self.assertEqual(service.list_folders(credentials), ["INBOX"])
         self.assertEqual(service.list_message_summaries(credentials, folder="Archive", limit=10), ["summary"])
+        self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
-        self.assertEqual(entered.login.call_count, 3)
+        self.assertEqual(entered.login.call_count, 4)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
+        entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
 
     def test_service_send_method_routes_to_smtp_client(self):

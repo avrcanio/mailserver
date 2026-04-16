@@ -17,6 +17,11 @@ class MailboxService:
             client.login(credentials)
             return client.fetch_message_summaries(folder=folder, limit=limit)
 
+    def list_message_summary_page(self, credentials, folder="INBOX", limit=50, before_uid=None):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.fetch_message_summary_page(folder=folder, limit=limit, before_uid=before_uid)
+
     def get_message_detail(self, credentials, folder, uid):
         with self.imap_client_factory() as client:
             client.login(credentials)

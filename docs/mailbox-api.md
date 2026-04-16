@@ -98,12 +98,20 @@ Response:
 
 `GET /api/mail/messages?folder=INBOX&limit=25`
 
+Use `before_uid` to fetch the next older page for lazy-loaded infinite scrolling:
+
+```http
+GET /api/mail/messages?folder=INBOX&limit=25&before_uid=42
+```
+
 Response:
 
 ```json
 {
   "account_email": "user@finestar.hr",
   "folder": "INBOX",
+  "has_more": true,
+  "next_before_uid": "42",
   "messages": [
     {
       "uid": "42",

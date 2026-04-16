@@ -10,7 +10,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from django.conf import settings
 
 from .exceptions import MailAuthError, MailConnectionError, MailProtocolError, MailTimeoutError
-from .schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary, MailboxCredentials
+from .schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary, MailMessageSummaryPage, MailboxCredentials
 
 
 _LIST_RE = re.compile(rb'\((?P<flags>.*?)\)\s+"?(?P<delimiter>[^"\s]*)"?\s+(?P<name>.+)$')
@@ -97,15 +97,23 @@ class ImapClient:
         self._expect_ok(status, data, f"IMAP folder selection failed for {folder}")
 
     def fetch_message_summaries(self, folder="INBOX", limit=50):
+        return list(self.fetch_message_summary_page(folder=folder, limit=limit).messages)
+
+    def fetch_message_summary_page(self, folder="INBOX", limit=50, before_uid=None):
         connection = self._require_connection()
         self.select_folder(folder, readonly=True)
         if limit < 1:
-            return []
+            return MailMessageSummaryPage()
         try:
             status, data = connection.uid("search", None, "ALL")
             self._expect_ok(status, data, f"IMAP search failed for {folder}")
-            uids = (data[0] or b"").split()
-            selected_uids = list(reversed(uids[-limit:]))
+            uids = _parse_uid_list(data[0] or b"")
+            if before_uid is not None:
+                before_uid_int = _parse_positive_uid(before_uid)
+                uids = [uid for uid in uids if uid < before_uid_int]
+            selected_uid_ints = list(reversed(uids[-limit:]))
+            has_more = len(uids) > len(selected_uid_ints)
+            selected_uids = [str(uid).encode("ascii") for uid in selected_uid_ints]
             summaries = []
             for uid in selected_uids:
                 status, fetch_data = connection.uid(
@@ -115,11 +123,14 @@ class ImapClient:
                 )
                 self._expect_ok(status, fetch_data, f"IMAP summary fetch failed for UID {uid.decode()}")
                 summaries.append(_parse_summary_response(folder, uid.decode(), fetch_data))
-            return summaries
+            next_before_uid = summaries[-1].uid if has_more and summaries else None
+            return MailMessageSummaryPage(messages=tuple(summaries), has_more=has_more, next_before_uid=next_before_uid)
         except socket.timeout as exc:
             raise MailTimeoutError(f"Timed out fetching IMAP summaries for {folder}") from exc
         except (OSError, ssl.SSLError) as exc:
             raise MailConnectionError(f"IMAP summary fetch connection failure for {folder}: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP summary pagination failed for {folder}: {exc}") from exc
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP summary fetch failed for {folder}") from exc
 
@@ -276,6 +287,23 @@ def _metadata_value(pattern, metadata):
     if not match:
         return None
     return _safe_decode(match.group(1))
+
+
+def _parse_uid_list(raw_uids):
+    uids = []
+    for raw_uid in (raw_uids or b"").split():
+        uids.append(_parse_positive_uid(_safe_decode(raw_uid)))
+    return uids
+
+
+def _parse_positive_uid(value):
+    try:
+        uid = int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid UID {value!r}") from exc
+    if uid < 1:
+        raise ValueError(f"Invalid UID {value!r}")
+    return uid
 
 
 def _parse_flags(metadata):

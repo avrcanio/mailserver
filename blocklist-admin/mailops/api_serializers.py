@@ -69,6 +69,8 @@ class MessageSummariesResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folder = serializers.CharField()
     messages = MessageSummarySerializer(many=True)
+    has_more = serializers.BooleanField()
+    next_before_uid = serializers.CharField(allow_null=True)
 
 
 class MessageDetailResponseSerializer(serializers.Serializer):

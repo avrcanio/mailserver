@@ -263,6 +263,7 @@ class MessageListView(APIView):
         parameters=[
             OpenApiParameter("folder", str, required=False, description="Mailbox folder name. Defaults to INBOX."),
             OpenApiParameter("limit", int, required=False, description="Maximum message summaries to return. 1-200, defaults to 50."),
+            OpenApiParameter("before_uid", str, required=False, description="Return the next older page before this message UID."),
         ],
         responses={200: MessageSummariesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
     )
@@ -277,15 +278,24 @@ class MessageListView(APIView):
             return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
         if limit < 1 or limit > 200:
             return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        before_uid = (request.query_params.get("before_uid") or "").strip() or None
+        if before_uid is not None:
+            try:
+                if int(before_uid) < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return Response({"error": "invalid_before_uid"}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            summaries = MailboxService().list_message_summaries(credentials, folder=folder, limit=limit)
+            page = MailboxService().list_message_summary_page(credentials, folder=folder, limit=limit, before_uid=before_uid)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response(
             {
                 "account_email": credentials.email,
                 "folder": folder,
-                "messages": [summary_payload(summary) for summary in summaries],
+                "messages": [summary_payload(summary) for summary in page.messages],
+                "has_more": page.has_more,
+                "next_before_uid": page.next_before_uid,
             }
         )
 

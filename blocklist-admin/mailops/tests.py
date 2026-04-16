@@ -13,7 +13,7 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
 from mail_integration.exceptions import MailAuthError, MailConnectionError, MailSendError
-from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary
+from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary, MailMessageSummaryPage
 
 from .api import create_mailbox_token, mailbox_credentials_from_request
 from .credential_crypto import (
@@ -286,47 +286,56 @@ class MailApiTests(TestCase):
     def test_mail_messages_returns_service_results(self, service_class):
         headers = self.auth_headers()
         service = service_class.return_value
-        service.list_message_summaries.return_value = [
-            MailMessageSummary(
-                uid="42",
-                folder="INBOX",
-                subject="Hello",
-                sender="Sender <sender@example.com>",
-                to=("user@example.com",),
-                cc=("copy@example.com",),
-                date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
-                message_id="<m1@example.com>",
-                flags=("Seen",),
-                size=1234,
-            )
-        ]
+        service.list_message_summary_page.return_value = MailMessageSummaryPage(
+            messages=(
+                MailMessageSummary(
+                    uid="42",
+                    folder="INBOX",
+                    subject="Hello",
+                    sender="Sender <sender@example.com>",
+                    to=("user@example.com",),
+                    cc=("copy@example.com",),
+                    date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+                    message_id="<m1@example.com>",
+                    flags=("Seen",),
+                    size=1234,
+                ),
+            ),
+            has_more=True,
+            next_before_uid="42",
+        )
 
-        response = self.client.get(reverse("mailops:api_mail_messages"), {"folder": "INBOX", "limit": 25}, **headers)
+        response = self.client.get(reverse("mailops:api_mail_messages"), {"folder": "INBOX", "limit": 25, "before_uid": "50"}, **headers)
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["messages"][0]["uid"], "42")
+        self.assertEqual(payload["has_more"], True)
+        self.assertEqual(payload["next_before_uid"], "42")
         self.assertIn("2026-04-16T07:00:00", payload["messages"][0]["date"])
-        credentials = service.list_message_summaries.call_args.args[0]
+        credentials = service.list_message_summary_page.call_args.args[0]
         self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(credentials.password, self.password)
-        self.assertEqual(service.list_message_summaries.call_args.kwargs, {"folder": "INBOX", "limit": 25})
+        self.assertEqual(service.list_message_summary_page.call_args.kwargs, {"folder": "INBOX", "limit": 25, "before_uid": "50"})
 
     def test_mail_messages_requires_token_and_validates_limit(self):
         missing_token = self.client.get(reverse("mailops:api_mail_messages"))
         headers = self.auth_headers()
         invalid_limit = self.client.get(reverse("mailops:api_mail_messages"), {"limit": 500}, **headers)
+        invalid_before_uid = self.client.get(reverse("mailops:api_mail_messages"), {"before_uid": "abc"}, **headers)
 
         self.assertEqual(missing_token.status_code, 401)
         self.assertEqual(missing_token.json()["error"], "not_authenticated")
         self.assertEqual(invalid_limit.status_code, 400)
         self.assertEqual(invalid_limit.json()["error"], "invalid_limit")
+        self.assertEqual(invalid_before_uid.status_code, 400)
+        self.assertEqual(invalid_before_uid.json()["error"], "invalid_before_uid")
 
     @patch("mailops.api.MailboxService")
     def test_mail_messages_maps_mail_errors(self, service_class):
         headers = self.auth_headers()
-        service_class.return_value.list_message_summaries.side_effect = MailAuthError("bad credentials")
+        service_class.return_value.list_message_summary_page.side_effect = MailAuthError("bad credentials")
 
         response = self.client.get(reverse("mailops:api_mail_messages"), **headers)
 
