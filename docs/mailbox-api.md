@@ -123,7 +123,8 @@ Response:
       "date": "2026-04-16T07:00:00Z",
       "message_id": "<m1@example.com>",
       "flags": ["Seen"],
-      "size": 1234
+      "size": 1234,
+      "has_attachments": true
     }
   ]
 }

@@ -166,11 +166,13 @@ def summary_payload(summary):
         "message_id": summary.message_id,
         "flags": list(summary.flags),
         "size": summary.size,
+        "has_attachments": getattr(summary, "has_attachments", False),
     }
 
 
 def detail_payload(detail):
     payload = summary_payload(detail)
+    payload["has_attachments"] = bool(detail.attachments)
     payload.update(
         {
             "text_body": detail.text_body,

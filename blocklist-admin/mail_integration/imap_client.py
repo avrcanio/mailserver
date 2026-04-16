@@ -28,6 +28,8 @@ _LIST_RE = re.compile(rb'\((?P<flags>.*?)\)\s+"?(?P<delimiter>[^"\s]*)"?\s+(?P<n
 _UID_RE = re.compile(rb"\bUID\s+(\d+)\b", re.IGNORECASE)
 _SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)\b", re.IGNORECASE)
 _FLAGS_RE = re.compile(rb"\bFLAGS\s+\((.*?)\)", re.IGNORECASE)
+_BODYSTRUCTURE_RE = re.compile(rb"BODYSTRUCTURE\s+(?P<bodystructure>.+?)(?:\s+BODY\[|\s*\)\s*$)", re.IGNORECASE | re.DOTALL)
+_ATTACHMENT_MARKER_RE = re.compile(rb'"(?:ATTACHMENT|INLINE|FILENAME|NAME)"', re.IGNORECASE)
 
 
 class ImapClient:
@@ -130,7 +132,7 @@ class ImapClient:
                 status, fetch_data = connection.uid(
                     "fetch",
                     uid,
-                    "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])",
+                    "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])",
                 )
                 self._expect_ok(status, fetch_data, f"IMAP summary fetch failed for UID {uid.decode()}")
                 summaries.append(_parse_summary_response(folder, uid.decode(), fetch_data))
@@ -298,6 +300,7 @@ def _parse_summary_response(folder, fallback_uid, fetch_data):
             message_id=_header_value(message, "message-id"),
             flags=_parse_flags(metadata),
             size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
+            has_attachments=_has_attachment_bodystructure(metadata),
         )
     except MailProtocolError:
         raise
@@ -449,6 +452,13 @@ def _parse_flags(metadata):
     if not match:
         return ()
     return tuple(flag.lstrip("\\") for flag in _safe_decode(match.group(1)).split() if flag)
+
+
+def _has_attachment_bodystructure(metadata):
+    match = _BODYSTRUCTURE_RE.search(metadata or b"")
+    if not match:
+        return False
+    return bool(_ATTACHMENT_MARKER_RE.search(match.group("bodystructure")))
 
 
 def _address_header(value):

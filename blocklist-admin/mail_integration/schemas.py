@@ -43,6 +43,7 @@ class MailMessageSummary:
     message_id: str = ""
     flags: tuple[str, ...] = field(default_factory=tuple)
     size: int | None = None
+    has_attachments: bool = False
 
 
 @dataclass(frozen=True)

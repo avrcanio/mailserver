@@ -99,6 +99,7 @@ class MessageSummarySerializer(serializers.Serializer):
     message_id = serializers.CharField(allow_blank=True)
     flags = serializers.ListField(child=serializers.CharField())
     size = serializers.IntegerField(allow_null=True)
+    has_attachments = serializers.BooleanField()
 
 
 class MessageDetailSerializer(MessageSummarySerializer):

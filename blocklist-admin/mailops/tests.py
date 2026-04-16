@@ -310,6 +310,7 @@ class MailApiTests(TestCase):
                     message_id="<m1@example.com>",
                     flags=("Seen",),
                     size=1234,
+                    has_attachments=True,
                 ),
             ),
             has_more=True,
@@ -322,6 +323,7 @@ class MailApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["messages"][0]["uid"], "42")
+        self.assertTrue(payload["messages"][0]["has_attachments"])
         self.assertEqual(payload["has_more"], True)
         self.assertEqual(payload["next_before_uid"], "42")
         self.assertIn("2026-04-16T07:00:00", payload["messages"][0]["date"])

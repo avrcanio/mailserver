@@ -77,7 +77,12 @@ class ImapClientTests(SimpleTestCase):
                 "OK",
                 [
                     (
-                        b"102 (UID 102 FLAGS (\\Seen) RFC822.SIZE 1234 BODY[HEADER.FIELDS ...] {180}",
+                        (
+                            b'102 (UID 102 FLAGS (\\Seen) RFC822.SIZE 1234 BODYSTRUCTURE '
+                            b'(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+                            b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 123 NIL '
+                            b'("ATTACHMENT" ("FILENAME" "report.pdf")) NIL) "MIXED") BODY[HEADER.FIELDS ...] {180}'
+                        ),
                         (
                             b"Subject: =?utf-8?q?Hello_=C4=8Cakovec?=\r\n"
                             b"From: Sender <sender@example.com>\r\n"
@@ -112,6 +117,8 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(summaries[0].flags, ("Seen",))
         self.assertEqual(summaries[0].size, 1234)
         self.assertEqual(summaries[0].message_id, "<m1@example.com>")
+        self.assertTrue(summaries[0].has_attachments)
+        self.assertFalse(summaries[1].has_attachments)
         connection.select.assert_called_once_with("Archive", readonly=True)
 
     def test_fetch_message_summaries_respects_zero_limit_without_fetching_messages(self):
@@ -140,8 +147,34 @@ class ImapClientTests(SimpleTestCase):
         self.assertFalse(page.has_more)
         self.assertIsNone(page.next_before_uid)
         connection.uid.assert_any_call("search", None, "UNDELETED")
-        connection.uid.assert_any_call("fetch", b"102", "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
-        connection.uid.assert_any_call("fetch", b"101", "(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
+        connection.uid.assert_any_call("fetch", b"102", "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
+        connection.uid.assert_any_call("fetch", b"101", "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
+
+    def test_fetch_message_summaries_detects_inline_named_parts_as_attachments(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"200"]),
+            (
+                "OK",
+                [
+                    (
+                        (
+                            b'200 (UID 200 FLAGS () RFC822.SIZE 321 BODYSTRUCTURE '
+                            b'(("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+                            b'("IMAGE" "PNG" ("NAME" "logo.png") "<logo>" NIL "BASE64" 20 NIL '
+                            b'("INLINE" ("FILENAME" "logo.png")) NIL) "RELATED") BODY[HEADER.FIELDS ...] {20}'
+                        ),
+                        b"Subject: Inline\r\n\r\n",
+                    )
+                ],
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            summaries = ImapClient().connect().fetch_message_summaries(folder="INBOX", limit=1)
+
+        self.assertTrue(summaries[0].has_attachments)
 
     def test_fetch_message_summary_page_returns_pagination_metadata(self):
         connection = Mock()
