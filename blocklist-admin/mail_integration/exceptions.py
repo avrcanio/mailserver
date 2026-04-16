@@ -18,6 +18,9 @@ class MailProtocolError(MailIntegrationError):
     """Raised when a mail service returns an unexpected protocol response."""
 
 
+class MailInvalidOperationError(MailIntegrationError):
+    """Raised when a requested mailbox operation is intentionally unsupported."""
+
+
 class MailSendError(MailIntegrationError):
     """Raised when SMTP accepts a connection but fails to send mail."""
-

@@ -62,6 +62,20 @@ class MailMessageDetail:
 
 
 @dataclass(frozen=True)
+class MailMessageMoveFailure:
+    uid: str
+    error: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class MailMessageMoveToTrashResult:
+    trash_folder: str
+    moved_to_trash: tuple[str, ...] = field(default_factory=tuple)
+    failed: tuple[MailMessageMoveFailure, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class SendMailRequest:
     to: tuple[str, ...]
     subject: str

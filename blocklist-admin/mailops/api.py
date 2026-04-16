@@ -9,13 +9,23 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mail_integration.exceptions import MailAuthError, MailConnectionError, MailIntegrationError, MailProtocolError, MailSendError, MailTimeoutError
+from mail_integration.exceptions import (
+    MailAuthError,
+    MailConnectionError,
+    MailIntegrationError,
+    MailInvalidOperationError,
+    MailProtocolError,
+    MailSendError,
+    MailTimeoutError,
+)
 from mail_integration.mailbox_service import MailboxService
 from mail_integration.schemas import MailboxCredentials, SendMailRequest
 
 from .api_serializers import (
     DeviceRegistrationRequestSerializer,
     DeviceRegistrationResponseSerializer,
+    DeleteMessagesRequestSerializer,
+    DeleteMessagesResponseSerializer,
     ErrorSerializer,
     FoldersResponseSerializer,
     IdentitySerializer,
@@ -166,6 +176,42 @@ def detail_payload(detail):
         }
     )
     return payload
+
+
+def delete_result_payload(credentials, folder, result):
+    failed = [
+        {
+            "uid": failure.uid,
+            "error": failure.error,
+            "detail": failure.detail,
+        }
+        for failure in result.failed
+    ]
+    return {
+        "account_email": credentials.email,
+        "folder": folder,
+        "trash_folder": result.trash_folder,
+        "success": bool(result.moved_to_trash) and not failed,
+        "partial": bool(result.moved_to_trash) and bool(failed),
+        "moved_to_trash": list(result.moved_to_trash),
+        "failed": failed,
+    }
+
+
+def validate_delete_payload(data):
+    if "folder" not in data or not str(data.get("folder") or "").strip():
+        return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+    if "uids" not in data:
+        return None, Response({"error": "empty_uid_list"}, status=status.HTTP_400_BAD_REQUEST)
+    serializer = DeleteMessagesRequestSerializer(data=data)
+    if not serializer.is_valid():
+        if "uids" in serializer.errors:
+            errors = serializer.errors["uids"]
+            if any(getattr(error, "code", None) == "empty" for error in errors):
+                return None, Response({"error": "empty_uid_list"}, status=status.HTTP_400_BAD_REQUEST)
+            return None, Response({"error": "invalid_uid"}, status=status.HTTP_400_BAD_REQUEST)
+        return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+    return serializer.validated_data, None
 
 
 class LoginView(APIView):
@@ -319,6 +365,58 @@ class MessageDetailView(APIView):
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response({"account_email": credentials.email, "folder": folder, "message": detail_payload(detail)})
+
+
+class DeleteMessagesView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_delete",
+        request=DeleteMessagesRequestSerializer,
+        responses={200: DeleteMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def post(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        data, error = validate_delete_payload(request.data)
+        if error:
+            return error
+        try:
+            result = MailboxService().move_messages_to_trash(credentials, folder=data["folder"], uids=tuple(data["uids"]))
+        except MailInvalidOperationError:
+            return Response({"error": "delete_from_trash_not_supported"}, status=status.HTTP_400_BAD_REQUEST)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(delete_result_payload(credentials, data["folder"], result))
+
+
+class DeleteMessageView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_delete_single",
+        request=None,
+        parameters=[OpenApiParameter("folder", str, required=True, description="Source mailbox folder name.")],
+        responses={200: DeleteMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def post(self, request, uid):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "").strip()
+        data, error = validate_delete_payload({"folder": folder, "uids": [uid]})
+        if error:
+            return error
+        try:
+            result = MailboxService().move_messages_to_trash(credentials, folder=data["folder"], uids=tuple(data["uids"]))
+        except MailInvalidOperationError:
+            return Response({"error": "delete_from_trash_not_supported"}, status=status.HTTP_400_BAD_REQUEST)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(delete_result_payload(credentials, data["folder"], result))
 
 
 class SendMailView(APIView):

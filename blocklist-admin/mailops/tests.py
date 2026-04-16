@@ -12,8 +12,16 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
-from mail_integration.exceptions import MailAuthError, MailConnectionError, MailSendError
-from mail_integration.schemas import MailAttachmentSummary, MailFolderSummary, MailMessageDetail, MailMessageSummary, MailMessageSummaryPage
+from mail_integration.exceptions import MailAuthError, MailConnectionError, MailInvalidOperationError, MailSendError
+from mail_integration.schemas import (
+    MailAttachmentSummary,
+    MailFolderSummary,
+    MailMessageDetail,
+    MailMessageMoveFailure,
+    MailMessageMoveToTrashResult,
+    MailMessageSummary,
+    MailMessageSummaryPage,
+)
 
 from .api import create_mailbox_token, mailbox_credentials_from_request
 from .credential_crypto import (
@@ -392,6 +400,138 @@ class MailApiTests(TestCase):
         self.assertEqual(response.json()["error"], "mail_connection_failed")
 
     @patch("mailops.api.MailboxService")
+    def test_mail_messages_delete_batch_returns_move_result(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.move_messages_to_trash.return_value = MailMessageMoveToTrashResult(
+            trash_folder="Trash",
+            moved_to_trash=("123", "124"),
+            failed=(),
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "INBOX", "uids": [123, "124"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "account_email": self.account_email,
+                "folder": "INBOX",
+                "trash_folder": "Trash",
+                "success": True,
+                "partial": False,
+                "moved_to_trash": ["123", "124"],
+                "failed": [],
+            },
+        )
+        credentials = service.move_messages_to_trash.call_args.args[0]
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
+        self.assertEqual(service.move_messages_to_trash.call_args.kwargs, {"folder": "INBOX", "uids": ("123", "124")})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_delete_single_uses_query_folder(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_trash.return_value = MailMessageMoveToTrashResult(
+            trash_folder="Trash",
+            moved_to_trash=("42",),
+            failed=(),
+        )
+
+        response = self.client.post(f'{reverse("mailops:api_mail_message_delete", kwargs={"uid": "42"})}?folder=Archive', **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["moved_to_trash"], ["42"])
+        self.assertEqual(service_class.return_value.move_messages_to_trash.call_args.kwargs, {"folder": "Archive", "uids": ("42",)})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_delete_serializes_partial_failures(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_trash.return_value = MailMessageMoveToTrashResult(
+            trash_folder="Trash",
+            moved_to_trash=("123",),
+            failed=(MailMessageMoveFailure(uid="124", error="move_failed", detail="IMAP move failed for UID 124"),),
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "INBOX", "uids": ["123", "124"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["moved_to_trash"], ["123"])
+        self.assertEqual(payload["failed"][0]["uid"], "124")
+        self.assertEqual(payload["failed"][0]["error"], "move_failed")
+
+    def test_mail_messages_delete_requires_token_and_validates_payload(self):
+        missing_token = self.client.post(reverse("mailops:api_mail_messages_delete"), data={}, content_type="application/json")
+        headers = self.auth_headers()
+        missing_folder = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+        empty_uids = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "INBOX", "uids": []},
+            content_type="application/json",
+            **headers,
+        )
+        invalid_uid = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "INBOX", "uids": ["abc"]},
+            content_type="application/json",
+            **headers,
+        )
+        single_missing_folder = self.client.post(reverse("mailops:api_mail_message_delete", kwargs={"uid": "42"}), **headers)
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(missing_folder.status_code, 400)
+        self.assertEqual(missing_folder.json()["error"], "invalid_folder")
+        self.assertEqual(empty_uids.status_code, 400)
+        self.assertEqual(empty_uids.json()["error"], "empty_uid_list")
+        self.assertEqual(invalid_uid.status_code, 400)
+        self.assertEqual(invalid_uid.json()["error"], "invalid_uid")
+        self.assertEqual(single_missing_folder.status_code, 400)
+        self.assertEqual(single_missing_folder.json()["error"], "invalid_folder")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_delete_maps_mail_errors_and_trash_guard(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_trash.side_effect = MailInvalidOperationError("trash")
+        trash_response = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "Trash", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        service_class.return_value.move_messages_to_trash.side_effect = MailConnectionError("down")
+        connection_response = self.client.post(
+            reverse("mailops:api_mail_messages_delete"),
+            data={"folder": "INBOX", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(trash_response.status_code, 400)
+        self.assertEqual(trash_response.json()["error"], "delete_from_trash_not_supported")
+        self.assertEqual(connection_response.status_code, 502)
+        self.assertEqual(connection_response.json()["error"], "mail_connection_failed")
+
+    @patch("mailops.api.MailboxService")
     def test_mail_send_calls_service_and_returns_message_id(self, service_class):
         headers = self.auth_headers()
         service = service_class.return_value
@@ -515,6 +655,8 @@ class MailApiTests(TestCase):
         self.assertEqual(schema.status_code, 200)
         self.assertContains(schema, "/api/auth/login")
         self.assertContains(schema, "/api/auth/logout")
+        self.assertContains(schema, "/api/mail/messages/delete")
+        self.assertContains(schema, "/api/mail/messages/{uid}/delete")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/mail/new/")

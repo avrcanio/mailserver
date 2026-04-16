@@ -34,6 +34,18 @@ class MailboxAddressField(serializers.CharField):
         return normalize_mailbox_address(value)
 
 
+class MailboxUidField(serializers.CharField):
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        try:
+            uid = int(value.strip())
+        except (TypeError, ValueError) as exc:
+            raise serializers.ValidationError("Enter a valid message UID.") from exc
+        if uid < 1:
+            raise serializers.ValidationError("Enter a valid message UID.")
+        return str(uid)
+
+
 class LoginRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(trim_whitespace=False, write_only=True)
@@ -132,6 +144,27 @@ class SendMailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     status = serializers.CharField()
     message_id = serializers.CharField(allow_null=True)
+
+
+class DeleteMessagesRequestSerializer(serializers.Serializer):
+    folder = serializers.CharField(allow_blank=False)
+    uids = serializers.ListField(child=MailboxUidField(), allow_empty=False)
+
+
+class DeleteMessageFailureSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    error = serializers.CharField()
+    detail = serializers.CharField()
+
+
+class DeleteMessagesResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folder = serializers.CharField()
+    trash_folder = serializers.CharField()
+    success = serializers.BooleanField()
+    partial = serializers.BooleanField()
+    moved_to_trash = serializers.ListField(child=serializers.CharField())
+    failed = DeleteMessageFailureSerializer(many=True)
 
 
 class DeviceRegistrationRequestSerializer(serializers.Serializer):

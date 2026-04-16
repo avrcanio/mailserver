@@ -162,6 +162,61 @@ Response:
 }
 ```
 
+## Delete
+
+Delete moves messages from the source folder to the server Trash folder. It does not permanently delete or expunge messages.
+
+`POST /api/mail/messages/delete`
+
+Request:
+
+```json
+{
+  "folder": "INBOX",
+  "uids": ["123", "124", "130"]
+}
+```
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "trash_folder": "Trash",
+  "success": true,
+  "partial": false,
+  "moved_to_trash": ["123", "124", "130"],
+  "failed": []
+}
+```
+
+Partial failures still return HTTP 200 and identify the failed UIDs:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "trash_folder": "Trash",
+  "success": false,
+  "partial": true,
+  "moved_to_trash": ["123"],
+  "failed": [
+    {
+      "uid": "124",
+      "error": "move_failed",
+      "detail": "IMAP move failed for UID 124"
+    }
+  ]
+}
+```
+
+For a single message, use the same behavior through:
+
+```http
+POST /api/mail/messages/123/delete?folder=INBOX
+```
+
 ## Send
 
 `POST /api/mail/send`
