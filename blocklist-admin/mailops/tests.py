@@ -13,11 +13,22 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
-from mail_integration.exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailSendError
+from mail_integration.exceptions import (
+    MailAttachmentNotFoundError,
+    MailAuthError,
+    MailConnectionError,
+    MailForwardAttachmentNotFoundError,
+    MailForwardAttachmentNotVisibleError,
+    MailInvalidOperationError,
+    MailSendError,
+)
 from mail_integration.schemas import (
     MailAttachmentContent,
     MailAttachmentSummary,
     MailboxAccountSummary,
+    MailConversationParticipant,
+    MailConversationSummary,
+    MailConversationSummaryPage,
     MailFolderSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
@@ -391,6 +402,97 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"], "mail_auth_failed")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_conversations_returns_structured_participants_and_aggregate_attachments(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        root = MailMessageSummary(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender Name <sender@example.com>",
+            to=("user@example.com",),
+            cc=(),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+            flags=("Seen",),
+            size=1234,
+            has_attachments=False,
+            has_visible_attachments=False,
+        )
+        reply = MailMessageSummary(
+            uid="43",
+            folder="INBOX",
+            subject="Re: Hello",
+            sender="Reply Person <reply@example.com>",
+            to=("sender@example.com",),
+            cc=(),
+            date=datetime(2026, 4, 16, 8, 0, tzinfo=dt_timezone.utc),
+            message_id="<m2@example.com>",
+            flags=(),
+            size=2345,
+            has_attachments=True,
+            has_visible_attachments=True,
+        )
+        service.list_conversations.return_value = MailConversationSummaryPage(
+            conversations=(
+                MailConversationSummary(
+                    conversation_id="thread-1",
+                    message_count=2,
+                    reply_count=1,
+                    has_unread=True,
+                    has_attachments=True,
+                    has_visible_attachments=True,
+                    participants=(
+                        MailConversationParticipant(name="Sender Name", email="sender@example.com"),
+                        MailConversationParticipant(name="", email="user@example.com"),
+                    ),
+                    root_message=root,
+                    replies=(reply,),
+                    latest_date=datetime(2026, 4, 16, 8, 0, tzinfo=dt_timezone.utc),
+                ),
+            )
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_conversations"), {"folder": "INBOX", "limit": 25}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        conversation = payload["conversations"][0]
+        self.assertEqual(payload["account_email"], self.account_email)
+        self.assertEqual(conversation["conversation_id"], "thread-1")
+        self.assertEqual(conversation["message_count"], 2)
+        self.assertEqual(conversation["reply_count"], 1)
+        self.assertTrue(conversation["has_unread"])
+        self.assertTrue(conversation["has_attachments"])
+        self.assertTrue(conversation["has_visible_attachments"])
+        self.assertEqual(conversation["participants"], [{"name": "Sender Name", "email": "sender@example.com"}, {"name": "", "email": "user@example.com"}])
+        self.assertEqual(conversation["root_message"]["uid"], "42")
+        self.assertEqual(conversation["replies"][0]["uid"], "43")
+        self.assertTrue(conversation["replies"][0]["has_attachments"])
+        self.assertIn("2026-04-16T08:00:00", conversation["latest_date"])
+        self.assertEqual(service.list_conversations.call_args.kwargs, {"folder": "INBOX", "limit": 25})
+
+    def test_mail_conversations_requires_token_and_validates_limit(self):
+        missing_token = self.client.get(reverse("mailops:api_mail_conversations"))
+        headers = self.auth_headers()
+        invalid_limit = self.client.get(reverse("mailops:api_mail_conversations"), {"limit": 500}, **headers)
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(invalid_limit.status_code, 400)
+        self.assertEqual(invalid_limit.json()["error"], "invalid_limit")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_conversations_maps_mail_errors(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.list_conversations.side_effect = MailConnectionError("down")
+
+        response = self.client.get(reverse("mailops:api_mail_conversations"), **headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "mail_connection_failed")
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_detail_returns_service_result(self, service_class):
@@ -856,6 +958,92 @@ class MailApiTests(TestCase):
         self.assertEqual(request.attachments[0].content_type, "text/plain")
         self.assertEqual(request.attachments[0].content, b"report content")
 
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_accepts_forward_source_message(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.send_mail.return_value = "<sent@example.com>"
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={
+                "to": ["to@example.com"],
+                "subject": "Forward",
+                "text_body": "Forwarded body",
+                "forward_source_message": {
+                    "folder": "INBOX",
+                    "uid": "42",
+                    "attachment_ids": ["att_4", "att_3"],
+                },
+            },
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        request = service.send_mail.call_args.args[1]
+        self.assertEqual(request.forward_source_message.folder, "INBOX")
+        self.assertEqual(request.forward_source_message.uid, "42")
+        self.assertEqual(request.forward_source_message.attachment_ids, ("att_4", "att_3"))
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_accepts_multipart_forward_source_message_and_uploads(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.send_mail.return_value = "<sent@example.com>"
+        attachment = SimpleUploadedFile("manual.txt", b"manual content", content_type="text/plain")
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={
+                "to": "to@example.com",
+                "subject": "Forward",
+                "text_body": "Forwarded body",
+                "forward_source_message": json.dumps(
+                    {
+                        "folder": "Archive",
+                        "uid": "99",
+                        "attachment_ids": ["att_2", "att_1"],
+                    }
+                ),
+                "attachments": attachment,
+            },
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        request = service.send_mail.call_args.args[1]
+        self.assertEqual(request.forward_source_message.folder, "Archive")
+        self.assertEqual(request.forward_source_message.uid, "99")
+        self.assertEqual(request.forward_source_message.attachment_ids, ("att_2", "att_1"))
+        self.assertEqual(len(request.attachments), 1)
+        self.assertEqual(request.attachments[0].filename, "manual.txt")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_maps_forward_attachment_input_errors_to_http_400(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        payload = {
+            "to": ["to@example.com"],
+            "subject": "Forward",
+            "text_body": "Forwarded body",
+            "forward_source_message": {"folder": "INBOX", "uid": "42", "attachment_ids": ["att_1"]},
+        }
+        service.send_mail.side_effect = MailForwardAttachmentNotVisibleError("att_1 hidden")
+        hidden_response = self.client.post(reverse("mailops:api_mail_send"), data=payload, content_type="application/json", **headers)
+
+        service.send_mail.side_effect = MailForwardAttachmentNotFoundError("att_99 missing")
+        missing_payload = {
+            **payload,
+            "forward_source_message": {"folder": "INBOX", "uid": "42", "attachment_ids": ["att_99"]},
+        }
+        missing_response = self.client.post(reverse("mailops:api_mail_send"), data=missing_payload, content_type="application/json", **headers)
+
+        self.assertEqual(hidden_response.status_code, 400)
+        self.assertEqual(hidden_response.json()["error"], "forward_attachment_not_visible")
+        self.assertEqual(missing_response.status_code, 400)
+        self.assertEqual(missing_response.json()["error"], "forward_attachment_not_found")
+
     def test_mail_send_rejects_oversized_multipart_attachments(self):
         headers = self.auth_headers()
         with override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=40 * 1024 * 1024):
@@ -974,6 +1162,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
+        self.assertContains(schema, "/api/mail/conversations")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/accounts/summaries")

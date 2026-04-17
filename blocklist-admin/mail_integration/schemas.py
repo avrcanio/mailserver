@@ -73,6 +73,8 @@ class MailMessageSummary:
     size: int | None = None
     has_attachments: bool = False
     has_visible_attachments: bool | None = None
+    in_reply_to: tuple[str, ...] = field(default_factory=tuple)
+    references: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self):
         if self.has_visible_attachments is None:
@@ -84,6 +86,31 @@ class MailMessageSummaryPage:
     messages: tuple[MailMessageSummary, ...] = field(default_factory=tuple)
     has_more: bool = False
     next_before_uid: str | None = None
+
+
+@dataclass(frozen=True)
+class MailConversationParticipant:
+    name: str
+    email: str
+
+
+@dataclass(frozen=True)
+class MailConversationSummary:
+    conversation_id: str
+    message_count: int
+    reply_count: int
+    has_unread: bool
+    has_attachments: bool
+    has_visible_attachments: bool
+    participants: tuple[MailConversationParticipant, ...]
+    root_message: MailMessageSummary
+    replies: tuple[MailMessageSummary, ...] = field(default_factory=tuple)
+    latest_date: datetime | None = None
+
+
+@dataclass(frozen=True)
+class MailConversationSummaryPage:
+    conversations: tuple[MailConversationSummary, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -140,6 +167,20 @@ class MailMessageRestoreResult:
 
 
 @dataclass(frozen=True)
+class ForwardSourceMessage:
+    folder: str
+    uid: str
+    attachment_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SendMailAttachment:
+    filename: str
+    content_type: str
+    content: bytes
+
+
+@dataclass(frozen=True)
 class SendMailRequest:
     to: tuple[str, ...]
     subject: str
@@ -149,11 +190,5 @@ class SendMailRequest:
     bcc: tuple[str, ...] = field(default_factory=tuple)
     reply_to: str | None = None
     from_display_name: str = ""
-    attachments: tuple["SendMailAttachment", ...] = field(default_factory=tuple)
-
-
-@dataclass(frozen=True)
-class SendMailAttachment:
-    filename: str
-    content_type: str
-    content: bytes
+    attachments: tuple[SendMailAttachment, ...] = field(default_factory=tuple)
+    forward_source_message: ForwardSourceMessage | None = None

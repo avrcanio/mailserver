@@ -186,6 +186,78 @@ Response:
 }
 ```
 
+## Conversations
+
+`GET /api/mail/conversations?folder=INBOX&limit=50`
+
+Conversations are computed server-side for one folder. `folder` defaults to `INBOX`. `limit` defaults to `50`, accepts `1` through `200`, and applies to the number of conversations returned. The backend may fetch or scan more than `limit` messages internally so it can assemble up to `limit` conversations.
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "conversations": [
+    {
+      "conversation_id": "thread-hash",
+      "message_count": 3,
+      "reply_count": 2,
+      "has_unread": true,
+      "has_attachments": true,
+      "has_visible_attachments": true,
+      "participants": [
+        {
+          "name": "Sender Name",
+          "email": "sender@example.com"
+        }
+      ],
+      "root_message": {
+        "uid": "40",
+        "folder": "INBOX",
+        "subject": "Hello",
+        "sender": "Sender Name <sender@example.com>",
+        "to": ["user@finestar.hr"],
+        "cc": [],
+        "date": "2026-04-16T07:00:00Z",
+        "message_id": "<root@example.com>",
+        "flags": ["Seen"],
+        "size": 1234,
+        "has_attachments": false,
+        "has_visible_attachments": false
+      },
+      "replies": [
+        {
+          "uid": "42",
+          "folder": "INBOX",
+          "subject": "Re: Hello",
+          "sender": "Reply Person <reply@example.com>",
+          "to": ["sender@example.com"],
+          "cc": [],
+          "date": "2026-04-16T08:00:00Z",
+          "message_id": "<reply@example.com>",
+          "flags": [],
+          "size": 2345,
+          "has_attachments": true,
+          "has_visible_attachments": true
+        }
+      ],
+      "latest_date": "2026-04-16T08:00:00Z"
+    }
+  ]
+}
+```
+
+`root_message` and `replies` use the same summary shape as `GET /api/mail/messages`. Fetch full bodies or attachment metadata through the existing message detail endpoint.
+
+Threading rules:
+
+- Message-ID based threading is used first through `Message-ID`, `In-Reply-To`, and `References`.
+- `root_message` is determined primarily by the referenced parent chain. If the parent chain is incomplete or inconsistent, the backend falls back to the earliest dated message, then the lower numeric UID.
+- Normalized-subject fallback is used only for orphan messages where usable ID-based threading metadata is missing. `Re:`, `Fw:`, and `Fwd:` prefixes are stripped repeatedly.
+- Replies are sorted chronologically after the root, then by lower UID. Conversations are sorted by latest activity descending.
+- `has_attachments` is true when any message in the conversation has any attachment-like MIME part. `has_visible_attachments` is true when any message has at least one visible attachment.
+
 `GET /api/mail/messages/42?folder=INBOX`
 
 Response:
@@ -403,6 +475,27 @@ attachments=@photo.jpg
 ```
 
 Multipart recipient fields may be repeated, or `to`, `cc`, and `bcc` may contain comma-separated address values. Attachment limits are 10 MB per file and 25 MB total per send request. Oversized files return `attachment_too_large`; oversized total payloads return `attachments_too_large`.
+
+For forwarding original visible attachments, include `forward_source_message` on the same send request. The client supplies the source message reference and the selected attachment IDs from message detail; the backend resolves the original bytes from IMAP and preserves filename and content type.
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Fwd: TELWIN",
+  "text_body": "Forwarded body",
+  "forward_source_message": {
+    "folder": "INBOX",
+    "uid": "42",
+    "attachment_ids": ["att_3", "att_4"]
+  }
+}
+```
+
+For `multipart/form-data`, send `forward_source_message` as a JSON string field alongside any repeated `attachments` file parts. Forwarded original attachments and newly uploaded attachments are included in one outgoing message. The order of `forward_source_message.attachment_ids` is preserved for forwarded attachments.
+
+Only attachments with `is_visible: true` are eligible for forwarding. If a requested ID exists but is hidden or inline-only, the response is `400 {"error": "forward_attachment_not_visible"}`. If a requested ID is not present on the source message, the response is `400 {"error": "forward_attachment_not_found"}`. Hidden CID resources are never silently forwarded.
+
+Reply and reply-all flows should not include original attachments unless the client explicitly sends `forward_source_message`.
 
 Response:
 

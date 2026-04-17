@@ -16,20 +16,24 @@ from rest_framework.views import APIView
 
 from mail_integration.exceptions import (
     MailAttachmentNotFoundError,
+    MailAttachmentLimitError,
     MailAuthError,
     MailConnectionError,
+    MailForwardAttachmentNotFoundError,
+    MailForwardAttachmentNotVisibleError,
     MailIntegrationError,
     MailInvalidOperationError,
     MailProtocolError,
     MailSendError,
     MailTimeoutError,
 )
-from mail_integration.mailbox_service import MailboxService
-from mail_integration.schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
+from mail_integration.mailbox_service import MAX_SEND_ATTACHMENT_SIZE_BYTES, MAX_SEND_ATTACHMENTS_TOTAL_BYTES, MailboxService
+from mail_integration.schemas import ForwardSourceMessage, MailboxCredentials, SendMailAttachment, SendMailRequest
 
 from .api_serializers import (
     AccountSummariesResponseSerializer,
     AccountsSummaryQuerySerializer,
+    ConversationListResponseSerializer,
     DeviceRegistrationRequestSerializer,
     DeviceRegistrationResponseSerializer,
     DeleteMessagesRequestSerializer,
@@ -55,8 +59,6 @@ from .services import send_mail_notification
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
 MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
-MAX_SEND_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
-MAX_SEND_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024
 
 
 def create_mailbox_token(email, password):
@@ -203,6 +205,27 @@ def detail_payload(detail):
     return payload
 
 
+def conversation_payload(conversation):
+    return {
+        "conversation_id": conversation.conversation_id,
+        "message_count": conversation.message_count,
+        "reply_count": conversation.reply_count,
+        "has_unread": conversation.has_unread,
+        "has_attachments": conversation.has_attachments,
+        "has_visible_attachments": conversation.has_visible_attachments,
+        "participants": [
+            {
+                "name": participant.name,
+                "email": participant.email,
+            }
+            for participant in conversation.participants
+        ],
+        "root_message": summary_payload(conversation.root_message),
+        "replies": [summary_payload(reply) for reply in conversation.replies],
+        "latest_date": conversation.latest_date,
+    }
+
+
 def account_summary_payload(account_email, summary):
     return {
         "account_email": account_email,
@@ -314,7 +337,7 @@ def send_form_data(data):
                 values.append(value)
         if values:
             normalized[field] = values
-    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name"):
+    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name", "forward_source_message"):
         values = data.getlist(field)
         if values:
             normalized[field] = values[-1]
@@ -476,6 +499,42 @@ class MessageListView(APIView):
                 "messages": [summary_payload(summary) for summary in page.messages],
                 "has_more": page.has_more,
                 "next_before_uid": page.next_before_uid,
+            }
+        )
+
+
+class ConversationListView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_conversations_list",
+        parameters=[
+            OpenApiParameter("folder", str, required=False, description="Mailbox folder name. Defaults to INBOX."),
+            OpenApiParameter("limit", int, required=False, description="Maximum conversations to return. 1-200, defaults to 50."),
+        ],
+        responses={200: ConversationListResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "INBOX").strip() or "INBOX"
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        if limit < 1 or limit > 200:
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            page = MailboxService().list_conversations(credentials, folder=folder, limit=limit)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(
+            {
+                "account_email": credentials.email,
+                "folder": folder,
+                "conversations": [conversation_payload(conversation) for conversation in page.conversations],
             }
         )
 
@@ -673,6 +732,13 @@ class SendMailView(APIView):
             attachments, error = uploaded_send_attachments(request.FILES)
             if error:
                 return error
+        forward_source = data.get("forward_source_message")
+        if forward_source:
+            forward_source = ForwardSourceMessage(
+                folder=forward_source["folder"],
+                uid=forward_source["uid"],
+                attachment_ids=tuple(forward_source["attachment_ids"]),
+            )
         send_request = SendMailRequest(
             to=tuple(data["to"]),
             cc=tuple(data.get("cc", ())),
@@ -683,9 +749,16 @@ class SendMailView(APIView):
             html_body=data.get("html_body", ""),
             from_display_name=data.get("from_display_name", ""),
             attachments=attachments,
+            forward_source_message=forward_source,
         )
         try:
             message_id = MailboxService().send_mail(credentials, send_request)
+        except MailForwardAttachmentNotVisibleError as exc:
+            return Response({"error": "forward_attachment_not_visible", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except MailForwardAttachmentNotFoundError as exc:
+            return Response({"error": "forward_attachment_not_found", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except MailAttachmentLimitError as exc:
+            return Response({"error": exc.code}, status=status.HTTP_400_BAD_REQUEST)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response({"account_email": credentials.email, "status": "sent", "message_id": message_id})

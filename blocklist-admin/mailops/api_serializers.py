@@ -1,7 +1,9 @@
+import json
 from email.utils import getaddresses
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 
@@ -136,10 +138,60 @@ class MessageSummariesResponseSerializer(serializers.Serializer):
     next_before_uid = serializers.CharField(allow_null=True)
 
 
+class ConversationParticipantSerializer(serializers.Serializer):
+    name = serializers.CharField(allow_blank=True)
+    email = serializers.EmailField()
+
+
+class ConversationSerializer(serializers.Serializer):
+    conversation_id = serializers.CharField()
+    message_count = serializers.IntegerField()
+    reply_count = serializers.IntegerField()
+    has_unread = serializers.BooleanField()
+    has_attachments = serializers.BooleanField()
+    has_visible_attachments = serializers.BooleanField()
+    participants = ConversationParticipantSerializer(many=True)
+    root_message = MessageSummarySerializer()
+    replies = MessageSummarySerializer(many=True)
+    latest_date = serializers.DateTimeField(allow_null=True)
+
+
+class ConversationListResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folder = serializers.CharField()
+    conversations = ConversationSerializer(many=True)
+
+
 class MessageDetailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folder = serializers.CharField()
     message = MessageDetailSerializer()
+
+
+class ForwardSourceMessageSerializer(serializers.Serializer):
+    folder = serializers.CharField(allow_blank=False)
+    uid = MailboxUidField()
+    attachment_ids = serializers.ListField(child=serializers.CharField(allow_blank=False), allow_empty=False)
+
+
+@extend_schema_field(ForwardSourceMessageSerializer)
+class ForwardSourceMessageField(serializers.Field):
+    def to_internal_value(self, data):
+        if data in (None, ""):
+            return None
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise serializers.ValidationError("Enter a valid JSON object.") from exc
+        if not isinstance(data, dict):
+            raise serializers.ValidationError("Expected an object.")
+        serializer = ForwardSourceMessageSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data
+
+    def to_representation(self, value):
+        return value
 
 
 class SendMailRequestSerializer(serializers.Serializer):
@@ -151,6 +203,7 @@ class SendMailRequestSerializer(serializers.Serializer):
     bcc = serializers.ListField(child=MailboxAddressField(), required=False, allow_empty=True, default=list)
     reply_to = MailboxAddressField(required=False, allow_blank=True, allow_null=True, default=None)
     from_display_name = serializers.CharField(required=False, allow_blank=True, default="")
+    forward_source_message = ForwardSourceMessageField(required=False, allow_null=True, default=None)
 
     def validate(self, attrs):
         if not attrs.get("text_body") and not attrs.get("html_body"):

@@ -7,10 +7,31 @@ from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase, override_settings
 
-from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailSendError, MailTimeoutError
+from .exceptions import (
+    MailAttachmentNotFoundError,
+    MailAuthError,
+    MailConnectionError,
+    MailForwardAttachmentNotFoundError,
+    MailForwardAttachmentNotVisibleError,
+    MailInvalidOperationError,
+    MailProtocolError,
+    MailSendError,
+    MailTimeoutError,
+)
 from .imap_client import ImapClient
 from .mailbox_service import MailboxService
-from .schemas import MailboxAccountSummary, MailboxCredentials, SendMailAttachment, SendMailRequest
+from .schemas import (
+    ForwardSourceMessage,
+    MailAttachmentContent,
+    MailAttachmentSummary,
+    MailboxAccountSummary,
+    MailboxCredentials,
+    MailConversationParticipant,
+    MailConversationSummary,
+    MailConversationSummaryPage,
+    SendMailAttachment,
+    SendMailRequest,
+)
 from .smtp_client import SmtpClient, build_email_message
 
 
@@ -357,6 +378,151 @@ class ImapClientTests(SimpleTestCase):
         self.assertTrue(page.has_more)
         self.assertEqual(page.next_before_uid, "104")
 
+    def test_fetch_conversation_page_groups_by_references_and_uses_structured_participants(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"101 102"]),
+            _conversation_fetch(
+                "102",
+                subject="Re: Project",
+                sender="Bob Builder <bob@example.com>",
+                to="Alice Example <alice@example.com>",
+                date="Thu, 16 Apr 2026 08:00:00 +0000",
+                message_id="<reply@example.com>",
+                in_reply_to="<root@example.com>",
+                references="<root@example.com>",
+                flags="",
+                attach=True,
+            ),
+            _conversation_fetch(
+                "101",
+                subject="Project",
+                sender="Alice Example <alice@example.com>",
+                to="User <user@example.com>",
+                date="Thu, 16 Apr 2026 07:00:00 +0000",
+                message_id="<root@example.com>",
+                flags="\\Seen",
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=10)
+
+        self.assertEqual(len(page.conversations), 1)
+        conversation = page.conversations[0]
+        self.assertEqual(conversation.root_message.uid, "101")
+        self.assertEqual([reply.uid for reply in conversation.replies], ["102"])
+        self.assertEqual(conversation.message_count, 2)
+        self.assertEqual(conversation.reply_count, 1)
+        self.assertTrue(conversation.has_unread)
+        self.assertTrue(conversation.has_attachments)
+        self.assertTrue(conversation.has_visible_attachments)
+        self.assertEqual(
+            conversation.participants,
+            (
+                MailConversationParticipant(name="Alice Example", email="alice@example.com"),
+                MailConversationParticipant(name="", email="user@example.com"),
+                MailConversationParticipant(name="Bob Builder", email="bob@example.com"),
+            ),
+        )
+
+    def test_fetch_conversation_page_falls_back_to_earliest_date_then_uid_for_incomplete_chain_root(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"110 111"]),
+            _conversation_fetch(
+                "111",
+                subject="Re: Missing parent",
+                sender="Reply <reply@example.com>",
+                to="user@example.com",
+                date="Thu, 16 Apr 2026 09:00:00 +0000",
+                message_id="<reply@example.com>",
+                in_reply_to="<missing@example.com>",
+                references="<missing@example.com>",
+            ),
+            _conversation_fetch(
+                "110",
+                subject="Re: Missing parent",
+                sender="Earlier <earlier@example.com>",
+                to="user@example.com",
+                date="Thu, 16 Apr 2026 08:00:00 +0000",
+                message_id="<earlier@example.com>",
+                in_reply_to="<missing@example.com>",
+                references="<missing@example.com>",
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=10)
+
+        self.assertEqual(len(page.conversations), 1)
+        self.assertEqual(page.conversations[0].root_message.uid, "110")
+
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"120 121"]),
+            _conversation_fetch(
+                "121",
+                subject="Re: Missing dates",
+                sender="High <high@example.com>",
+                to="user@example.com",
+                message_id="<high@example.com>",
+                in_reply_to="<missing@example.com>",
+                references="<missing@example.com>",
+            ),
+            _conversation_fetch(
+                "120",
+                subject="Re: Missing dates",
+                sender="Low <low@example.com>",
+                to="user@example.com",
+                message_id="<low@example.com>",
+                in_reply_to="<missing@example.com>",
+                references="<missing@example.com>",
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=10)
+
+        self.assertEqual(len(page.conversations), 1)
+        self.assertEqual(page.conversations[0].root_message.uid, "120")
+
+    def test_fetch_conversation_page_uses_subject_fallback_only_for_orphan_messages(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"3"])
+        connection.uid.side_effect = [
+            ("OK", [b"201 202 203"]),
+            _conversation_fetch("203", subject="Re: Report", sender="Id <id@example.com>", to="user@example.com", message_id="<id@example.com>"),
+            _conversation_fetch("202", subject="Fwd: Re: Report", sender="No Id 2 <orphan2@example.com>", to="user@example.com"),
+            _conversation_fetch("201", subject="Report", sender="No Id 1 <orphan1@example.com>", to="user@example.com"),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=10)
+
+        conversation_uids = [sorted([conversation.root_message.uid, *(reply.uid for reply in conversation.replies)]) for conversation in page.conversations]
+        self.assertIn(["201", "202"], conversation_uids)
+        self.assertIn(["203"], conversation_uids)
+
+    def test_fetch_conversation_page_scans_more_messages_than_returned_conversation_limit(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"3"])
+        connection.uid.side_effect = [
+            ("OK", [b"301 302 303"]),
+            _conversation_fetch("303", subject="Newest", sender="a@example.com", to="user@example.com", message_id="<303@example.com>"),
+            _conversation_fetch("302", subject="Middle", sender="b@example.com", to="user@example.com", message_id="<302@example.com>"),
+            _conversation_fetch("301", subject="Oldest", sender="c@example.com", to="user@example.com", message_id="<301@example.com>"),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=1)
+
+        self.assertEqual(len(page.conversations), 1)
+        self.assertEqual(connection.uid.call_count, 4)
+
     def test_fetch_message_summary_page_empty_when_no_older_messages_remain(self):
         connection = Mock()
         connection.select.return_value = ("OK", [b"2"])
@@ -525,6 +691,22 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(attachment.summary.id, "att_1")
         self.assertEqual(attachment.summary.filename, "report.txt")
         self.assertEqual(attachment.content, b"report content")
+
+    def test_fetch_attachments_uses_detail_visibility_for_forward_sources(self):
+        raw_message = _raw_telwin_message()
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.return_value = (
+            "OK",
+            [(b"7 (UID 7 FLAGS () RFC822.SIZE 2048 RFC822 {999}", raw_message)],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            attachments = ImapClient().connect().fetch_attachments("INBOX", "7")
+
+        self.assertEqual([attachment.summary.filename for attachment in attachments], ["image002.jpg", "image004.gif", "Otpremnice.pdf", "194-1-26.pdf"])
+        self.assertEqual([attachment.summary.is_visible for attachment in attachments], [False, False, True, True])
+        self.assertEqual([attachment.summary.content_type for attachment in attachments[2:]], ["application/pdf", "application/pdf"])
 
     def test_fetch_attachment_guesses_pdf_content_type_from_filename(self):
         message = EmailMessage()
@@ -1012,8 +1194,10 @@ class MailboxServiceTests(SimpleTestCase):
         entered.fetch_message_summaries.return_value = ["summary"]
         entered.fetch_account_summary.return_value = MailboxAccountSummary(unread_count=2, important_count=1)
         entered.fetch_message_summary_page.return_value = "summary-page"
+        entered.fetch_conversation_page.return_value = "conversation-page"
         entered.fetch_message_detail.return_value = "detail"
         entered.fetch_attachment.return_value = "attachment"
+        entered.fetch_attachments.return_value = "attachments"
         entered.move_messages_to_trash.return_value = "move-result"
         entered.restore_messages_from_trash.return_value = "restore-result"
 
@@ -1023,17 +1207,21 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.list_message_summaries(credentials, folder="Archive", limit=10), ["summary"])
         self.assertEqual(service.get_account_summary(credentials), MailboxAccountSummary(unread_count=2, important_count=1))
         self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
+        self.assertEqual(service.list_conversations(credentials, folder="Archive", limit=5), "conversation-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
         self.assertEqual(service.get_attachment(credentials, folder="Archive", uid="99", attachment_id="att_1"), "attachment")
+        self.assertEqual(service.get_attachments(credentials, folder="Archive", uid="99"), "attachments")
         self.assertEqual(service.move_messages_to_trash(credentials, folder="Archive", uids=("99",)), "move-result")
         self.assertEqual(service.restore_messages_from_trash(credentials, folder="Trash", target_folder="INBOX", uids=("99",)), "restore-result")
-        self.assertEqual(entered.login.call_count, 8)
+        self.assertEqual(entered.login.call_count, 10)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
         entered.fetch_account_summary.assert_called_once_with()
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
+        entered.fetch_conversation_page.assert_called_once_with(folder="Archive", limit=5)
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
         entered.fetch_attachment.assert_called_once_with(folder="Archive", uid="99", attachment_id="att_1")
+        entered.fetch_attachments.assert_called_once_with(folder="Archive", uid="99")
         entered.move_messages_to_trash.assert_called_once_with(folder="Archive", uids=("99",))
         entered.restore_messages_from_trash.assert_called_once_with(folder="Trash", target_folder="INBOX", uids=("99",))
 
@@ -1048,6 +1236,65 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.send_mail(credentials, request), "<sent@example.com>")
         smtp_client.__enter__.return_value.login.assert_called_once_with(credentials)
         smtp_client.__enter__.return_value.send_mail.assert_called_once_with(credentials, request)
+
+    def test_service_send_resolves_forwarded_visible_attachments_in_client_order(self):
+        credentials = MailboxCredentials("sender@example.com", "secret")
+        request = SendMailRequest(
+            to=("to@example.com",),
+            subject="Hi",
+            text_body="Body",
+            attachments=(SendMailAttachment(filename="manual.txt", content_type="text/plain", content=b"manual"),),
+            forward_source_message=ForwardSourceMessage(folder="INBOX", uid="7", attachment_ids=("att_4", "att_3")),
+        )
+        imap_client = _context_client()
+        smtp_client = _context_client()
+        imap_client.__enter__.return_value.fetch_attachments.return_value = _telwin_attachment_contents()
+        smtp_client.__enter__.return_value.send_mail.return_value = "<sent@example.com>"
+
+        service = MailboxService(imap_client_factory=lambda: imap_client, smtp_client_factory=lambda: smtp_client)
+
+        self.assertEqual(service.send_mail(credentials, request), "<sent@example.com>")
+        sent_request = smtp_client.__enter__.return_value.send_mail.call_args.args[1]
+        self.assertEqual([attachment.filename for attachment in sent_request.attachments], ["194-1-26.pdf", "Otpremnice.pdf", "manual.txt"])
+        self.assertEqual([attachment.content_type for attachment in sent_request.attachments[:2]], ["application/pdf", "application/pdf"])
+        self.assertEqual([attachment.content for attachment in sent_request.attachments], [b"invoice", b"delivery note", b"manual"])
+        imap_client.__enter__.return_value.fetch_attachments.assert_called_once_with(folder="INBOX", uid="7")
+
+    def test_service_send_rejects_hidden_forward_attachment_as_invalid_input(self):
+        credentials = MailboxCredentials("sender@example.com", "secret")
+        request = SendMailRequest(
+            to=("to@example.com",),
+            subject="Hi",
+            text_body="Body",
+            forward_source_message=ForwardSourceMessage(folder="INBOX", uid="7", attachment_ids=("att_1",)),
+        )
+        imap_client = _context_client()
+        smtp_client = _context_client()
+        imap_client.__enter__.return_value.fetch_attachments.return_value = _telwin_attachment_contents()
+
+        service = MailboxService(imap_client_factory=lambda: imap_client, smtp_client_factory=lambda: smtp_client)
+
+        with self.assertRaises(MailForwardAttachmentNotVisibleError):
+            service.send_mail(credentials, request)
+        smtp_client.__enter__.return_value.send_mail.assert_not_called()
+
+    def test_service_send_rejects_unknown_forward_attachment_as_invalid_input(self):
+        credentials = MailboxCredentials("sender@example.com", "secret")
+        request = SendMailRequest(
+            to=("to@example.com",),
+            subject="Hi",
+            text_body="Body",
+            forward_source_message=ForwardSourceMessage(folder="INBOX", uid="7", attachment_ids=("att_99",)),
+        )
+        imap_client = _context_client()
+        smtp_client = _context_client()
+        imap_client.__enter__.return_value.fetch_attachments.return_value = _telwin_attachment_contents()
+
+        service = MailboxService(imap_client_factory=lambda: imap_client, smtp_client_factory=lambda: smtp_client)
+
+        with self.assertRaises(MailForwardAttachmentNotFoundError):
+            service.send_mail(credentials, request)
+        smtp_client.__enter__.return_value.send_mail.assert_not_called()
 
 
 def _raw_detail_message(text_body="", html_body="", attach=False):
@@ -1084,6 +1331,111 @@ def _raw_duplicate_signature_image_message():
     html_part.get_payload()[2].replace_header("Content-Disposition", 'inline; filename="Outlook-logo.png"')
     message.add_attachment(image_content, maintype="image", subtype="png", filename="Outlook-logo.png", cid="<duplicate-logo>")
     return bytes(message)
+
+
+def _raw_telwin_message():
+    message = EmailMessage()
+    message["Subject"] = "TELWIN attachments"
+    message["From"] = "Sender <sender@example.com>"
+    message["To"] = "User <user@example.com>"
+    message.set_content("Plain fallback")
+    message.add_alternative(
+        '<p><img src="cid:image002.jpg@01DCB149.77FF6EF0">'
+        '<img src="cid:image004.gif@01DCB149.77FF6EF0"></p>',
+        subtype="html",
+    )
+    html_part = message.get_payload()[1]
+    html_part.add_related(
+        b"jpg bytes",
+        maintype="image",
+        subtype="jpeg",
+        cid="<image002.jpg@01DCB149.77FF6EF0>",
+        filename="image002.jpg",
+    )
+    _remove_content_disposition(html_part.get_payload()[-1], "image002.jpg")
+    html_part.add_related(
+        b"gif bytes",
+        maintype="image",
+        subtype="gif",
+        cid="<image004.gif@01DCB149.77FF6EF0>",
+        filename="image004.gif",
+    )
+    _remove_content_disposition(html_part.get_payload()[-1], "image004.gif")
+    message.add_attachment(b"delivery note", maintype="application", subtype="pdf", filename="Otpremnice.pdf")
+    message.add_attachment(b"invoice", maintype="application", subtype="pdf", filename="194-1-26.pdf")
+    return bytes(message)
+
+
+def _telwin_attachment_contents():
+    return (
+        MailAttachmentContent(
+            summary=MailAttachmentSummary(
+                id="att_1",
+                filename="image002.jpg",
+                content_type="image/jpeg",
+                size=9,
+                content_id="image002.jpg@01DCB149.77FF6EF0",
+                is_visible=False,
+            ),
+            content=b"jpg bytes",
+        ),
+        MailAttachmentContent(
+            summary=MailAttachmentSummary(
+                id="att_2",
+                filename="image004.gif",
+                content_type="image/gif",
+                size=9,
+                content_id="image004.gif@01DCB149.77FF6EF0",
+                is_visible=False,
+            ),
+            content=b"gif bytes",
+        ),
+        MailAttachmentContent(
+            summary=MailAttachmentSummary(id="att_3", filename="Otpremnice.pdf", content_type="application/pdf", size=13, is_visible=True),
+            content=b"delivery note",
+        ),
+        MailAttachmentContent(
+            summary=MailAttachmentSummary(id="att_4", filename="194-1-26.pdf", content_type="application/pdf", size=7, is_visible=True),
+            content=b"invoice",
+        ),
+    )
+
+
+def _conversation_fetch(
+    uid,
+    subject,
+    sender,
+    to,
+    date="",
+    message_id="",
+    in_reply_to="",
+    references="",
+    flags="",
+    attach=False,
+):
+    bodystructure = (
+        b'(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+        b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 100 NIL '
+        b'("ATTACHMENT" ("FILENAME" "report.pdf")) NIL) "MIXED")'
+        if attach
+        else b'("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+    )
+    headers = [
+        f"Subject: {subject}",
+        f"From: {sender}",
+        f"To: {to}",
+    ]
+    if date:
+        headers.append(f"Date: {date}")
+    if message_id:
+        headers.append(f"Message-ID: {message_id}")
+    if in_reply_to:
+        headers.append(f"In-Reply-To: {in_reply_to}")
+    if references:
+        headers.append(f"References: {references}")
+    payload = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8")
+    metadata = f"{uid} (UID {uid} FLAGS ({flags}) RFC822.SIZE 123 BODYSTRUCTURE ".encode("ascii") + bodystructure + b" BODY[HEADER.FIELDS ...] {123}"
+    return ("OK", [(metadata, payload)])
 
 
 def _remove_content_disposition(part, filename=None):

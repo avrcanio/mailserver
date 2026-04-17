@@ -13,6 +13,7 @@ urlpatterns = [
     path("api/auth/me", api.MeView.as_view(), name="api_me"),
     path("api/auth/logout", api.LogoutView.as_view(), name="api_logout"),
     path("api/mail/folders", api.FolderListView.as_view(), name="api_mail_folders"),
+    path("api/mail/conversations", api.ConversationListView.as_view(), name="api_mail_conversations"),
     path("api/mail/messages", api.MessageListView.as_view(), name="api_mail_messages"),
     path("api/mail/messages/delete", api.DeleteMessagesView.as_view(), name="api_mail_messages_delete"),
     path("api/mail/messages/restore", api.RestoreMessagesView.as_view(), name="api_mail_messages_restore"),
