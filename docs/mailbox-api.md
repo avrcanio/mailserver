@@ -351,6 +351,33 @@ In Docker, the `mailindex-sync` service runs this loop. It selects stale indexed
 
 Incremental sync refreshes newer UIDs plus a recent metadata window. It does not delete indexed rows that are missing from that recent window unless `MAIL_INDEX_RECONCILE_DELETIONS=true` is explicitly enabled, because deletion reconciliation depends on the IMAP server returning a complete and trustworthy UID view for that checked window.
 
+`GET /api/mail/index-status`
+
+Returns the stored Django mail index status for the authenticated mailbox. The endpoint is read-only, requires the same mailbox token context as the other mailbox APIs, and never triggers sync or live IMAP calls. Optional query parameter: `account_email`; when omitted, the current token mailbox is used.
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "index_status": "ready",
+  "last_indexed_at": "2026-04-17T13:40:00Z",
+  "last_sync_started_at": "2026-04-17T13:39:50Z",
+  "last_sync_finished_at": "2026-04-17T13:40:00Z",
+  "last_sync_error": "",
+  "folders": [
+    {
+      "folder": "INBOX",
+      "uidvalidity": "12345",
+      "highest_indexed_uid": 500,
+      "last_synced_at": "2026-04-17T13:40:00Z"
+    }
+  ]
+}
+```
+
+If the authenticated user has no index row for the requested mailbox, the endpoint returns `404 {"error": "mail_index_not_found"}`. Invalid `account_email` returns `400 {"error": "invalid_account_email"}`. `last_sync_error` is returned as stored operational status only; sync code must not write credentials, raw message bodies, or raw MIME content into that field.
+
 `GET /api/mail/messages/42?folder=INBOX`
 
 Response:

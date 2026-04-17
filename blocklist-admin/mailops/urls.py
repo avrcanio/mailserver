@@ -15,6 +15,7 @@ urlpatterns = [
     path("api/mail/folders", api.FolderListView.as_view(), name="api_mail_folders"),
     path("api/mail/conversations", api.ConversationListView.as_view(), name="api_mail_conversations"),
     path("api/mail/unified-conversations", api.UnifiedConversationListView.as_view(), name="api_mail_unified_conversations"),
+    path("api/mail/index-status", api.MailIndexStatusView.as_view(), name="api_mail_index_status"),
     path("api/mail/messages", api.MessageListView.as_view(), name="api_mail_messages"),
     path("api/mail/messages/delete", api.DeleteMessagesView.as_view(), name="api_mail_messages_delete"),
     path("api/mail/messages/restore", api.RestoreMessagesView.as_view(), name="api_mail_messages_restore"),
