@@ -7,6 +7,7 @@ from . import views
 app_name = "mailops"
 
 urlpatterns = [
+    path("privacy/", views.privacy_policy, name="privacy_policy"),
     path("", views.dashboard, name="dashboard"),
     path("apply/", views.apply_blocklist_view, name="apply"),
     path("api/auth/login", api.LoginView.as_view(), name="api_login"),

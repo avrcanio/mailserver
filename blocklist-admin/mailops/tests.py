@@ -167,6 +167,15 @@ class MailApiTests(TestCase):
         self.assertNotIn(self.password, serialized_payload)
         self.assertNotIn(ENCRYPTED_VALUE_PREFIX, serialized_payload)
 
+    def test_privacy_policy_is_public(self):
+        response = self.client.get(reverse("mailops:privacy_policy"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Pravila privatnosti")
+        self.assertContains(response, "Finestar Mail")
+        self.assertContains(response, "postmaster@finestar.hr")
+        self.assertContains(response, "nije namijenjen djeci mlađoj od 13 godina")
+
     def test_mailbox_credentials_from_request_decrypts_password(self):
         token = create_mailbox_token(self.account_email, self.password)
         request = Mock(auth=token)
