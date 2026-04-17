@@ -16,18 +16,24 @@ from rest_framework.views import APIView
 
 from mail_integration.exceptions import (
     MailAttachmentNotFoundError,
+    MailAttachmentLimitError,
     MailAuthError,
     MailConnectionError,
+    MailForwardAttachmentNotFoundError,
+    MailForwardAttachmentNotVisibleError,
     MailIntegrationError,
     MailInvalidOperationError,
     MailProtocolError,
     MailSendError,
     MailTimeoutError,
 )
-from mail_integration.mailbox_service import MailboxService
-from mail_integration.schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
+from mail_integration.mailbox_service import MAX_SEND_ATTACHMENT_SIZE_BYTES, MAX_SEND_ATTACHMENTS_TOTAL_BYTES, MailboxService
+from mail_integration.schemas import ForwardSourceMessage, MailboxCredentials, SendMailAttachment, SendMailRequest
 
 from .api_serializers import (
+    AccountSummariesResponseSerializer,
+    AccountsSummaryQuerySerializer,
+    ConversationListResponseSerializer,
     DeviceRegistrationRequestSerializer,
     DeviceRegistrationResponseSerializer,
     DeleteMessagesRequestSerializer,
@@ -46,6 +52,7 @@ from .api_serializers import (
     SendMailMultipartRequestSerializer,
     SendMailRequestSerializer,
     SendMailResponseSerializer,
+    UnifiedConversationListResponseSerializer,
 )
 from .models import DeviceRegistration, MailboxTokenCredential
 from .services import send_mail_notification
@@ -53,8 +60,6 @@ from .services import send_mail_notification
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
 MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
-MAX_SEND_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
-MAX_SEND_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024
 
 
 def create_mailbox_token(email, password):
@@ -149,8 +154,13 @@ def mail_error_response(exc):
 def folder_payload(folder):
     return {
         "name": folder.name,
+        "path": folder.path or folder.name,
+        "display_name": folder.display_name or folder.name,
+        "parent_path": folder.parent_path,
+        "depth": folder.depth,
         "delimiter": folder.delimiter,
         "flags": list(folder.flags),
+        "selectable": folder.selectable,
     }
 
 
@@ -167,6 +177,7 @@ def summary_payload(summary):
         "flags": list(summary.flags),
         "size": summary.size,
         "has_attachments": getattr(summary, "has_attachments", False),
+        "has_visible_attachments": getattr(summary, "has_visible_attachments", getattr(summary, "has_attachments", False)),
     }
 
 
@@ -185,12 +196,70 @@ def detail_payload(detail):
                     "size": attachment.size,
                     "disposition": attachment.disposition,
                     "is_inline": attachment.is_inline,
+                    "content_id": attachment.content_id,
+                    "is_visible": attachment.is_visible,
                 }
                 for attachment in detail.attachments
             ],
         }
     )
     return payload
+
+
+def conversation_payload(conversation):
+    return {
+        "conversation_id": conversation.conversation_id,
+        "message_count": conversation.message_count,
+        "reply_count": conversation.reply_count,
+        "has_unread": conversation.has_unread,
+        "has_attachments": conversation.has_attachments,
+        "has_visible_attachments": conversation.has_visible_attachments,
+        "participants": [
+            {
+                "name": participant.name,
+                "email": participant.email,
+            }
+            for participant in conversation.participants
+        ],
+        "root_message": summary_payload(conversation.root_message),
+        "replies": [summary_payload(reply) for reply in conversation.replies],
+        "latest_date": conversation.latest_date,
+    }
+
+
+def unified_message_payload(message):
+    payload = summary_payload(message.summary)
+    payload["direction"] = message.direction
+    return payload
+
+
+def unified_conversation_payload(conversation):
+    return {
+        "conversation_id": conversation.conversation_id,
+        "message_count": conversation.message_count,
+        "reply_count": conversation.reply_count,
+        "has_unread": conversation.has_unread,
+        "has_attachments": conversation.has_attachments,
+        "has_visible_attachments": conversation.has_visible_attachments,
+        "participants": [
+            {
+                "name": participant.name,
+                "email": participant.email,
+            }
+            for participant in conversation.participants
+        ],
+        "latest_date": conversation.latest_date,
+        "messages": [unified_message_payload(message) for message in conversation.messages],
+    }
+
+
+def account_summary_payload(account_email, summary):
+    return {
+        "account_email": account_email,
+        "display_name": "",
+        "unread_count": summary.unread_count,
+        "important_count": summary.important_count,
+    }
 
 
 def delete_result_payload(credentials, folder, result):
@@ -295,7 +364,7 @@ def send_form_data(data):
                 values.append(value)
         if values:
             normalized[field] = values
-    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name"):
+    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name", "forward_source_message"):
         values = data.getlist(field)
         if values:
             normalized[field] = values[-1]
@@ -457,6 +526,76 @@ class MessageListView(APIView):
                 "messages": [summary_payload(summary) for summary in page.messages],
                 "has_more": page.has_more,
                 "next_before_uid": page.next_before_uid,
+            }
+        )
+
+
+class ConversationListView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_conversations_list",
+        parameters=[
+            OpenApiParameter("folder", str, required=False, description="Mailbox folder name. Defaults to INBOX."),
+            OpenApiParameter("limit", int, required=False, description="Maximum conversations to return. 1-200, defaults to 50."),
+        ],
+        responses={200: ConversationListResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "INBOX").strip() or "INBOX"
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        if limit < 1 or limit > 200:
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            page = MailboxService().list_conversations(credentials, folder=folder, limit=limit)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(
+            {
+                "account_email": credentials.email,
+                "folder": folder,
+                "conversations": [conversation_payload(conversation) for conversation in page.conversations],
+            }
+        )
+
+
+class UnifiedConversationListView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_unified_conversations_list",
+        parameters=[
+            OpenApiParameter("limit", int, required=False, description="Maximum unified conversations to return. 1-200, defaults to 50."),
+        ],
+        responses={200: UnifiedConversationListResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        if limit < 1 or limit > 200:
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            page = MailboxService().list_unified_conversations(credentials, limit=limit, user=request.user)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(
+            {
+                "account_email": credentials.email,
+                "folders": list(page.folders),
+                "conversations": [unified_conversation_payload(conversation) for conversation in page.conversations],
             }
         )
 
@@ -654,6 +793,13 @@ class SendMailView(APIView):
             attachments, error = uploaded_send_attachments(request.FILES)
             if error:
                 return error
+        forward_source = data.get("forward_source_message")
+        if forward_source:
+            forward_source = ForwardSourceMessage(
+                folder=forward_source["folder"],
+                uid=forward_source["uid"],
+                attachment_ids=tuple(forward_source["attachment_ids"]),
+            )
         send_request = SendMailRequest(
             to=tuple(data["to"]),
             cc=tuple(data.get("cc", ())),
@@ -664,9 +810,16 @@ class SendMailView(APIView):
             html_body=data.get("html_body", ""),
             from_display_name=data.get("from_display_name", ""),
             attachments=attachments,
+            forward_source_message=forward_source,
         )
         try:
             message_id = MailboxService().send_mail(credentials, send_request)
+        except MailForwardAttachmentNotVisibleError as exc:
+            return Response({"error": "forward_attachment_not_visible", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except MailForwardAttachmentNotFoundError as exc:
+            return Response({"error": "forward_attachment_not_found", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except MailAttachmentLimitError as exc:
+            return Response({"error": exc.code}, status=status.HTTP_400_BAD_REQUEST)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response({"account_email": credentials.email, "status": "sent", "message_id": message_id})
@@ -691,13 +844,14 @@ class DeviceRegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         supplied_email = data["normalized_account_email"]
-        if supplied_email and supplied_email != credentials.email:
+        normalized_account_email = credentials.email.strip().lower()
+        if supplied_email and supplied_email != normalized_account_email:
             return Response({"error": "account_email_mismatch"}, status=status.HTTP_403_FORBIDDEN)
 
         device, created = DeviceRegistration.objects.update_or_create(
+            account_email=normalized_account_email,
             fcm_token=data["normalized_fcm_token"],
             defaults={
-                "account_email": credentials.email,
                 "platform": data["normalized_platform"],
                 "app_version": data["normalized_app_version"],
                 "enabled": True,
@@ -712,6 +866,65 @@ class DeviceRegistrationView(APIView):
                 "account_email": device.account_email,
             }
         )
+
+
+class AccountSummariesView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="accounts_summaries",
+        parameters=[
+            OpenApiParameter(
+                "fcm_token",
+                str,
+                required=False,
+                description="Temporary MVP device-link lookup token. Alias: fcmToken.",
+            ),
+            OpenApiParameter(
+                "fcmToken",
+                str,
+                required=False,
+                description="Alias for fcm_token.",
+            ),
+        ],
+        responses={200: AccountSummariesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 403: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+
+        serializer = AccountsSummaryQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        fcm_token = serializer.validated_data["normalized_fcm_token"]
+        account_email = credentials.email.strip().lower()
+
+        if not DeviceRegistration.objects.filter(account_email=account_email, fcm_token=fcm_token, enabled=True).exists():
+            return Response({"error": "fcm_token_not_linked"}, status=status.HTTP_403_FORBIDDEN)
+
+        account_emails = list(
+            DeviceRegistration.objects.filter(fcm_token=fcm_token, enabled=True).order_by("account_email").values_list("account_email", flat=True)
+        )
+        credentials_by_email = {
+            credential.mailbox_email: credential
+            for credential in MailboxTokenCredential.objects.filter(mailbox_email__in=account_emails).order_by("mailbox_email")
+        }
+
+        accounts = []
+        service = MailboxService()
+        for linked_email in account_emails:
+            token_credential = credentials_by_email.get(linked_email)
+            if token_credential is None:
+                continue
+            linked_credentials = MailboxCredentials(email=token_credential.mailbox_email, password=token_credential.get_mailbox_password())
+            try:
+                summary = service.get_account_summary(linked_credentials)
+            except MailIntegrationError as exc:
+                return mail_error_response(exc)
+            accounts.append(account_summary_payload(token_credential.mailbox_email, summary))
+
+        return Response({"accounts": accounts})
 
 
 class NewMailHookView(APIView):

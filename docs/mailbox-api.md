@@ -75,6 +75,44 @@ Response:
 
 Logout revokes only the current DRF token. The linked server-side mailbox credential is deleted automatically, so the same token can no longer access `/api/auth/me` or protected mail endpoints. The Django user and existing push device registrations remain unchanged.
 
+## Account Summaries
+
+`GET /api/accounts/summaries?fcm_token=android-fcm-token`
+
+Use the current mailbox DRF token in the `Authorization` header. `fcmToken` is accepted as an alias for `fcm_token`.
+
+For this MVP, `fcm_token` is a temporary device-link lookup mechanism for the Accounts screen. It is normalized with `strip()`, must be non-empty, and is used only to find mailbox accounts already linked to the same app install through `POST /api/devices/`. It is not a permanent account identity design.
+
+The authenticated mailbox must already have an enabled registration for the supplied FCM token. The response includes all enabled mailbox associations for that FCM token that still have stored server-side mailbox credentials.
+
+Response:
+
+```json
+{
+  "accounts": [
+    {
+      "account_email": "user@finestar.hr",
+      "display_name": "",
+      "unread_count": 12,
+      "important_count": 3
+    }
+  ]
+}
+```
+
+Counter semantics:
+
+- `unread_count` is the number of IMAP `UNSEEN` messages in `INBOX`
+- `important_count` is the number of IMAP `FLAGGED` / starred messages in `INBOX`
+- Trash, Spam/Junk, Archive, Sent, and other folders are not included in these MVP counters
+
+Errors:
+
+- missing or invalid DRF token: `401 {"error": "not_authenticated"}`
+- valid token without stored mailbox credentials: `401 {"error": "mailbox_credentials_missing"}`
+- missing or blank FCM token: `400`
+- FCM token is not linked to the authenticated mailbox: `403 {"error": "fcm_token_not_linked"}`
+
 ## Folders
 
 `GET /api/mail/folders`
@@ -87,12 +125,29 @@ Response:
   "folders": [
     {
       "name": "INBOX",
+      "path": "INBOX",
+      "display_name": "INBOX",
+      "parent_path": null,
+      "depth": 0,
       "delimiter": "/",
-      "flags": ["HasNoChildren"]
+      "flags": ["HasChildren"],
+      "selectable": true
+    },
+    {
+      "name": "INBOX/Invoices/2026",
+      "path": "INBOX/Invoices/2026",
+      "display_name": "2026",
+      "parent_path": "INBOX/Invoices",
+      "depth": 2,
+      "delimiter": "/",
+      "flags": ["HasNoChildren"],
+      "selectable": true
     }
   ]
 }
 ```
+
+`name` remains a backwards-compatible alias for the full IMAP folder path. New clients should use `path` as the stable identifier when calling message APIs, `display_name` for the visible label, and `depth` / `parent_path` to render nested folders. Folders with `selectable: false` are visible hierarchy nodes but should not be opened.
 
 ## Messages
 
@@ -124,11 +179,168 @@ Response:
       "message_id": "<m1@example.com>",
       "flags": ["Seen"],
       "size": 1234,
-      "has_attachments": true
+      "has_attachments": true,
+      "has_visible_attachments": true
     }
   ]
 }
 ```
+
+## Conversations
+
+`GET /api/mail/conversations?folder=INBOX&limit=50`
+
+Conversations are computed server-side for one folder. `folder` defaults to `INBOX`. `limit` defaults to `50`, accepts `1` through `200`, and applies to the number of conversations returned. The backend may fetch or scan more than `limit` messages internally so it can assemble up to `limit` conversations.
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "conversations": [
+    {
+      "conversation_id": "thread-hash",
+      "message_count": 3,
+      "reply_count": 2,
+      "has_unread": true,
+      "has_attachments": true,
+      "has_visible_attachments": true,
+      "participants": [
+        {
+          "name": "Sender Name",
+          "email": "sender@example.com"
+        }
+      ],
+      "root_message": {
+        "uid": "40",
+        "folder": "INBOX",
+        "subject": "Hello",
+        "sender": "Sender Name <sender@example.com>",
+        "to": ["user@finestar.hr"],
+        "cc": [],
+        "date": "2026-04-16T07:00:00Z",
+        "message_id": "<root@example.com>",
+        "flags": ["Seen"],
+        "size": 1234,
+        "has_attachments": false,
+        "has_visible_attachments": false
+      },
+      "replies": [
+        {
+          "uid": "42",
+          "folder": "INBOX",
+          "subject": "Re: Hello",
+          "sender": "Reply Person <reply@example.com>",
+          "to": ["sender@example.com"],
+          "cc": [],
+          "date": "2026-04-16T08:00:00Z",
+          "message_id": "<reply@example.com>",
+          "flags": [],
+          "size": 2345,
+          "has_attachments": true,
+          "has_visible_attachments": true
+        }
+      ],
+      "latest_date": "2026-04-16T08:00:00Z"
+    }
+  ]
+}
+```
+
+`root_message` and `replies` use the same summary shape as `GET /api/mail/messages`. Fetch full bodies or attachment metadata through the existing message detail endpoint.
+
+Threading rules:
+
+- Message-ID based threading is used first through `Message-ID`, `In-Reply-To`, and `References`.
+- `root_message` is determined primarily by the referenced parent chain. If the parent chain is incomplete or inconsistent, the backend falls back to the earliest dated message, then the lower numeric UID.
+- Normalized-subject fallback is used only for orphan messages where usable ID-based threading metadata is missing. `Re:`, `Fw:`, and `Fwd:` prefixes are stripped repeatedly.
+- Replies are sorted chronologically after the root, then by lower UID. Conversations are sorted by latest activity descending.
+- `has_attachments` is true when any message in the conversation has any attachment-like MIME part. `has_visible_attachments` is true when any message has at least one visible attachment.
+
+## Unified Conversations
+
+`GET /api/mail/unified-conversations?limit=50`
+
+Unified conversations are computed across `INBOX` and the account's Sent folder so the client can render a full inbound/outbound timeline. `limit` defaults to `50`, accepts `1` through `200`, and applies to the number of conversations returned. The backend may fetch or scan more than `limit` messages internally.
+
+The endpoint keeps the same response contract whether data comes from the Django mail index or from live IMAP. When a usable index exists for the authenticated mailbox, the backend serves indexed metadata first. If the index is missing, empty, stale, or not ready, the backend falls back to the live IMAP implementation.
+
+Live IMAP conversation fallback scans only the most recent `MAIL_CONVERSATION_SCAN_LIMIT` messages per folder, defaulting to `1000`, so large folders do not trigger unbounded metadata fetches.
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folders": ["INBOX", "Sent"],
+  "conversations": [
+    {
+      "conversation_id": "thread-hash",
+      "message_count": 2,
+      "reply_count": 1,
+      "has_unread": false,
+      "has_attachments": true,
+      "has_visible_attachments": true,
+      "participants": [
+        {
+          "name": "Sender Name",
+          "email": "sender@example.com"
+        }
+      ],
+      "latest_date": "2026-04-16T08:00:00Z",
+      "messages": [
+        {
+          "uid": "42",
+          "folder": "INBOX",
+          "direction": "inbound",
+          "subject": "Hello",
+          "sender": "Sender Name <sender@example.com>",
+          "to": ["user@finestar.hr"],
+          "cc": [],
+          "date": "2026-04-16T07:00:00Z",
+          "message_id": "<root@example.com>",
+          "flags": ["Seen"],
+          "size": 1234,
+          "has_attachments": false,
+          "has_visible_attachments": false
+        },
+        {
+          "uid": "7",
+          "folder": "Sent",
+          "direction": "outbound",
+          "subject": "Re: Hello",
+          "sender": "User <user@finestar.hr>",
+          "to": ["sender@example.com"],
+          "cc": [],
+          "date": "2026-04-16T08:00:00Z",
+          "message_id": "<reply@example.com>",
+          "flags": [],
+          "size": 2345,
+          "has_attachments": true,
+          "has_visible_attachments": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+The backend resolves the Sent folder by special-use `\Sent` flag first, then common names such as `Sent`, `INBOX/Sent`, `INBOX.Sent`, and `Sent Messages`. If Sent cannot be resolved, the endpoint returns INBOX-only unified conversations and `folders: ["INBOX"]`.
+
+Threading uses the same ID-first rules as folder-local conversations, but the deterministic `conversation_id` is independent of source folder so matching INBOX/Sent messages appear in one thread. Each message keeps its original `folder` and `uid`; clients must use those values for detail and message actions.
+
+Duplicate messages with the same normalized `Message-ID` are rendered once. When possible, the backend infers logical direction from sender/recipient data and keeps the copy whose folder matches that direction: inbound prefers `INBOX`, outbound prefers Sent. If direction cannot be inferred confidently, a stable folder/UID tie-break is used. `has_unread` considers inbound messages only; Sent messages do not create unread state.
+
+Indexing can be refreshed operationally with:
+
+```bash
+python manage.py sync_mail_index --account user@finestar.hr --limit 500
+```
+
+By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
+
+Incremental sync refreshes newer UIDs plus a recent metadata window. It does not delete indexed rows that are missing from that recent window unless `MAIL_INDEX_RECONCILE_DELETIONS=true` is explicitly enabled, because deletion reconciliation depends on the IMAP server returning a complete and trustworthy UID view for that checked window.
 
 `GET /api/mail/messages/42?folder=INBOX`
 
@@ -149,6 +361,8 @@ Response:
     "message_id": "<m1@example.com>",
     "flags": ["Seen"],
     "size": 2048,
+    "has_attachments": true,
+    "has_visible_attachments": true,
     "text_body": "Plain body",
     "html_body": "<p>HTML body</p>",
     "attachments": [
@@ -158,7 +372,19 @@ Response:
         "content_type": "application/pdf",
         "size": 12345,
         "disposition": "attachment",
-        "is_inline": false
+        "is_inline": false,
+        "content_id": "",
+        "is_visible": true
+      },
+      {
+        "id": "att_2",
+        "filename": "logo.png",
+        "content_type": "image/png",
+        "size": 2345,
+        "disposition": "inline",
+        "is_inline": true,
+        "content_id": "logo123",
+        "is_visible": false
       }
     ]
   }
@@ -167,7 +393,11 @@ Response:
 
 ## Attachments
 
-Message detail includes attachment metadata with stable per-message IDs such as `att_1`, `att_2`, in MIME traversal order.
+Message detail includes attachment metadata with stable per-message IDs such as `att_1`, `att_2`, in MIME traversal order. Inline HTML body resources are included when they have MIME attachment-like metadata, so clients can fetch bytes for `cid:` image rendering.
+
+Use `has_visible_attachments` for message-list paperclip UI. `has_attachments` remains backward-compatible and can be true for inline-only CID resources.
+
+Attachment `content_id` is normalized without surrounding angle brackets. Clients should use `is_visible` for attachment chips when present. Inline body resources and duplicate image payloads of referenced inline resources are included for CID rendering, but marked with `is_visible: false`.
 
 `GET /api/mail/messages/42/attachments/att_1?folder=INBOX`
 
@@ -329,6 +559,27 @@ attachments=@photo.jpg
 ```
 
 Multipart recipient fields may be repeated, or `to`, `cc`, and `bcc` may contain comma-separated address values. Attachment limits are 10 MB per file and 25 MB total per send request. Oversized files return `attachment_too_large`; oversized total payloads return `attachments_too_large`.
+
+For forwarding original visible attachments, include `forward_source_message` on the same send request. The client supplies the source message reference and the selected attachment IDs from message detail; the backend resolves the original bytes from IMAP and preserves filename and content type.
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Fwd: TELWIN",
+  "text_body": "Forwarded body",
+  "forward_source_message": {
+    "folder": "INBOX",
+    "uid": "42",
+    "attachment_ids": ["att_3", "att_4"]
+  }
+}
+```
+
+For `multipart/form-data`, send `forward_source_message` as a JSON string field alongside any repeated `attachments` file parts. Forwarded original attachments and newly uploaded attachments are included in one outgoing message. The order of `forward_source_message.attachment_ids` is preserved for forwarded attachments.
+
+Only attachments with `is_visible: true` are eligible for forwarding. If a requested ID exists but is hidden or inline-only, the response is `400 {"error": "forward_attachment_not_visible"}`. If a requested ID is not present on the source message, the response is `400 {"error": "forward_attachment_not_found"}`. Hidden CID resources are never silently forwarded.
+
+Reply and reply-all flows should not include original attachments unless the client explicitly sends `forward_source_message`.
 
 Response:
 

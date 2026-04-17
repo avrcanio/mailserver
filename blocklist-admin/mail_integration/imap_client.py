@@ -1,18 +1,30 @@
 import imaplib
+import base64
+import hashlib
+import mimetypes
 import re
 import socket
 import ssl
+from collections import defaultdict
+from html.parser import HTMLParser
 from email.header import decode_header, make_header
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
+from dataclasses import replace
+from urllib.parse import unquote
 
 from django.conf import settings
 
 from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailTimeoutError
 from .schemas import (
-    MailAttachmentSummary,
     MailAttachmentContent,
+    MailAttachmentSummary,
+    MailConversationParticipant,
+    MailConversationSummary,
+    MailConversationSummaryPage,
+    MailboxAccountSummary,
+    MailboxCredentials,
     MailFolderSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
@@ -20,7 +32,9 @@ from .schemas import (
     MailMessageRestoreResult,
     MailMessageSummary,
     MailMessageSummaryPage,
-    MailboxCredentials,
+    MailUnifiedConversationSummary,
+    MailUnifiedConversationSummaryPage,
+    MailUnifiedMessageSummary,
 )
 
 
@@ -30,6 +44,8 @@ _SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)\b", re.IGNORECASE)
 _FLAGS_RE = re.compile(rb"\bFLAGS\s+\((.*?)\)", re.IGNORECASE)
 _BODYSTRUCTURE_RE = re.compile(rb"BODYSTRUCTURE\s+(?P<bodystructure>.+?)(?:\s+BODY\[|\s*\)\s*$)", re.IGNORECASE | re.DOTALL)
 _ATTACHMENT_MARKER_RE = re.compile(rb'"(?:ATTACHMENT|INLINE|FILENAME|NAME)"', re.IGNORECASE)
+_MESSAGE_ID_RE = re.compile(r"<([^<>]+)>")
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:(?:re|fw|fwd)\s*:\s*)+", re.IGNORECASE)
 
 
 class ImapClient:
@@ -100,7 +116,7 @@ class ImapClient:
     def select_folder(self, folder="INBOX", readonly=True):
         connection = self._require_connection()
         try:
-            status, data = connection.select(folder, readonly=readonly)
+            status, data = connection.select(_imap_mailbox_arg(folder), readonly=readonly)
         except socket.timeout as exc:
             raise MailTimeoutError(f"Timed out selecting IMAP folder {folder}") from exc
         except (OSError, ssl.SSLError) as exc:
@@ -111,6 +127,13 @@ class ImapClient:
 
     def fetch_message_summaries(self, folder="INBOX", limit=50):
         return list(self.fetch_message_summary_page(folder=folder, limit=limit).messages)
+
+    def fetch_account_summary(self):
+        self.select_folder("INBOX", readonly=True)
+        return MailboxAccountSummary(
+            unread_count=self._search_count("UNSEEN"),
+            important_count=self._search_count("FLAGGED"),
+        )
 
     def fetch_message_summary_page(self, folder="INBOX", limit=50, before_uid=None):
         connection = self._require_connection()
@@ -135,7 +158,13 @@ class ImapClient:
                     "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])",
                 )
                 self._expect_ok(status, fetch_data, f"IMAP summary fetch failed for UID {uid.decode()}")
-                summaries.append(_parse_summary_response(folder, uid.decode(), fetch_data))
+                summary = _parse_summary_response(folder, uid.decode(), fetch_data)
+                if summary.has_visible_attachments and _summary_needs_visible_attachment_refinement(fetch_data):
+                    status, full_fetch_data = connection.uid("fetch", uid, "(FLAGS RFC822.SIZE RFC822)")
+                    self._expect_ok(status, full_fetch_data, f"IMAP summary visibility fetch failed for UID {uid.decode()}")
+                    detail = _parse_detail_response(folder, uid.decode(), full_fetch_data)
+                    summary = replace(summary, has_visible_attachments=detail.has_visible_attachments)
+                summaries.append(summary)
             next_before_uid = summaries[-1].uid if has_more and summaries else None
             return MailMessageSummaryPage(messages=tuple(summaries), has_more=has_more, next_before_uid=next_before_uid)
         except socket.timeout as exc:
@@ -146,6 +175,90 @@ class ImapClient:
             raise MailProtocolError(f"IMAP summary pagination failed for {folder}: {exc}") from exc
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP summary fetch failed for {folder}") from exc
+
+    def fetch_conversation_page(self, folder="INBOX", limit=50):
+        if limit < 1:
+            return MailConversationSummaryPage()
+        try:
+            summaries = self._fetch_conversation_summaries(folder)
+            return _build_conversation_page(folder, summaries, limit)
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching IMAP conversations for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP conversation fetch connection failure for {folder}: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP conversation fetch failed for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP conversation fetch failed for {folder}") from exc
+
+    def fetch_unified_conversation_page(self, account_email, limit=50):
+        if limit < 1:
+            return MailUnifiedConversationSummaryPage(folders=("INBOX",))
+        try:
+            sent_folder = self._resolve_sent_folder()
+            folders = ("INBOX",)
+            if sent_folder and not _same_folder(sent_folder, "INBOX"):
+                folders = ("INBOX", sent_folder)
+            summaries_by_folder = {folder: self._fetch_conversation_summaries(folder) for folder in folders}
+            return _build_unified_conversation_page(
+                folders=folders,
+                sent_folder=sent_folder,
+                account_email=account_email,
+                summaries_by_folder=summaries_by_folder,
+                limit=limit,
+            )
+        except socket.timeout as exc:
+            raise MailTimeoutError("Timed out fetching IMAP unified conversations") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP unified conversation fetch connection failure: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP unified conversation fetch failed: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError("IMAP unified conversation fetch failed") from exc
+
+    def fetch_folder_uidvalidity(self, folder):
+        connection = self._require_connection()
+        try:
+            self.select_folder(folder, readonly=True)
+            _, data = connection.response("UIDVALIDITY")
+            if not data:
+                return ""
+            return _safe_decode(data[-1]).strip()
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching IMAP UIDVALIDITY for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP UIDVALIDITY fetch connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP UIDVALIDITY fetch failed for {folder}") from exc
+
+    def fetch_recent_conversation_summaries(self, folder="INBOX", limit=100):
+        if limit < 1:
+            return tuple()
+        try:
+            uids = self._search_undeleted_uid_ints(folder)
+            return tuple(self._fetch_conversation_summaries_for_uid_ints(folder, reversed(uids[-limit:]), select_folder=False))
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching recent IMAP index summaries for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP recent index summary fetch connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP recent index summary fetch failed for {folder}") from exc
+
+    def fetch_conversation_summaries_since_uid(self, folder="INBOX", min_uid=0, limit=500):
+        if limit < 1:
+            return tuple()
+        try:
+            min_uid_int = _parse_positive_uid(min_uid) if min_uid else 0
+            uids = [uid for uid in self._search_undeleted_uid_ints(folder) if uid > min_uid_int]
+            return tuple(self._fetch_conversation_summaries_for_uid_ints(folder, reversed(uids[-limit:]), select_folder=False))
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching incremental IMAP index summaries for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP incremental index summary fetch connection failure for {folder}: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}") from exc
 
     def fetch_message_detail(self, folder, uid):
         metadata, message = self._fetch_full_message(folder, uid)
@@ -158,6 +271,42 @@ class ImapClient:
             if attachment.summary.id == attachment_id:
                 return attachment
         raise MailAttachmentNotFoundError(f"Attachment {attachment_id} was not found")
+
+    def fetch_attachments(self, folder, uid):
+        _, message = self._fetch_full_message(folder, uid)
+        return tuple(_extract_message_parts(message)[2])
+
+    def _fetch_conversation_summaries(self, folder):
+        return list(self.fetch_recent_conversation_summaries(folder=folder, limit=_conversation_scan_limit()))
+
+    def _search_undeleted_uid_ints(self, folder):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=True)
+        status, data = connection.uid("search", None, "UNDELETED")
+        self._expect_ok(status, data, f"IMAP conversation search failed for {folder}")
+        return _parse_uid_list(data[0] or b"")
+
+    def _fetch_conversation_summaries_for_uid_ints(self, folder, uid_ints, select_folder=True):
+        connection = self._require_connection()
+        if select_folder:
+            self.select_folder(folder, readonly=True)
+        summaries = []
+        for uid_int in uid_ints:
+            uid = str(uid_int).encode("ascii")
+            status, fetch_data = connection.uid(
+                "fetch",
+                uid,
+                "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])",
+            )
+            self._expect_ok(status, fetch_data, f"IMAP conversation fetch failed for UID {uid.decode()}")
+            summary = _parse_summary_response(folder, uid.decode(), fetch_data)
+            if summary.has_visible_attachments and _summary_needs_visible_attachment_refinement(fetch_data):
+                status, full_fetch_data = connection.uid("fetch", uid, "(FLAGS RFC822.SIZE RFC822)")
+                self._expect_ok(status, full_fetch_data, f"IMAP conversation visibility fetch failed for UID {uid.decode()}")
+                detail = _parse_detail_response(folder, uid.decode(), full_fetch_data)
+                summary = replace(summary, has_visible_attachments=detail.has_visible_attachments)
+            summaries.append(summary)
+        return summaries
 
     def _fetch_full_message(self, folder, uid):
         connection = self._require_connection()
@@ -226,13 +375,37 @@ class ImapClient:
                 return folder_by_lower_name[candidate]
         raise MailProtocolError("Could not resolve IMAP Trash folder")
 
+    def _resolve_sent_folder(self):
+        folders = [folder for folder in self.list_folders() if folder.selectable]
+        for folder in folders:
+            if any(flag.lower() == "sent" for flag in folder.flags):
+                return folder.name
+        folder_by_lower_name = {folder.name.lower(): folder.name for folder in folders}
+        for candidate in ("sent", "inbox/sent", "inbox.sent", "sent messages"):
+            if candidate in folder_by_lower_name:
+                return folder_by_lower_name[candidate]
+        return None
+
+    def _search_count(self, criterion):
+        connection = self._require_connection()
+        try:
+            status, data = connection.uid("search", None, criterion)
+            self._expect_ok(status, data, f"IMAP search failed for INBOX {criterion}")
+            return len(_parse_uid_list((data or [b""])[0] or b""))
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out counting IMAP INBOX {criterion}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP count connection failure for INBOX {criterion}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP count failed for INBOX {criterion}") from exc
+
     def _move_message_to_trash(self, uid, trash_folder):
         self._move_message(uid, trash_folder, "move")
 
     def _move_message(self, uid, target_folder, operation_name):
         connection = self._require_connection()
         try:
-            status, data = connection.uid("MOVE", uid, target_folder)
+            status, data = connection.uid("MOVE", uid, _imap_mailbox_arg(target_folder))
             if status == "OK":
                 return
             move_error = _decode_first(data)
@@ -256,7 +429,7 @@ class ImapClient:
 
     def _copy_and_mark_deleted(self, uid, target_folder, operation_name):
         connection = self._require_connection()
-        status, data = connection.uid("COPY", uid, target_folder)
+        status, data = connection.uid("COPY", uid, _imap_mailbox_arg(target_folder))
         self._expect_ok(status, data, f"IMAP {operation_name} copy failed for UID {uid}")
         status, data = connection.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
         self._expect_ok(status, data, f"IMAP {operation_name} mark deleted failed for UID {uid}")
@@ -282,13 +455,14 @@ def _parse_folder(line):
     delimiter_value = _safe_decode(match.group("delimiter"))
     delimiter = None if delimiter_value.upper() == "NIL" else delimiter_value or None
     name = _decode_mailbox_name(match.group("name"))
-    return MailFolderSummary(name=name, delimiter=delimiter, flags=flags)
+    return MailFolderSummary(name=name, delimiter=delimiter, flags=flags, path=name)
 
 
 def _parse_summary_response(folder, fallback_uid, fetch_data):
     try:
         metadata, payload = _first_fetch_tuple(fetch_data)
         message = BytesParser(policy=policy.default).parsebytes(payload or b"")
+        has_attachments = _has_attachment_bodystructure(metadata)
         return MailMessageSummary(
             uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
             folder=folder,
@@ -300,7 +474,10 @@ def _parse_summary_response(folder, fallback_uid, fetch_data):
             message_id=_header_value(message, "message-id"),
             flags=_parse_flags(metadata),
             size=_parse_int(_metadata_value(_SIZE_RE, metadata)),
-            has_attachments=_has_attachment_bodystructure(metadata),
+            has_attachments=has_attachments,
+            has_visible_attachments=_has_visible_attachment_bodystructure(metadata, has_attachments),
+            in_reply_to=_message_id_values(_header_value(message, "in-reply-to")),
+            references=_message_id_values(_header_value(message, "references")),
         )
     except MailProtocolError:
         raise
@@ -321,6 +498,7 @@ def _parse_detail_response(folder, fallback_uid, fetch_data):
 
 def _parse_detail_message(folder, fallback_uid, metadata, message):
     text_body, html_body, attachments = _extract_message_parts(message)
+    has_visible_attachments = _has_visible_attachments(attachment.summary for attachment in attachments)
     return MailMessageDetail(
         uid=_metadata_value(_UID_RE, metadata) or fallback_uid,
         folder=folder,
@@ -335,7 +513,296 @@ def _parse_detail_message(folder, fallback_uid, metadata, message):
         text_body=text_body,
         html_body=html_body,
         attachments=tuple(attachment.summary for attachment in attachments),
+        has_visible_attachments=has_visible_attachments,
     )
+
+
+def _build_conversation_page(folder, summaries, limit):
+    conversations_by_key = defaultdict(list)
+    message_ids = {_normalize_message_id(summary.message_id): summary for summary in summaries if _normalize_message_id(summary.message_id)}
+    for summary in summaries:
+        conversations_by_key[_conversation_key(summary, message_ids)].append(summary)
+
+    conversations = []
+    for key, messages in conversations_by_key.items():
+        ordered_messages = sorted(messages, key=_message_age_key)
+        root = _conversation_root(ordered_messages, message_ids)
+        replies = tuple(message for message in ordered_messages if message is not root)
+        latest = max(ordered_messages, key=_message_activity_key)
+        conversations.append(
+            MailConversationSummary(
+                conversation_id=_conversation_id(folder, key),
+                message_count=len(ordered_messages),
+                reply_count=len(replies),
+                has_unread=any(not _message_is_seen(message) for message in ordered_messages),
+                has_attachments=any(message.has_attachments for message in ordered_messages),
+                has_visible_attachments=any(message.has_visible_attachments for message in ordered_messages),
+                participants=_conversation_participants((root,) + replies),
+                root_message=root,
+                replies=replies,
+                latest_date=latest.date,
+            )
+        )
+    conversations.sort(key=_conversation_sort_key)
+    return MailConversationSummaryPage(conversations=tuple(conversations[:limit]))
+
+
+def _build_unified_conversation_page(folders, sent_folder, account_email, summaries_by_folder, limit):
+    items = []
+    for folder in folders:
+        for summary in summaries_by_folder.get(folder, ()):
+            items.append(MailUnifiedMessageSummary(summary=summary, direction=_folder_direction(summary.folder, sent_folder)))
+    message_ids = {}
+    for item in items:
+        message_id = _normalize_message_id(item.summary.message_id)
+        if message_id and message_id not in message_ids:
+            message_ids[message_id] = item.summary
+
+    conversations_by_key = defaultdict(list)
+    for item in items:
+        conversations_by_key[_conversation_key(item.summary, message_ids)].append(item)
+
+    conversations = []
+    for key, grouped_items in conversations_by_key.items():
+        deduped_items = _dedupe_unified_items(grouped_items, account_email, sent_folder)
+        if not deduped_items:
+            continue
+        ordered_items = tuple(sorted(deduped_items, key=_unified_item_sort_key))
+        latest_item = max(ordered_items, key=lambda item: _message_activity_key(item.summary))
+        conversations.append(
+            MailUnifiedConversationSummary(
+                conversation_id=_unified_conversation_id(key),
+                message_count=len(ordered_items),
+                reply_count=max(0, len(ordered_items) - 1),
+                has_unread=any(item.direction == "inbound" and not _message_is_seen(item.summary) for item in ordered_items),
+                has_attachments=any(item.summary.has_attachments for item in ordered_items),
+                has_visible_attachments=any(item.summary.has_visible_attachments for item in ordered_items),
+                participants=_conversation_participants(tuple(item.summary for item in ordered_items)),
+                messages=ordered_items,
+                latest_date=latest_item.summary.date,
+            )
+        )
+    conversations.sort(key=_unified_conversation_sort_key)
+    return MailUnifiedConversationSummaryPage(folders=tuple(folders), conversations=tuple(conversations[:limit]))
+
+
+def _dedupe_unified_items(items, account_email, sent_folder):
+    best_by_key = {}
+    for item in items:
+        key = _unified_dedupe_key(item.summary)
+        current = best_by_key.get(key)
+        if current is None or _prefer_unified_item(item, current, account_email, sent_folder):
+            best_by_key[key] = item
+    return tuple(best_by_key.values())
+
+
+def _unified_dedupe_key(summary):
+    message_id = _normalize_message_id(summary.message_id)
+    if message_id:
+        return ("message-id", message_id)
+    return ("folder-uid", str(summary.folder).strip().lower(), str(summary.uid))
+
+
+def _prefer_unified_item(candidate, current, account_email, sent_folder):
+    inferred = _infer_message_direction(candidate.summary, account_email)
+    if inferred:
+        candidate_matches = candidate.direction == inferred
+        current_matches = current.direction == inferred
+        if candidate_matches != current_matches:
+            return candidate_matches
+    return _unified_item_preference_key(candidate, sent_folder) < _unified_item_preference_key(current, sent_folder)
+
+
+def _infer_message_direction(summary, account_email):
+    normalized_account = str(account_email or "").strip().lower()
+    if not normalized_account:
+        return None
+    sender_email = _first_email(summary.sender)
+    if sender_email == normalized_account:
+        return "outbound"
+    recipients = set()
+    for value in (*summary.to, *summary.cc):
+        recipients.update(email for _, email in getaddresses([value]))
+    if normalized_account in {str(email or "").strip().lower() for email in recipients}:
+        return "inbound"
+    return None
+
+
+def _first_email(value):
+    addresses = getaddresses([str(value or "")])
+    if not addresses:
+        return ""
+    return str(addresses[0][1] or "").strip().lower()
+
+
+def _unified_item_preference_key(item, sent_folder):
+    if _same_folder(item.summary.folder, "INBOX"):
+        folder_priority = 0
+    elif sent_folder and _same_folder(item.summary.folder, sent_folder):
+        folder_priority = 1
+    else:
+        folder_priority = 2
+    return (folder_priority, _uid_int(item.summary.uid))
+
+
+def _folder_direction(folder, sent_folder):
+    if sent_folder and _same_folder(folder, sent_folder):
+        return "outbound"
+    return "inbound"
+
+
+def _unified_item_sort_key(item):
+    direction_order = 0 if item.direction == "inbound" else 1
+    timestamp, uid = _message_age_key(item.summary)
+    return (timestamp, direction_order, uid)
+
+
+def _unified_conversation_id(key):
+    return hashlib.sha256(f"unified\0{key}".encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _unified_conversation_sort_key(conversation):
+    latest_item = max(conversation.messages, key=lambda item: _message_activity_key(item.summary))
+    latest_timestamp = latest_item.summary.date.timestamp() if latest_item.summary.date else 0
+    return (-latest_timestamp, -_uid_int(latest_item.summary.uid))
+
+
+def _conversation_key(summary, message_ids):
+    own_id = _normalize_message_id(summary.message_id)
+    if _has_usable_thread_metadata(summary):
+        parent_ids = _thread_parent_ids(summary)
+        for parent_id in parent_ids:
+            if parent_id in message_ids:
+                return f"id:{_thread_root_id(message_ids[parent_id], message_ids)}"
+        if parent_ids:
+            return f"id:{parent_ids[0]}"
+        if own_id:
+            return f"id:{own_id}"
+    subject = _normalize_thread_subject(summary.subject)
+    if subject:
+        return f"subject:{subject}"
+    if own_id:
+        return f"id:{own_id}"
+    return f"uid:{summary.uid}"
+
+
+def _has_usable_thread_metadata(summary):
+    return bool(_normalize_message_id(summary.message_id) or summary.in_reply_to or summary.references)
+
+
+def _thread_parent_ids(summary):
+    parent_ids = []
+    for value in summary.in_reply_to:
+        normalized = _normalize_message_id(value)
+        if normalized:
+            parent_ids.append(normalized)
+    for value in reversed(summary.references):
+        normalized = _normalize_message_id(value)
+        if normalized and normalized not in parent_ids:
+            parent_ids.append(normalized)
+    return parent_ids
+
+
+def _thread_root_id(summary, message_ids, seen=None):
+    seen = seen or set()
+    own_id = _normalize_message_id(summary.message_id)
+    if own_id:
+        seen.add(own_id)
+    available_parents = [parent_id for parent_id in reversed(summary.references) if parent_id in message_ids]
+    available_parents.extend(parent_id for parent_id in summary.in_reply_to if parent_id in message_ids)
+    for parent_id in available_parents:
+        normalized_parent = _normalize_message_id(parent_id)
+        if normalized_parent and normalized_parent not in seen:
+            return _thread_root_id(message_ids[normalized_parent], message_ids, seen)
+    return own_id or str(summary.uid)
+
+
+def _conversation_root(messages, message_ids):
+    message_set = set(messages)
+    candidate_roots = []
+    for message in messages:
+        for parent_id in reversed(message.references):
+            parent = message_ids.get(_normalize_message_id(parent_id))
+            if parent in message_set and parent not in candidate_roots:
+                candidate_roots.append(parent)
+        for parent_id in message.in_reply_to:
+            parent = message_ids.get(_normalize_message_id(parent_id))
+            if parent in message_set and parent not in candidate_roots:
+                candidate_roots.append(parent)
+    if candidate_roots:
+        return min(candidate_roots, key=_message_age_key)
+    return min(messages, key=_message_age_key)
+
+
+def _conversation_participants(messages):
+    participants = []
+    seen = set()
+    for message in messages:
+        raw_values = [message.sender, *message.to, *message.cc]
+        for display_name, email_address in getaddresses(raw_values):
+            normalized_email = (email_address or "").strip().lower()
+            if not normalized_email or normalized_email in seen:
+                continue
+            seen.add(normalized_email)
+            participants.append(MailConversationParticipant(name=(display_name or "").strip(), email=normalized_email))
+    return tuple(participants)
+
+
+def _conversation_id(folder, key):
+    return hashlib.sha256(f"{folder}\0{key}".encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _conversation_sort_key(conversation):
+    latest_message = max((conversation.root_message,) + conversation.replies, key=_message_activity_key)
+    latest_timestamp = latest_message.date.timestamp() if latest_message.date else 0
+    return (-latest_timestamp, -_uid_int(latest_message.uid))
+
+
+def _message_age_key(message):
+    timestamp = message.date.timestamp() if message.date else 0
+    return (timestamp, _uid_int(message.uid))
+
+
+def _message_activity_key(message):
+    timestamp = message.date.timestamp() if message.date else 0
+    return (timestamp, _uid_int(message.uid))
+
+
+def _message_is_seen(message):
+    return any(flag.lower() == "seen" for flag in message.flags)
+
+
+def _uid_int(uid):
+    try:
+        return int(uid)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _conversation_scan_limit():
+    try:
+        return max(1, int(getattr(settings, "MAIL_CONVERSATION_SCAN_LIMIT", 1000)))
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _message_id_values(value):
+    raw_value = str(value or "")
+    ids = [_normalize_message_id(match) for match in _MESSAGE_ID_RE.findall(raw_value)]
+    if ids:
+        return tuple(id_value for id_value in ids if id_value)
+    normalized = _normalize_message_id(raw_value)
+    return (normalized,) if normalized else ()
+
+
+def _normalize_message_id(value):
+    normalized = str(value or "").strip().strip("<>").strip().lower()
+    return normalized
+
+
+def _normalize_thread_subject(value):
+    subject = _SUBJECT_PREFIX_RE.sub("", str(value or "")).strip().lower()
+    return re.sub(r"\s+", " ", subject)
 
 
 def _first_fetch_tuple(fetch_data):
@@ -348,7 +815,6 @@ def _first_fetch_tuple(fetch_data):
 def _extract_message_parts(message):
     text_parts = []
     html_parts = []
-    attachments = _extract_attachments(message)
     parts = message.walk() if message.is_multipart() else [message]
     for part in parts:
         if part.is_multipart():
@@ -356,44 +822,124 @@ def _extract_message_parts(message):
         content_type = part.get_content_type()
         disposition = part.get_content_disposition()
         filename = part.get_filename()
-        if _is_attachment_part(filename, disposition):
+        content_id = _content_id(part.get("Content-ID"))
+        if _is_attachment_part(filename, disposition, content_id):
             continue
         if content_type == "text/plain":
             text_parts.append(_part_content(part))
         elif content_type == "text/html":
             html_parts.append(_part_content(part))
-    return "\n".join(filter(None, text_parts)), "\n".join(filter(None, html_parts)), attachments
+    text_body = "\n".join(filter(None, text_parts))
+    html_body = "\n".join(filter(None, html_parts))
+    if not text_body and html_body:
+        text_body = _html_to_text(html_body)
+    attachments = _extract_attachments(message, html_body)
+    return text_body, html_body, attachments
 
 
-def _extract_attachments(message):
-    attachments = []
+def _extract_attachments(message, html_body=""):
+    candidates = []
+    referenced_content_hashes = set()
+    cid_refs = _html_cid_refs(html_body)
     parts = message.walk() if message.is_multipart() else [message]
     for part in parts:
         if part.is_multipart():
             continue
         disposition = part.get_content_disposition()
         filename = part.get_filename()
-        if not _is_attachment_part(filename, disposition):
+        content_id = _content_id(part.get("Content-ID"))
+        if not _is_attachment_part(filename, disposition, content_id):
             continue
         content = part.get_payload(decode=True) or b""
+        content_hash = _content_hash(content)
+        candidate = {
+            "filename": filename,
+            "content_type": _attachment_content_type(part, filename),
+            "size": len(content),
+            "disposition": disposition,
+            "is_inline": disposition == "inline",
+            "content_id": content_id,
+            "content": content,
+            "content_hash": content_hash,
+        }
+        if _is_referenced_cid_image(candidate, cid_refs):
+            referenced_content_hashes.add(content_hash)
+        candidates.append(candidate)
+    attachments = []
+    for candidate in candidates:
+        is_visible = _attachment_candidate_is_visible(candidate, referenced_content_hashes, cid_refs)
         attachments.append(
             MailAttachmentContent(
                 summary=MailAttachmentSummary(
                     id=f"att_{len(attachments) + 1}",
-                    filename=filename,
-                    content_type=part.get_content_type(),
-                    size=len(content),
-                    disposition=disposition,
-                    is_inline=disposition == "inline",
+                    filename=candidate["filename"],
+                    content_type=candidate["content_type"],
+                    size=candidate["size"],
+                    disposition=candidate["disposition"],
+                    is_inline=candidate["is_inline"],
+                    content_id=candidate["content_id"],
+                    is_visible=is_visible,
                 ),
-                content=content,
+                content=candidate["content"],
             )
         )
     return attachments
 
 
-def _is_attachment_part(filename, disposition):
-    return bool(filename) or disposition in {"attachment", "inline"}
+def _is_attachment_part(filename, disposition, content_id=""):
+    return bool(filename) or disposition == "attachment" or (disposition == "inline" and bool(content_id))
+
+
+def _attachment_content_type(part, filename):
+    content_type = part.get_content_type() or "application/octet-stream"
+    if content_type != "application/octet-stream" or not filename:
+        return content_type
+    guessed_type, _ = mimetypes.guess_type(filename)
+    return guessed_type or content_type
+
+
+def _content_id(value):
+    content_id = str(value or "").strip()
+    if content_id.startswith("<") and content_id.endswith(">"):
+        return content_id[1:-1].strip()
+    return content_id
+
+
+def _content_hash(content):
+    return hashlib.sha256(content or b"").hexdigest()
+
+
+def _html_cid_refs(html_body):
+    return {unquote(match).strip("<>") for match in re.findall(r"cid:([^\"'>\s)]+)", html_body or "", re.IGNORECASE)}
+
+
+def _cid_referenced(content_id, cid_refs):
+    return content_id in cid_refs
+
+
+def _attachment_candidate_is_visible(candidate, referenced_content_hashes, cid_refs):
+    if candidate["is_inline"] and candidate["content_id"] and _cid_referenced(candidate["content_id"], cid_refs):
+        return False
+    if _is_referenced_cid_image(candidate, cid_refs):
+        return False
+    if candidate["content_type"].startswith("image/") and candidate["content_hash"] in referenced_content_hashes:
+        return False
+    return True
+
+
+def _is_referenced_cid_image(candidate, cid_refs):
+    return (
+        candidate["content_type"].startswith("image/")
+        and bool(candidate["content_id"])
+        and _cid_referenced(candidate["content_id"], cid_refs)
+    )
+
+
+def _has_visible_attachments(attachments):
+    for attachment in attachments:
+        if attachment.is_visible:
+            return True
+    return False
 
 
 def _part_content(part):
@@ -401,6 +947,80 @@ def _part_content(part):
         return part.get_content()
     except LookupError as exc:
         raise MailProtocolError(f"Unsupported message charset: {exc}") from exc
+
+
+class _HtmlTextExtractor(HTMLParser):
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "p",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._chunks = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"script", "style"} and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        self._chunks.append(data)
+
+    def text(self):
+        lines = []
+        for line in "".join(self._chunks).splitlines():
+            normalized = re.sub(r"[ \t\r\f\v]+", " ", line).strip()
+            if normalized:
+                lines.append(normalized)
+        return "\n".join(lines)
+
+
+def _html_to_text(html_body):
+    extractor = _HtmlTextExtractor()
+    try:
+        extractor.feed(html_body)
+        extractor.close()
+    except Exception:
+        return ""
+    return extractor.text()
 
 
 def _payload_size(part):
@@ -461,6 +1081,131 @@ def _has_attachment_bodystructure(metadata):
     return bool(_ATTACHMENT_MARKER_RE.search(match.group("bodystructure")))
 
 
+def _has_visible_attachment_bodystructure(metadata, has_attachments):
+    match = _BODYSTRUCTURE_RE.search(metadata or b"")
+    if not match:
+        return has_attachments
+    try:
+        parts = list(_iter_bodystructure_parts(_parse_bodystructure(match.group("bodystructure"))))
+    except (TypeError, ValueError):
+        return has_attachments
+    found_attachment_like = False
+    for part in parts:
+        disposition = _bodystructure_disposition(part)
+        has_name = _bodystructure_has_name(part)
+        content_id = _content_id(_bodystructure_value(part, 3))
+        if disposition in {"attachment", "inline"} or has_name:
+            found_attachment_like = True
+        if disposition == "attachment" or (has_name and not (disposition == "inline" and content_id)):
+            return True
+    return has_attachments if not found_attachment_like else False
+
+
+def _summary_needs_visible_attachment_refinement(fetch_data):
+    try:
+        metadata, _ = _first_fetch_tuple(fetch_data)
+        match = _BODYSTRUCTURE_RE.search(metadata or b"")
+        if not match:
+            return False
+        parts = list(_iter_bodystructure_parts(_parse_bodystructure(match.group("bodystructure"))))
+    except (MailProtocolError, TypeError, ValueError):
+        return False
+    attachment_like_parts = []
+    for part in parts:
+        disposition = _bodystructure_disposition(part)
+        if disposition in {"attachment", "inline"} or _bodystructure_has_name(part):
+            attachment_like_parts.append(part)
+    if not attachment_like_parts:
+        return False
+    has_inline_or_cid = any(_bodystructure_disposition(part) == "inline" or _content_id(_bodystructure_value(part, 3)) for part in attachment_like_parts)
+    return has_inline_or_cid and all(str(_bodystructure_value(part, 0) or "").lower() == "image" for part in attachment_like_parts)
+
+
+def _parse_bodystructure(raw):
+    text = _safe_decode(raw)
+    value, index = _parse_bodystructure_value(text, 0)
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return value
+
+
+def _parse_bodystructure_value(text, index):
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        raise ValueError("Unexpected end of BODYSTRUCTURE")
+    if text[index] == "(":
+        values = []
+        index += 1
+        while True:
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                raise ValueError("Unterminated BODYSTRUCTURE list")
+            if text[index] == ")":
+                return values, index + 1
+            value, index = _parse_bodystructure_value(text, index)
+            values.append(value)
+    if text[index] == '"':
+        return _parse_bodystructure_quoted(text, index)
+    start = index
+    while index < len(text) and not text[index].isspace() and text[index] not in "()":
+        index += 1
+    atom = text[start:index]
+    if atom.upper() == "NIL":
+        return None, index
+    return atom, index
+
+
+def _parse_bodystructure_quoted(text, index):
+    chars = []
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            chars.append(text[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            return "".join(chars), index + 1
+        chars.append(char)
+        index += 1
+    raise ValueError("Unterminated BODYSTRUCTURE quoted string")
+
+
+def _iter_bodystructure_parts(value):
+    if not isinstance(value, list):
+        return
+    if len(value) >= 2 and isinstance(value[0], str) and isinstance(value[1], str):
+        yield value
+        return
+    for child in value:
+        yield from _iter_bodystructure_parts(child)
+
+
+def _bodystructure_value(part, index):
+    return part[index] if len(part) > index else None
+
+
+def _bodystructure_disposition(part):
+    for value in part[7:]:
+        if isinstance(value, list) and value and isinstance(value[0], str) and value[0].lower() in {"attachment", "inline"}:
+            return value[0].lower()
+    return ""
+
+
+def _bodystructure_has_name(part):
+    return _bodystructure_param_has_key(_bodystructure_value(part, 2), "name") or any(
+        isinstance(value, list) and len(value) > 1 and _bodystructure_param_has_key(value[1], "filename") for value in part[7:]
+    )
+
+
+def _bodystructure_param_has_key(params, key):
+    if not isinstance(params, list):
+        return False
+    return any(isinstance(value, str) and value.lower() == key for value in params[::2])
+
+
 def _address_header(value):
     if not value:
         return ()
@@ -498,8 +1243,67 @@ def _decode_first(data):
 def _decode_mailbox_name(value):
     decoded = _safe_decode(value).strip()
     if decoded.startswith('"') and decoded.endswith('"'):
-        return decoded[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-    return decoded
+        decoded = decoded[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return _modified_utf7_decode(decoded)
+
+
+def _imap_mailbox_arg(value):
+    mailbox = _modified_utf7_encode(_modified_utf7_decode(str(value or "")))
+    escaped = mailbox.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'.encode("ascii")
+
+
+def _modified_utf7_decode(value):
+    result = []
+    index = 0
+    while index < len(value):
+        if value[index] != "&":
+            result.append(value[index])
+            index += 1
+            continue
+        end = value.find("-", index)
+        if end == -1:
+            result.append(value[index])
+            index += 1
+            continue
+        encoded = value[index + 1 : end]
+        if encoded == "":
+            result.append("&")
+        else:
+            padding = "=" * (-len(encoded) % 4)
+            try:
+                data = base64.b64decode((encoded.replace(",", "/") + padding).encode("ascii"), validate=True)
+                result.append(data.decode("utf-16-be"))
+            except (LookupError, UnicodeError, ValueError):
+                result.append(value[index : end + 1])
+        index = end + 1
+    return "".join(result)
+
+
+def _modified_utf7_encode(value):
+    chunks = []
+    unicode_buffer = []
+
+    def flush_unicode_buffer():
+        if not unicode_buffer:
+            return
+        data = "".join(unicode_buffer).encode("utf-16-be")
+        encoded = base64.b64encode(data).decode("ascii").rstrip("=").replace("/", ",")
+        chunks.append(f"&{encoded}-")
+        unicode_buffer.clear()
+
+    for char in value:
+        codepoint = ord(char)
+        if char == "&":
+            flush_unicode_buffer()
+            chunks.append("&-")
+        elif 0x20 <= codepoint <= 0x7E:
+            flush_unicode_buffer()
+            chunks.append(char)
+        else:
+            unicode_buffer.append(char)
+    flush_unicode_buffer()
+    return "".join(chunks)
 
 
 def _safe_decode(value):

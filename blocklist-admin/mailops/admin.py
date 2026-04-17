@@ -1,7 +1,16 @@
 from django.contrib import admin
 
 from .forms import SenderBlocklistRuleForm
-from .models import ApplyLog, DeviceRegistration, PushNotificationLog, SenderBlocklistRule
+from .models import (
+    ApplyLog,
+    DeviceRegistration,
+    MailAccountIndex,
+    MailConversationIndex,
+    MailFolderIndexState,
+    MailMessageIndex,
+    PushNotificationLog,
+    SenderBlocklistRule,
+)
 
 
 @admin.register(SenderBlocklistRule)
@@ -58,3 +67,34 @@ class PushNotificationLogAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(MailAccountIndex)
+class MailAccountIndexAdmin(admin.ModelAdmin):
+    list_display = ("account_email", "index_status", "imap_host", "sent_folder", "last_indexed_at", "updated_at")
+    list_filter = ("index_status",)
+    search_fields = ("account_email", "imap_host", "sent_folder")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(MailConversationIndex)
+class MailConversationIndexAdmin(admin.ModelAdmin):
+    list_display = ("account", "conversation_id", "latest_message_at", "message_count", "has_unread")
+    list_filter = ("has_unread", "has_attachments", "has_visible_attachments")
+    search_fields = ("account__account_email", "conversation_id", "thread_key", "normalized_subject")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(MailMessageIndex)
+class MailMessageIndexAdmin(admin.ModelAdmin):
+    list_display = ("account", "folder", "uid", "direction", "subject", "sent_at", "is_read")
+    list_filter = ("direction", "folder", "is_read", "has_attachments", "has_visible_attachments")
+    search_fields = ("account__account_email", "folder", "uid", "message_id", "subject", "sender_email")
+    readonly_fields = ("indexed_at", "created_at", "updated_at")
+
+
+@admin.register(MailFolderIndexState)
+class MailFolderIndexStateAdmin(admin.ModelAdmin):
+    list_display = ("account", "folder", "highest_indexed_uid", "last_synced_at", "updated_at")
+    search_fields = ("account__account_email", "folder")
+    readonly_fields = ("created_at", "updated_at")

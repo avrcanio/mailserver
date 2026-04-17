@@ -26,5 +26,21 @@ class MailAttachmentNotFoundError(MailIntegrationError):
     """Raised when a requested message attachment cannot be found."""
 
 
+class MailForwardAttachmentNotFoundError(MailIntegrationError):
+    """Raised when a requested forwarded attachment ID is not on the source message."""
+
+
+class MailForwardAttachmentNotVisibleError(MailIntegrationError):
+    """Raised when a requested forwarded attachment is hidden or inline-only."""
+
+
+class MailAttachmentLimitError(MailIntegrationError):
+    """Raised when outgoing attachment payload limits are exceeded."""
+
+    def __init__(self, code, detail=""):
+        super().__init__(detail or code)
+        self.code = code
+
+
 class MailSendError(MailIntegrationError):
     """Raised when SMTP accepts a connection but fails to send mail."""
