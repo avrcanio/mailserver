@@ -153,6 +153,13 @@ docker compose logs -f mailserver
 docker compose logs -f mailadmin
 ```
 
+- mail index sync runner:
+
+```bash
+docker compose logs -f mailindex-sync
+docker compose exec mailadmin python manage.py run_mail_index_sync_cycle
+```
+
 - backup:
 
 ```bash

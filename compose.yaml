@@ -82,6 +82,51 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  mailindex-sync:
+    build:
+      context: ./blocklist-admin
+    container_name: mailserver-mailindex-sync
+    command:
+      - python
+      - manage.py
+      - run_mail_index_sync_cycle
+      - --loop
+      - --interval-seconds
+      - ${MAIL_INDEX_SYNC_INTERVAL_SECONDS:-600}
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@postgis:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
+      DJANGO_SECRET_KEY: ${MAILADMIN_SECRET_KEY:-change-me-too}
+      DJANGO_ALLOWED_HOSTS: ${MAILADMIN_ALLOWED_HOSTS:-mailadmin.example.com,127.0.0.1,localhost},mailadmin
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${MAILADMIN_CSRF_TRUSTED_ORIGINS:-https://mailadmin.example.com}
+      MAILADMIN_HOST: ${MAILADMIN_HOST:-mailadmin.example.com}
+      BLOCKLIST_CONFIG_PATH: /app/shared-config/postfix-sender-blocklist
+      MAILSERVER_CONTAINER_NAME: mailserver
+      BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
+      MAIL_NOTIFY_HOOK_SECRET: ${MAIL_NOTIFY_HOOK_SECRET}
+      DEVICE_REGISTRATION_SECRET: ${DEVICE_REGISTRATION_SECRET}
+      MAILBOX_CREDENTIAL_ENCRYPTION_KEY: ${MAILBOX_CREDENTIAL_ENCRYPTION_KEY}
+      MAIL_IMAP_HOST: ${MAIL_HOSTNAME}
+      MAIL_SMTP_HOST: ${MAIL_HOSTNAME}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
+      MAIL_INDEX_SYNC_INTERVAL_SECONDS: ${MAIL_INDEX_SYNC_INTERVAL_SECONDS:-600}
+      MAIL_INDEX_SYNC_STALE_AFTER_SECONDS: ${MAIL_INDEX_SYNC_STALE_AFTER_SECONDS:-600}
+      MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS: ${MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS:-1800}
+      MAIL_INDEX_SYNC_MAX_ACCOUNTS: ${MAIL_INDEX_SYNC_MAX_ACCOUNTS:-50}
+      MAIL_INDEX_SYNC_LIMIT: ${MAIL_INDEX_SYNC_LIMIT:-500}
+    volumes:
+      - ./docker-data/dms/config:/app/shared-config
+      - ./docker-data/secrets/firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
+    networks:
+      - default
+      - postgis
+    depends_on:
+      mailserver:
+        condition: service_started
+      mailadmin:
+        condition: service_started
+    restart: unless-stopped
+
 networks:
   postgis:
     external: true

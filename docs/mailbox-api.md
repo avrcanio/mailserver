@@ -340,6 +340,15 @@ python manage.py sync_mail_index --account user@finestar.hr --limit 500
 
 By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
 
+The deployed stack also includes a periodic sync runner:
+
+```bash
+python manage.py run_mail_index_sync_cycle
+python manage.py run_mail_index_sync_cycle --loop --interval-seconds 600
+```
+
+In Docker, the `mailindex-sync` service runs this loop. It selects stale indexed accounts, skips active syncs, applies a cooldown for recent failures, and logs each cycle summary. Defaults are configured with `MAIL_INDEX_SYNC_INTERVAL_SECONDS`, `MAIL_INDEX_SYNC_STALE_AFTER_SECONDS`, `MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS`, `MAIL_INDEX_SYNC_MAX_ACCOUNTS`, and `MAIL_INDEX_SYNC_LIMIT`.
+
 Incremental sync refreshes newer UIDs plus a recent metadata window. It does not delete indexed rows that are missing from that recent window unless `MAIL_INDEX_RECONCILE_DELETIONS=true` is explicitly enabled, because deletion reconciliation depends on the IMAP server returning a complete and trustworthy UID view for that checked window.
 
 `GET /api/mail/messages/42?folder=INBOX`
