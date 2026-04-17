@@ -10,7 +10,7 @@ from django.test import SimpleTestCase, override_settings
 from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailSendError, MailTimeoutError
 from .imap_client import ImapClient
 from .mailbox_service import MailboxService
-from .schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
+from .schemas import MailboxAccountSummary, MailboxCredentials, SendMailAttachment, SendMailRequest
 from .smtp_client import SmtpClient, build_email_message
 
 
@@ -52,13 +52,96 @@ class ImapClientTests(SimpleTestCase):
             folders = ImapClient().connect().list_folders()
 
         self.assertEqual(folders[0].name, "INBOX")
+        self.assertEqual(folders[0].path, "INBOX")
+        self.assertEqual(folders[0].display_name, "INBOX")
+        self.assertIsNone(folders[0].parent_path)
+        self.assertEqual(folders[0].depth, 0)
+        self.assertTrue(folders[0].selectable)
         self.assertEqual(folders[0].delimiter, "/")
         self.assertEqual(folders[0].flags, ("HasNoChildren",))
         self.assertEqual(folders[1].flags, ("HasChildren", "Noselect"))
+        self.assertFalse(folders[1].selectable)
         self.assertEqual(folders[2].name, "Sent")
         self.assertIsNone(folders[2].delimiter)
         self.assertEqual(folders[2].flags, ("HasNoChildren", "Sent"))
         self.assertEqual(folders[3].name, "Junk Mail")
+
+    def test_list_folders_preserves_nested_inbox_paths(self):
+        connection = Mock()
+        connection.list.return_value = (
+            "OK",
+            [
+                b'(\\HasChildren) "/" "INBOX"',
+                b'(\\HasNoChildren) "/" "INBOX/Clients"',
+                b'(\\HasChildren) "/" "INBOX/Invoices"',
+                b'(\\HasNoChildren) "/" "INBOX/Invoices/2026"',
+            ],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            folders = ImapClient().connect().list_folders()
+
+        self.assertEqual([folder.name for folder in folders], ["INBOX", "INBOX/Clients", "INBOX/Invoices", "INBOX/Invoices/2026"])
+        self.assertEqual(folders[1].path, "INBOX/Clients")
+        self.assertEqual(folders[1].display_name, "Clients")
+        self.assertEqual(folders[1].parent_path, "INBOX")
+        self.assertEqual(folders[1].depth, 1)
+        self.assertTrue(folders[1].selectable)
+        self.assertEqual(folders[3].path, "INBOX/Invoices/2026")
+        self.assertEqual(folders[3].display_name, "2026")
+        self.assertEqual(folders[3].parent_path, "INBOX/Invoices")
+        self.assertEqual(folders[3].depth, 2)
+
+    def test_list_folders_uses_imap_delimiter_for_hierarchy(self):
+        connection = Mock()
+        connection.list.return_value = (
+            "OK",
+            [
+                b'(\\HasChildren) "." "INBOX"',
+                b'(\\HasNoChildren) "." "INBOX.Clients"',
+            ],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            folders = ImapClient().connect().list_folders()
+
+        self.assertEqual(folders[1].path, "INBOX.Clients")
+        self.assertEqual(folders[1].display_name, "Clients")
+        self.assertEqual(folders[1].parent_path, "INBOX")
+        self.assertEqual(folders[1].depth, 1)
+
+    def test_list_folders_decodes_modified_utf7_mailbox_names(self):
+        connection = Mock()
+        connection.list.return_value = (
+            "OK",
+            [
+                b'(\\HasNoChildren) "." "Nabava.TSH &AQw-akovec"',
+                b'(\\HasNoChildren) "." "Ponude.Ante Sladi&AQc-"',
+            ],
+        )
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            folders = ImapClient().connect().list_folders()
+
+        self.assertEqual(folders[0].name, "Nabava.TSH Čakovec")
+        self.assertEqual(folders[0].path, "Nabava.TSH Čakovec")
+        self.assertEqual(folders[0].display_name, "TSH Čakovec")
+        self.assertEqual(folders[0].parent_path, "Nabava")
+        self.assertEqual(folders[1].name, "Ponude.Ante Sladić")
+        self.assertEqual(folders[1].display_name, "Ante Sladić")
+
+    def test_fetch_message_summary_encodes_unicode_folder_for_imap_select(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"101"]),
+            ("OK", [(b"101 (UID 101 FLAGS () RFC822.SIZE 10 BODY[HEADER.FIELDS ...] {20}", b"Subject: TSH\r\n\r\n")]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            ImapClient().connect().fetch_message_summaries(folder="Nabava.TSH Čakovec", limit=1)
+
+        connection.select.assert_called_once_with(b'"Nabava.TSH &AQw-akovec"', readonly=True)
 
     def test_list_folders_rejects_malformed_imap_lines(self):
         connection = Mock()
@@ -118,8 +201,10 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(summaries[0].size, 1234)
         self.assertEqual(summaries[0].message_id, "<m1@example.com>")
         self.assertTrue(summaries[0].has_attachments)
+        self.assertTrue(summaries[0].has_visible_attachments)
         self.assertFalse(summaries[1].has_attachments)
-        connection.select.assert_called_once_with("Archive", readonly=True)
+        self.assertFalse(summaries[1].has_visible_attachments)
+        connection.select.assert_called_once_with(b'"Archive"', readonly=True)
 
     def test_fetch_message_summaries_respects_zero_limit_without_fetching_messages(self):
         connection = Mock()
@@ -130,6 +215,23 @@ class ImapClientTests(SimpleTestCase):
 
         self.assertEqual(summaries, [])
         connection.uid.assert_not_called()
+
+    def test_fetch_account_summary_counts_inbox_unseen_and_flagged(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"5"])
+        connection.uid.side_effect = [
+            ("OK", [b"101 103 105"]),
+            ("OK", [b"102 105"]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            summary = ImapClient().connect().fetch_account_summary()
+
+        self.assertEqual(summary.unread_count, 3)
+        self.assertEqual(summary.important_count, 2)
+        connection.select.assert_called_once_with(b'"INBOX"', readonly=True)
+        connection.uid.assert_any_call("search", None, "UNSEEN")
+        connection.uid.assert_any_call("search", None, "FLAGGED")
 
     def test_fetch_message_summary_page_uses_before_uid_cursor(self):
         connection = Mock()
@@ -150,7 +252,7 @@ class ImapClientTests(SimpleTestCase):
         connection.uid.assert_any_call("fetch", b"102", "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
         connection.uid.assert_any_call("fetch", b"101", "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID)])")
 
-    def test_fetch_message_summaries_detects_inline_named_parts_as_attachments(self):
+    def test_fetch_message_summaries_detects_inline_cid_parts_without_visible_attachments(self):
         connection = Mock()
         connection.select.return_value = ("OK", [b"1"])
         connection.uid.side_effect = [
@@ -175,6 +277,69 @@ class ImapClientTests(SimpleTestCase):
             summaries = ImapClient().connect().fetch_message_summaries(folder="INBOX", limit=1)
 
         self.assertTrue(summaries[0].has_attachments)
+        self.assertFalse(summaries[0].has_visible_attachments)
+
+    def test_fetch_message_summaries_detects_mixed_inline_and_visible_attachments(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"201"]),
+            (
+                "OK",
+                [
+                    (
+                        (
+                            b'201 (UID 201 FLAGS () RFC822.SIZE 654 BODYSTRUCTURE '
+                            b'(("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+                            b'("IMAGE" "PNG" ("NAME" "logo.png") "<logo>" NIL "BASE64" 20 NIL '
+                            b'("INLINE" ("FILENAME" "logo.png")) NIL)'
+                            b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 100 NIL '
+                            b'("ATTACHMENT" ("FILENAME" "report.pdf")) NIL) "MIXED") BODY[HEADER.FIELDS ...] {20}'
+                        ),
+                        b"Subject: Mixed\r\n\r\n",
+                    )
+                ],
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            summaries = ImapClient().connect().fetch_message_summaries(folder="INBOX", limit=1)
+
+        self.assertTrue(summaries[0].has_attachments)
+        self.assertTrue(summaries[0].has_visible_attachments)
+
+    def test_fetch_message_summaries_refines_duplicate_inline_image_visibility(self):
+        raw_message = _raw_duplicate_signature_image_message()
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"202"]),
+            (
+                "OK",
+                [
+                    (
+                        (
+                            b'202 (UID 202 FLAGS () RFC822.SIZE 1000 BODYSTRUCTURE '
+                            b'(("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 12 1 NIL NIL NIL)'
+                            b'("IMAGE" "PNG" ("NAME" "Outlook-logo.png") "<unreferenced-logo>" NIL "BASE64" 20 NIL '
+                            b'("INLINE" ("FILENAME" "Outlook-logo.png")) NIL)'
+                            b'("IMAGE" "PNG" ("NAME" "Outlook-logo.png") "<referenced-logo>" NIL "BASE64" 20 NIL '
+                            b'("INLINE" ("FILENAME" "Outlook-logo.png")) NIL)'
+                            b'("IMAGE" "PNG" ("NAME" "Outlook-logo.png") "<duplicate-logo>" NIL "BASE64" 20 NIL '
+                            b'("ATTACHMENT" ("FILENAME" "Outlook-logo.png")) NIL) "MIXED") BODY[HEADER.FIELDS ...] {20}'
+                        ),
+                        b"Subject: Signature\r\n\r\n",
+                    )
+                ],
+            ),
+            ("OK", [(b"202 (UID 202 FLAGS () RFC822.SIZE 1000 RFC822 {999}", raw_message)]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            summaries = ImapClient().connect().fetch_message_summaries(folder="INBOX", limit=1)
+
+        self.assertTrue(summaries[0].has_attachments)
+        self.assertFalse(summaries[0].has_visible_attachments)
 
     def test_fetch_message_summary_page_returns_pagination_metadata(self):
         connection = Mock()
@@ -225,8 +390,125 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(detail.attachments[0].content_type, "text/plain")
         self.assertEqual(detail.attachments[0].disposition, "attachment")
         self.assertFalse(detail.attachments[0].is_inline)
-        connection.select.assert_called_once_with("INBOX", readonly=True)
+        self.assertEqual(detail.attachments[0].content_id, "")
+        self.assertTrue(detail.has_visible_attachments)
+        connection.select.assert_called_once_with(b'"INBOX"', readonly=True)
         connection.uid.assert_called_once_with("fetch", "7", "(FLAGS RFC822.SIZE RFC822)")
+
+    def test_fetch_message_detail_extracts_inline_content_id_metadata(self):
+        message = EmailMessage()
+        message["Subject"] = "Inline CID"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Plain fallback")
+        message.add_alternative('<p><img src="cid:logo123"></p>', subtype="html")
+        html_part = message.get_payload()[1]
+        html_part.add_related(b"png bytes", maintype="image", subtype="png", cid="<logo123>", filename="logo.png")
+        html_part.get_payload()[1].replace_header("Content-Disposition", 'inline; filename="logo.png"')
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertTrue(detail.attachments)
+        self.assertTrue(detail.attachments[0].is_inline)
+        self.assertEqual(detail.attachments[0].content_id, "logo123")
+        self.assertEqual(detail.attachments[0].filename, "logo.png")
+        self.assertFalse(detail.attachments[0].is_visible)
+        self.assertTrue(bool(detail.attachments))
+        self.assertFalse(detail.has_visible_attachments)
+
+    def test_fetch_message_detail_hides_duplicate_signature_image_attachments(self):
+        detail = _detail_from_raw_message(_raw_duplicate_signature_image_message())
+
+        self.assertEqual(len(detail.attachments), 3)
+        self.assertEqual([attachment.content_id for attachment in detail.attachments], ["unreferenced-logo", "referenced-logo", "duplicate-logo"])
+        self.assertEqual([attachment.is_visible for attachment in detail.attachments], [False, False, False])
+        self.assertFalse(detail.has_visible_attachments)
+
+    def test_fetch_message_detail_keeps_non_duplicate_image_attachment_visible(self):
+        message = EmailMessage()
+        message["Subject"] = "Inline and image attachment"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Plain fallback")
+        message.add_alternative('<p><img src="cid:logo"></p>', subtype="html")
+        html_part = message.get_payload()[1]
+        html_part.add_related(b"inline png", maintype="image", subtype="png", cid="<logo>", filename="logo.png")
+        html_part.get_payload()[1].replace_header("Content-Disposition", 'inline; filename="logo.png"')
+        message.add_attachment(b"different png", maintype="image", subtype="png", filename="photo.png")
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertEqual([attachment.is_visible for attachment in detail.attachments], [False, True])
+        self.assertTrue(detail.has_visible_attachments)
+
+    def test_fetch_message_detail_hides_referenced_cid_images_without_disposition(self):
+        message = EmailMessage()
+        message["Subject"] = "CID images and PDFs"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Plain fallback")
+        message.add_alternative(
+            '<p><img src="cid:image002.jpg@01DCB149.77FF6EF0">'
+            '<img src="cid:image004.gif@01DCB149.77FF6EF0"></p>',
+            subtype="html",
+        )
+        html_part = message.get_payload()[1]
+        html_part.add_related(
+            b"jpg bytes",
+            maintype="image",
+            subtype="jpeg",
+            cid="<image002.jpg@01DCB149.77FF6EF0>",
+            filename="image002.jpg",
+        )
+        _remove_content_disposition(html_part.get_payload()[-1], "image002.jpg")
+        html_part.add_related(
+            b"gif bytes",
+            maintype="image",
+            subtype="gif",
+            cid="<image004.gif@01DCB149.77FF6EF0>",
+            filename="image004.gif",
+        )
+        _remove_content_disposition(html_part.get_payload()[-1], "image004.gif")
+        message.add_attachment(b"delivery note", maintype="application", subtype="pdf", filename="Otpremnice.pdf")
+        message.add_attachment(b"invoice", maintype="application", subtype="pdf", filename="194-1-26.pdf")
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertEqual(
+            [attachment.filename for attachment in detail.attachments],
+            ["image002.jpg", "image004.gif", "Otpremnice.pdf", "194-1-26.pdf"],
+        )
+        self.assertEqual(
+            [attachment.content_id for attachment in detail.attachments],
+            ["image002.jpg@01DCB149.77FF6EF0", "image004.gif@01DCB149.77FF6EF0", "", ""],
+        )
+        self.assertEqual([attachment.is_visible for attachment in detail.attachments], [False, False, True, True])
+        self.assertTrue(detail.has_visible_attachments)
+
+    def test_fetch_message_detail_hides_only_referenced_cid_images_without_disposition(self):
+        message = EmailMessage()
+        message["Subject"] = "Only CID images"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Plain fallback")
+        message.add_alternative('<p><img src="cid:image002.jpg@01DCB149.77FF6EF0"></p>', subtype="html")
+        html_part = message.get_payload()[1]
+        html_part.add_related(
+            b"jpg bytes",
+            maintype="image",
+            subtype="jpeg",
+            cid="<image002.jpg@01DCB149.77FF6EF0>",
+            filename="image002.jpg",
+        )
+        _remove_content_disposition(html_part.get_payload()[-1], "image002.jpg")
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertEqual(len(detail.attachments), 1)
+        self.assertEqual(detail.attachments[0].filename, "image002.jpg")
+        self.assertFalse(detail.attachments[0].is_visible)
+        self.assertTrue(bool(detail.attachments))
+        self.assertFalse(detail.has_visible_attachments)
 
     def test_fetch_attachment_returns_selected_attachment_content(self):
         raw_message = _raw_detail_message(text_body="Plain body", attach=True)
@@ -243,6 +525,24 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(attachment.summary.id, "att_1")
         self.assertEqual(attachment.summary.filename, "report.txt")
         self.assertEqual(attachment.content, b"report content")
+
+    def test_fetch_attachment_guesses_pdf_content_type_from_filename(self):
+        message = EmailMessage()
+        message["Subject"] = "PDF attachment"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Plain body")
+        message.add_attachment(
+            b"%PDF-1.7\n",
+            maintype="application",
+            subtype="octet-stream",
+            filename="statement.pdf",
+        )
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertEqual(detail.attachments[0].filename, "statement.pdf")
+        self.assertEqual(detail.attachments[0].content_type, "application/pdf")
 
     def test_fetch_attachment_raises_not_found_for_unknown_attachment_id(self):
         raw_message = _raw_detail_message(text_body="Plain body", attach=True)
@@ -264,12 +564,43 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(detail.html_body, "")
         self.assertEqual(detail.attachments, ())
 
+    def test_fetch_message_detail_keeps_inline_text_as_body(self):
+        message = EmailMessage()
+        message["Subject"] = "Inline text"
+        message["From"] = "Sender <sender@example.com>"
+        message["To"] = "User <user@example.com>"
+        message.set_content("Postovani,\nPBZ izvadak", charset="iso-8859-2")
+        message.add_header("Content-Disposition", "inline")
+        message.add_attachment(b"%PDF-1.7\n", maintype="application", subtype="pdf", filename="statement.pdf")
+
+        detail = _detail_from_raw_message(bytes(message))
+
+        self.assertIn("Postovani", detail.text_body)
+        self.assertEqual(detail.html_body, "")
+        self.assertEqual(len(detail.attachments), 1)
+        self.assertEqual(detail.attachments[0].filename, "statement.pdf")
+
     def test_fetch_message_detail_extracts_html_only(self):
         detail = _detail_from_raw_message(_raw_detail_message(html_body="<p>HTML only</p>"))
 
-        self.assertEqual(detail.text_body, "")
+        self.assertEqual(detail.text_body, "HTML only")
         self.assertIn("<p>HTML only</p>", detail.html_body)
         self.assertEqual(detail.attachments, ())
+
+    def test_fetch_message_detail_builds_text_fallback_for_table_html(self):
+        raw_message = _raw_detail_message(
+            html_body=(
+                "<html><head><style>.hidden{display:none}</style></head>"
+                "<body><table><tr><td>Nuvola Studio</td></tr>"
+                "<tr><td>Vaša narudžba je poslana</td></tr></table></body></html>"
+            )
+        )
+
+        detail = _detail_from_raw_message(raw_message)
+
+        self.assertIn("Nuvola Studio", detail.text_body)
+        self.assertIn("Vaša narudžba je poslana", detail.text_body)
+        self.assertNotIn("display:none", detail.text_body)
 
     def test_fetch_message_detail_extracts_multipart_alternative(self):
         detail = _detail_from_raw_message(_raw_detail_message(text_body="Plain alt", html_body="<p>HTML alt</p>"))
@@ -299,9 +630,9 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(result.trash_folder, "Deleted Messages")
         self.assertEqual(result.moved_to_trash, ("123", "124"))
         self.assertEqual(result.failed, ())
-        connection.select.assert_called_once_with("INBOX", readonly=False)
-        connection.uid.assert_any_call("MOVE", "123", "Deleted Messages")
-        connection.uid.assert_any_call("MOVE", "124", "Deleted Messages")
+        connection.select.assert_called_once_with(b'"INBOX"', readonly=False)
+        connection.uid.assert_any_call("MOVE", "123", b'"Deleted Messages"')
+        connection.uid.assert_any_call("MOVE", "124", b'"Deleted Messages"')
 
     def test_move_messages_to_trash_falls_back_to_copy_and_deleted_flag(self):
         connection = Mock()
@@ -319,8 +650,8 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(result.trash_folder, "Trash")
         self.assertEqual(result.moved_to_trash, ("123",))
         self.assertEqual(result.failed, ())
-        connection.uid.assert_any_call("MOVE", "123", "Trash")
-        connection.uid.assert_any_call("COPY", "123", "Trash")
+        connection.uid.assert_any_call("MOVE", "123", b'"Trash"')
+        connection.uid.assert_any_call("COPY", "123", b'"Trash"')
         connection.uid.assert_any_call("STORE", "123", "+FLAGS.SILENT", r"(\Deleted)")
 
     def test_move_messages_to_trash_reports_partial_failures(self):
@@ -388,9 +719,9 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(result.target_folder, "INBOX")
         self.assertEqual(result.restored, ("123", "124"))
         self.assertEqual(result.failed, ())
-        connection.select.assert_called_once_with("Trash", readonly=False)
-        connection.uid.assert_any_call("MOVE", "123", "INBOX")
-        connection.uid.assert_any_call("MOVE", "124", "INBOX")
+        connection.select.assert_called_once_with(b'"Trash"', readonly=False)
+        connection.uid.assert_any_call("MOVE", "123", b'"INBOX"')
+        connection.uid.assert_any_call("MOVE", "124", b'"INBOX"')
 
     def test_restore_messages_from_trash_falls_back_to_copy_and_deleted_flag(self):
         connection = Mock()
@@ -408,8 +739,8 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(result.target_folder, "INBOX")
         self.assertEqual(result.restored, ("123",))
         self.assertEqual(result.failed, ())
-        connection.uid.assert_any_call("MOVE", "123", "INBOX")
-        connection.uid.assert_any_call("COPY", "123", "INBOX")
+        connection.uid.assert_any_call("MOVE", "123", b'"INBOX"')
+        connection.uid.assert_any_call("COPY", "123", b'"INBOX"')
         connection.uid.assert_any_call("STORE", "123", "+FLAGS.SILENT", r"(\Deleted)")
 
     def test_restore_messages_from_trash_reports_partial_failures(self):
@@ -679,6 +1010,7 @@ class MailboxServiceTests(SimpleTestCase):
         entered = imap_client.__enter__.return_value
         entered.list_folders.return_value = ["INBOX"]
         entered.fetch_message_summaries.return_value = ["summary"]
+        entered.fetch_account_summary.return_value = MailboxAccountSummary(unread_count=2, important_count=1)
         entered.fetch_message_summary_page.return_value = "summary-page"
         entered.fetch_message_detail.return_value = "detail"
         entered.fetch_attachment.return_value = "attachment"
@@ -689,14 +1021,16 @@ class MailboxServiceTests(SimpleTestCase):
 
         self.assertEqual(service.list_folders(credentials), ["INBOX"])
         self.assertEqual(service.list_message_summaries(credentials, folder="Archive", limit=10), ["summary"])
+        self.assertEqual(service.get_account_summary(credentials), MailboxAccountSummary(unread_count=2, important_count=1))
         self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
         self.assertEqual(service.get_attachment(credentials, folder="Archive", uid="99", attachment_id="att_1"), "attachment")
         self.assertEqual(service.move_messages_to_trash(credentials, folder="Archive", uids=("99",)), "move-result")
         self.assertEqual(service.restore_messages_from_trash(credentials, folder="Trash", target_folder="INBOX", uids=("99",)), "restore-result")
-        self.assertEqual(entered.login.call_count, 7)
+        self.assertEqual(entered.login.call_count, 8)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
+        entered.fetch_account_summary.assert_called_once_with()
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
         entered.fetch_attachment.assert_called_once_with(folder="Archive", uid="99", attachment_id="att_1")
@@ -733,6 +1067,30 @@ def _raw_detail_message(text_body="", html_body="", attach=False):
     if attach:
         message.add_attachment(b"report content", maintype="text", subtype="plain", filename="report.txt")
     return bytes(message)
+
+
+def _raw_duplicate_signature_image_message():
+    message = EmailMessage()
+    message["Subject"] = "Forwarded signature"
+    message["From"] = "Sender <sender@example.com>"
+    message["To"] = "User <user@example.com>"
+    message.set_content("Plain fallback")
+    message.add_alternative('<p><img src="cid:referenced-logo"></p>', subtype="html")
+    html_part = message.get_payload()[1]
+    image_content = b"same png bytes"
+    html_part.add_related(image_content, maintype="image", subtype="png", cid="<unreferenced-logo>", filename="Outlook-logo.png")
+    html_part.get_payload()[1].replace_header("Content-Disposition", 'inline; filename="Outlook-logo.png"')
+    html_part.add_related(image_content, maintype="image", subtype="png", cid="<referenced-logo>", filename="Outlook-logo.png")
+    html_part.get_payload()[2].replace_header("Content-Disposition", 'inline; filename="Outlook-logo.png"')
+    message.add_attachment(image_content, maintype="image", subtype="png", filename="Outlook-logo.png", cid="<duplicate-logo>")
+    return bytes(message)
+
+
+def _remove_content_disposition(part, filename=None):
+    if "Content-Disposition" in part:
+        del part["Content-Disposition"]
+    if filename:
+        part.set_param("name", filename, header="Content-Type")
 
 
 def _detail_from_raw_message(raw_message):

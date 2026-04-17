@@ -46,6 +46,13 @@ class MailboxUidField(serializers.CharField):
         return str(uid)
 
 
+def normalize_fcm_token(value):
+    token = str(value or "").strip()
+    if not token:
+        raise serializers.ValidationError("This field is required.")
+    return token
+
+
 class LoginRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(trim_whitespace=False, write_only=True)
@@ -75,8 +82,13 @@ class ErrorSerializer(serializers.Serializer):
 
 class FolderSerializer(serializers.Serializer):
     name = serializers.CharField()
+    path = serializers.CharField()
+    display_name = serializers.CharField()
+    parent_path = serializers.CharField(allow_null=True)
+    depth = serializers.IntegerField()
     delimiter = serializers.CharField(allow_null=True, required=False)
     flags = serializers.ListField(child=serializers.CharField())
+    selectable = serializers.BooleanField()
 
 
 class AttachmentSerializer(serializers.Serializer):
@@ -86,6 +98,8 @@ class AttachmentSerializer(serializers.Serializer):
     size = serializers.IntegerField(allow_null=True, required=False)
     disposition = serializers.CharField(allow_null=True, required=False)
     is_inline = serializers.BooleanField()
+    content_id = serializers.CharField(allow_blank=True)
+    is_visible = serializers.BooleanField()
 
 
 class MessageSummarySerializer(serializers.Serializer):
@@ -100,6 +114,7 @@ class MessageSummarySerializer(serializers.Serializer):
     flags = serializers.ListField(child=serializers.CharField())
     size = serializers.IntegerField(allow_null=True)
     has_attachments = serializers.BooleanField()
+    has_visible_attachments = serializers.BooleanField()
 
 
 class MessageDetailSerializer(MessageSummarySerializer):
@@ -205,12 +220,13 @@ class DeviceRegistrationRequestSerializer(serializers.Serializer):
         attrs["normalized_account_email"] = (
             attrs.get("account_email") or attrs.get("accountEmail") or attrs.get("accountId") or attrs.get("email") or ""
         ).strip().lower()
-        attrs["normalized_fcm_token"] = (attrs.get("fcm_token") or attrs.get("fcmToken") or "").strip()
+        try:
+            attrs["normalized_fcm_token"] = normalize_fcm_token(attrs.get("fcm_token") or attrs.get("fcmToken") or "")
+        except serializers.ValidationError as exc:
+            raise serializers.ValidationError({"fcm_token": exc.detail}) from exc
         platform = (attrs.get("platform") or "unknown").strip().lower()
         attrs["normalized_platform"] = platform if platform in {"android", "ios", "web", "unknown"} else "unknown"
         attrs["normalized_app_version"] = (attrs.get("app_version") or attrs.get("appVersion") or "").strip()
-        if not attrs["normalized_fcm_token"]:
-            raise serializers.ValidationError({"fcm_token": "This field is required."})
         return attrs
 
 
@@ -219,6 +235,29 @@ class DeviceRegistrationResponseSerializer(serializers.Serializer):
     created = serializers.BooleanField()
     id = serializers.IntegerField()
     account_email = serializers.EmailField()
+
+
+class AccountsSummaryQuerySerializer(serializers.Serializer):
+    fcm_token = serializers.CharField(required=False, allow_blank=True)
+    fcmToken = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        try:
+            attrs["normalized_fcm_token"] = normalize_fcm_token(attrs.get("fcm_token") or attrs.get("fcmToken") or "")
+        except serializers.ValidationError as exc:
+            raise serializers.ValidationError({"fcm_token": exc.detail}) from exc
+        return attrs
+
+
+class AccountSummarySerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    display_name = serializers.CharField(allow_blank=True)
+    unread_count = serializers.IntegerField()
+    important_count = serializers.IntegerField()
+
+
+class AccountSummariesResponseSerializer(serializers.Serializer):
+    accounts = AccountSummarySerializer(many=True)
 
 
 class MailHookRequestSerializer(serializers.Serializer):

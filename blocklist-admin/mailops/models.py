@@ -99,7 +99,7 @@ class DeviceRegistration(models.Model):
     ]
 
     account_email = models.EmailField(db_index=True)
-    fcm_token = models.TextField(unique=True)
+    fcm_token = models.TextField()
     platform = models.CharField(max_length=16, choices=PLATFORM_CHOICES, default=PLATFORM_UNKNOWN)
     app_version = models.CharField(max_length=64, blank=True, default="")
     enabled = models.BooleanField(default=True)
@@ -109,6 +109,9 @@ class DeviceRegistration(models.Model):
 
     class Meta:
         ordering = ["account_email", "-last_seen_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["account_email", "fcm_token"], name="uniq_device_registration_account_fcm_token"),
+        ]
         verbose_name = "Device registration"
         verbose_name_plural = "Device registrations"
 

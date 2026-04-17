@@ -17,6 +17,7 @@ from mail_integration.exceptions import MailAttachmentNotFoundError, MailAuthErr
 from mail_integration.schemas import (
     MailAttachmentContent,
     MailAttachmentSummary,
+    MailboxAccountSummary,
     MailFolderSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
@@ -279,10 +280,44 @@ class MailApiTests(TestCase):
         response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["folders"][0], {"name": "INBOX", "delimiter": "/", "flags": ["HasNoChildren"]})
+        self.assertEqual(
+            response.json()["folders"][0],
+            {
+                "name": "INBOX",
+                "path": "INBOX",
+                "display_name": "INBOX",
+                "parent_path": None,
+                "depth": 0,
+                "delimiter": "/",
+                "flags": ["HasNoChildren"],
+                "selectable": True,
+            },
+        )
         credentials = service_class.return_value.list_folders.call_args.args[0]
         self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(credentials.password, self.password)
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_folders_returns_nested_folder_metadata(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.list_folders.return_value = [
+            MailFolderSummary(name="INBOX", delimiter="/", flags=("HasChildren",)),
+            MailFolderSummary(name="INBOX/Invoices", delimiter="/", flags=("HasChildren",)),
+            MailFolderSummary(name="INBOX/Invoices/2026", delimiter="/", flags=("HasNoChildren",)),
+            MailFolderSummary(name="Archive", delimiter="/", flags=("Noselect",)),
+        ]
+
+        response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        folders = response.json()["folders"]
+        self.assertEqual(folders[2]["name"], "INBOX/Invoices/2026")
+        self.assertEqual(folders[2]["path"], "INBOX/Invoices/2026")
+        self.assertEqual(folders[2]["display_name"], "2026")
+        self.assertEqual(folders[2]["parent_path"], "INBOX/Invoices")
+        self.assertEqual(folders[2]["depth"], 2)
+        self.assertTrue(folders[2]["selectable"])
+        self.assertFalse(folders[3]["selectable"])
 
     def test_legacy_mailbox_path_no_longer_accepts_post_password_payload(self):
         response = self.client.post(
@@ -311,6 +346,7 @@ class MailApiTests(TestCase):
                     flags=("Seen",),
                     size=1234,
                     has_attachments=True,
+                    has_visible_attachments=True,
                 ),
             ),
             has_more=True,
@@ -324,6 +360,7 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["account_email"], self.account_email)
         self.assertEqual(payload["messages"][0]["uid"], "42")
         self.assertTrue(payload["messages"][0]["has_attachments"])
+        self.assertTrue(payload["messages"][0]["has_visible_attachments"])
         self.assertEqual(payload["has_more"], True)
         self.assertEqual(payload["next_before_uid"], "42")
         self.assertIn("2026-04-16T07:00:00", payload["messages"][0]["date"])
@@ -380,8 +417,21 @@ class MailApiTests(TestCase):
                     size=12345,
                     disposition="attachment",
                     is_inline=False,
+                    content_id="",
+                    is_visible=True,
+                ),
+                MailAttachmentSummary(
+                    id="att_2",
+                    filename="logo.png",
+                    content_type="image/png",
+                    size=234,
+                    disposition="inline",
+                    is_inline=True,
+                    content_id="logo123",
+                    is_visible=False,
                 ),
             ),
+            has_visible_attachments=True,
         )
 
         response = self.client.get(reverse("mailops:api_mail_message_detail", kwargs={"uid": "42"}), {"folder": "INBOX"}, **headers)
@@ -393,7 +443,13 @@ class MailApiTests(TestCase):
         self.assertEqual(payload["message"]["html_body"], "<p>HTML body</p>")
         self.assertEqual(payload["message"]["attachments"][0]["id"], "att_1")
         self.assertEqual(payload["message"]["attachments"][0]["filename"], "report.pdf")
+        self.assertEqual(payload["message"]["attachments"][0]["content_id"], "")
+        self.assertTrue(payload["message"]["attachments"][0]["is_visible"])
         self.assertFalse(payload["message"]["attachments"][0]["is_inline"])
+        self.assertEqual(payload["message"]["attachments"][1]["content_id"], "logo123")
+        self.assertTrue(payload["message"]["attachments"][1]["is_inline"])
+        self.assertFalse(payload["message"]["attachments"][1]["is_visible"])
+        self.assertTrue(payload["message"]["has_visible_attachments"])
         credentials = service.get_message_detail.call_args.args[0]
         self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(service.get_message_detail.call_args.kwargs, {"folder": "INBOX", "uid": "42"})
@@ -920,6 +976,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
+        self.assertContains(schema, "/api/accounts/summaries")
         self.assertContains(schema, "/api/mail/new/")
         self.assertEqual(docs.status_code, 200)
         self.assertEqual(redoc.status_code, 200)
@@ -1018,6 +1075,26 @@ class PushApiTests(TestCase):
         self.assertEqual(device.app_version, "1.0.1")
         self.assertTrue(device.enabled)
 
+    def test_register_device_allows_same_token_for_multiple_normalized_accounts(self):
+        first_response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"account_email": " USER@Example.COM ", "fcmToken": " shared-token "},
+            content_type="application/json",
+            headers=self.auth_headers(account_email="USER@Example.COM"),
+        )
+        second_response = self.client.post(
+            reverse("mailops:register_device"),
+            data={"account_email": "SECOND@Example.COM", "fcmToken": " shared-token "},
+            content_type="application/json",
+            headers=self.auth_headers(account_email="SECOND@Example.COM"),
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(DeviceRegistration.objects.filter(fcm_token="shared-token").count(), 2)
+        self.assertTrue(DeviceRegistration.objects.filter(account_email="user@example.com", fcm_token="shared-token").exists())
+        self.assertTrue(DeviceRegistration.objects.filter(account_email="second@example.com", fcm_token="shared-token").exists())
+
     def test_register_device_rejects_account_email_mismatch(self):
         response = self.client.post(
             reverse("mailops:register_device"),
@@ -1028,6 +1105,75 @@ class PushApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["error"], "account_email_mismatch")
+
+    @patch("mailops.api.MailboxService")
+    def test_accounts_summaries_returns_fcm_linked_accounts_with_inbox_counts(self, service_class):
+        headers = self.auth_headers(account_email="USER@Example.COM")
+        create_mailbox_token("second@example.com", self.password)
+        DeviceRegistration.objects.create(
+            account_email="user@example.com",
+            fcm_token="shared-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+        DeviceRegistration.objects.create(
+            account_email="second@example.com",
+            fcm_token="shared-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+        DeviceRegistration.objects.create(
+            account_email="other@example.com",
+            fcm_token="other-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+        service_class.return_value.get_account_summary.side_effect = [
+            MailboxAccountSummary(unread_count=4, important_count=1),
+            MailboxAccountSummary(unread_count=0, important_count=2),
+        ]
+
+        response = self.client.get(
+            reverse("mailops:api_accounts_summaries"),
+            {"fcmToken": " shared-token "},
+            headers={"Authorization": headers["Authorization"]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "accounts": [
+                    {"account_email": "second@example.com", "display_name": "", "unread_count": 4, "important_count": 1},
+                    {"account_email": "user@example.com", "display_name": "", "unread_count": 0, "important_count": 2},
+                ]
+            },
+        )
+        called_emails = [call.args[0].email for call in service_class.return_value.get_account_summary.call_args_list]
+        self.assertEqual(called_emails, ["second@example.com", "user@example.com"])
+
+    def test_accounts_summaries_requires_valid_linked_fcm_token(self):
+        headers = self.auth_headers()
+        DeviceRegistration.objects.create(
+            account_email="other@example.com",
+            fcm_token="other-token",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+
+        missing = self.client.get(
+            reverse("mailops:api_accounts_summaries"),
+            headers={"Authorization": headers["Authorization"]},
+        )
+        unlinked = self.client.get(
+            reverse("mailops:api_accounts_summaries"),
+            {"fcm_token": "other-token"},
+            headers={"Authorization": headers["Authorization"]},
+        )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(unlinked.status_code, 403)
+        self.assertEqual(unlinked.json()["error"], "fcm_token_not_linked")
 
     def test_new_mail_rejects_missing_secret(self):
         response = self.client.post(reverse("mailops:new_mail"), data={}, content_type="application/json")

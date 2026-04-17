@@ -22,5 +22,6 @@ urlpatterns = [
     path("api/mail/messages/<str:uid>", api.MessageDetailView.as_view(), name="api_mail_message_detail"),
     path("api/mail/send", api.SendMailView.as_view(), name="api_mail_send"),
     path("api/devices/", api.DeviceRegistrationView.as_view(), name="register_device"),
+    path("api/accounts/summaries", api.AccountSummariesView.as_view(), name="api_accounts_summaries"),
     path("api/mail/new/", api.NewMailHookView.as_view(), name="new_mail"),
 ]

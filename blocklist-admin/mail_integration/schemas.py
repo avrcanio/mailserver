@@ -13,6 +13,32 @@ class MailFolderSummary:
     name: str
     delimiter: str | None = None
     flags: tuple[str, ...] = field(default_factory=tuple)
+    path: str = ""
+    display_name: str = ""
+    parent_path: str | None = None
+    depth: int = 0
+    selectable: bool = True
+
+    def __post_init__(self):
+        path = self.path or self.name
+        display_name = self.display_name
+        parent_path = self.parent_path
+        depth = self.depth
+        if not display_name:
+            if self.delimiter:
+                parts = path.split(self.delimiter)
+                display_name = parts[-1] if parts else path
+                if len(parts) > 1:
+                    parent_path = self.delimiter.join(parts[:-1])
+                    depth = len(parts) - 1
+            else:
+                display_name = path
+        selectable = self.selectable and not any(flag.lower() == "noselect" for flag in self.flags)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "parent_path", parent_path)
+        object.__setattr__(self, "depth", depth)
+        object.__setattr__(self, "selectable", selectable)
 
 
 @dataclass(frozen=True)
@@ -23,6 +49,8 @@ class MailAttachmentSummary:
     size: int | None = None
     disposition: str | None = None
     is_inline: bool = False
+    content_id: str = ""
+    is_visible: bool = True
 
 
 @dataclass(frozen=True)
@@ -44,6 +72,11 @@ class MailMessageSummary:
     flags: tuple[str, ...] = field(default_factory=tuple)
     size: int | None = None
     has_attachments: bool = False
+    has_visible_attachments: bool | None = None
+
+    def __post_init__(self):
+        if self.has_visible_attachments is None:
+            object.__setattr__(self, "has_visible_attachments", self.has_attachments)
 
 
 @dataclass(frozen=True)
@@ -51,6 +84,12 @@ class MailMessageSummaryPage:
     messages: tuple[MailMessageSummary, ...] = field(default_factory=tuple)
     has_more: bool = False
     next_before_uid: str | None = None
+
+
+@dataclass(frozen=True)
+class MailboxAccountSummary:
+    unread_count: int = 0
+    important_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -68,6 +107,15 @@ class MailMessageDetail:
     text_body: str = ""
     html_body: str = ""
     attachments: tuple[MailAttachmentSummary, ...] = field(default_factory=tuple)
+    has_visible_attachments: bool | None = None
+
+    def __post_init__(self):
+        if self.has_visible_attachments is None:
+            object.__setattr__(self, "has_visible_attachments", any(_attachment_is_visible(attachment) for attachment in self.attachments))
+
+
+def _attachment_is_visible(attachment):
+    return attachment.is_visible
 
 
 @dataclass(frozen=True)

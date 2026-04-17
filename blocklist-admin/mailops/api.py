@@ -28,6 +28,8 @@ from mail_integration.mailbox_service import MailboxService
 from mail_integration.schemas import MailboxCredentials, SendMailAttachment, SendMailRequest
 
 from .api_serializers import (
+    AccountSummariesResponseSerializer,
+    AccountsSummaryQuerySerializer,
     DeviceRegistrationRequestSerializer,
     DeviceRegistrationResponseSerializer,
     DeleteMessagesRequestSerializer,
@@ -149,8 +151,13 @@ def mail_error_response(exc):
 def folder_payload(folder):
     return {
         "name": folder.name,
+        "path": folder.path or folder.name,
+        "display_name": folder.display_name or folder.name,
+        "parent_path": folder.parent_path,
+        "depth": folder.depth,
         "delimiter": folder.delimiter,
         "flags": list(folder.flags),
+        "selectable": folder.selectable,
     }
 
 
@@ -167,6 +174,7 @@ def summary_payload(summary):
         "flags": list(summary.flags),
         "size": summary.size,
         "has_attachments": getattr(summary, "has_attachments", False),
+        "has_visible_attachments": getattr(summary, "has_visible_attachments", getattr(summary, "has_attachments", False)),
     }
 
 
@@ -185,12 +193,23 @@ def detail_payload(detail):
                     "size": attachment.size,
                     "disposition": attachment.disposition,
                     "is_inline": attachment.is_inline,
+                    "content_id": attachment.content_id,
+                    "is_visible": attachment.is_visible,
                 }
                 for attachment in detail.attachments
             ],
         }
     )
     return payload
+
+
+def account_summary_payload(account_email, summary):
+    return {
+        "account_email": account_email,
+        "display_name": "",
+        "unread_count": summary.unread_count,
+        "important_count": summary.important_count,
+    }
 
 
 def delete_result_payload(credentials, folder, result):
@@ -691,13 +710,14 @@ class DeviceRegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         supplied_email = data["normalized_account_email"]
-        if supplied_email and supplied_email != credentials.email:
+        normalized_account_email = credentials.email.strip().lower()
+        if supplied_email and supplied_email != normalized_account_email:
             return Response({"error": "account_email_mismatch"}, status=status.HTTP_403_FORBIDDEN)
 
         device, created = DeviceRegistration.objects.update_or_create(
+            account_email=normalized_account_email,
             fcm_token=data["normalized_fcm_token"],
             defaults={
-                "account_email": credentials.email,
                 "platform": data["normalized_platform"],
                 "app_version": data["normalized_app_version"],
                 "enabled": True,
@@ -712,6 +732,65 @@ class DeviceRegistrationView(APIView):
                 "account_email": device.account_email,
             }
         )
+
+
+class AccountSummariesView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="accounts_summaries",
+        parameters=[
+            OpenApiParameter(
+                "fcm_token",
+                str,
+                required=False,
+                description="Temporary MVP device-link lookup token. Alias: fcmToken.",
+            ),
+            OpenApiParameter(
+                "fcmToken",
+                str,
+                required=False,
+                description="Alias for fcm_token.",
+            ),
+        ],
+        responses={200: AccountSummariesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 403: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+
+        serializer = AccountsSummaryQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        fcm_token = serializer.validated_data["normalized_fcm_token"]
+        account_email = credentials.email.strip().lower()
+
+        if not DeviceRegistration.objects.filter(account_email=account_email, fcm_token=fcm_token, enabled=True).exists():
+            return Response({"error": "fcm_token_not_linked"}, status=status.HTTP_403_FORBIDDEN)
+
+        account_emails = list(
+            DeviceRegistration.objects.filter(fcm_token=fcm_token, enabled=True).order_by("account_email").values_list("account_email", flat=True)
+        )
+        credentials_by_email = {
+            credential.mailbox_email: credential
+            for credential in MailboxTokenCredential.objects.filter(mailbox_email__in=account_emails).order_by("mailbox_email")
+        }
+
+        accounts = []
+        service = MailboxService()
+        for linked_email in account_emails:
+            token_credential = credentials_by_email.get(linked_email)
+            if token_credential is None:
+                continue
+            linked_credentials = MailboxCredentials(email=token_credential.mailbox_email, password=token_credential.get_mailbox_password())
+            try:
+                summary = service.get_account_summary(linked_credentials)
+            except MailIntegrationError as exc:
+                return mail_error_response(exc)
+            accounts.append(account_summary_payload(token_credential.mailbox_email, summary))
+
+        return Response({"accounts": accounts})
 
 
 class NewMailHookView(APIView):
