@@ -266,6 +266,8 @@ Unified conversations are computed across `INBOX` and the account's Sent folder 
 
 The endpoint keeps the same response contract whether data comes from the Django mail index or from live IMAP. When a usable index exists for the authenticated mailbox, the backend serves indexed metadata first. If the index is missing, empty, stale, or not ready, the backend falls back to the live IMAP implementation.
 
+Live IMAP conversation fallback scans only the most recent `MAIL_CONVERSATION_SCAN_LIMIT` messages per folder, defaulting to `1000`, so large folders do not trigger unbounded metadata fetches.
+
 Response:
 
 ```json
@@ -337,6 +339,8 @@ python manage.py sync_mail_index --account user@finestar.hr --limit 500
 ```
 
 By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
+
+Incremental sync refreshes newer UIDs plus a recent metadata window. It does not delete indexed rows that are missing from that recent window unless `MAIL_INDEX_RECONCILE_DELETIONS=true` is explicitly enabled, because deletion reconciliation depends on the IMAP server returning a complete and trustworthy UID view for that checked window.
 
 `GET /api/mail/messages/42?folder=INBOX`
 

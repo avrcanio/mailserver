@@ -50,6 +50,7 @@ from .credential_crypto import (
     encrypt_mailbox_password,
 )
 from .mail_indexing import MailIndexService
+from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
 from .models import DeviceRegistration, MailAccountIndex, MailConversationIndex, MailMessageIndex, MailboxTokenCredential, PushNotificationLog
 
 
@@ -704,6 +705,31 @@ class MailApiTests(TestCase):
         self.assertEqual(conversation.message_count, 1)
         self.assertTrue(conversation.has_unread)
         self.assertEqual(conversation.participants_json, [{"name": "Shop", "email": "shop@example.com"}, {"name": "", "email": self.account_email}])
+
+    def test_mail_index_recent_missing_reconcile_does_not_delete_by_default(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
+        MailMessageIndex.objects.create(
+            account=account,
+            folder="INBOX",
+            uid=101,
+            direction=MailMessageIndex.DIRECTION_INBOUND,
+            thread_key="uid:101",
+            subject="Still indexed",
+            sender_raw="Sender <sender@example.com>",
+            sent_at=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            dedupe_key="uid:inbox:101",
+        )
+        touched_thread_keys = set()
+
+        reconcile_recent_missing_messages(
+            account,
+            FolderSyncResult(folder="INBOX", present_uids=(102, 103)),
+            touched_thread_keys,
+        )
+
+        self.assertTrue(MailMessageIndex.objects.filter(account=account, uid=101).exists())
+        self.assertEqual(touched_thread_keys, set())
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_detail_returns_service_result(self, service_class):

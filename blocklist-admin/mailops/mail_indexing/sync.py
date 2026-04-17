@@ -250,6 +250,8 @@ def upsert_message(account, summary, thread_key, sent_folder):
 
 
 def reconcile_recent_missing_messages(account, folder_result, touched_thread_keys):
+    if not getattr(settings, "MAIL_INDEX_RECONCILE_DELETIONS", False):
+        return
     if not folder_result.present_uids:
         return
     indexed_recent = account.messages.filter(folder=folder_result.folder, uid__lte=max(folder_result.present_uids), uid__gte=min(folder_result.present_uids))

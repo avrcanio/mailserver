@@ -524,6 +524,23 @@ class ImapClientTests(SimpleTestCase):
         self.assertEqual(len(page.conversations), 1)
         self.assertEqual(connection.uid.call_count, 4)
 
+    @override_settings(MAIL_CONVERSATION_SCAN_LIMIT=2)
+    def test_fetch_conversation_page_uses_configured_scan_cap(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"4"])
+        connection.uid.side_effect = [
+            ("OK", [b"301 302 303 304"]),
+            _conversation_fetch("304", subject="Newest", sender="a@example.com", to="user@example.com", message_id="<304@example.com>"),
+            _conversation_fetch("303", subject="Next", sender="b@example.com", to="user@example.com", message_id="<303@example.com>"),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_conversation_page(folder="INBOX", limit=10)
+
+        returned_uids = sorted(conversation.root_message.uid for conversation in page.conversations)
+        self.assertEqual(returned_uids, ["303", "304"])
+        self.assertEqual(connection.uid.call_count, 3)
+
     def test_fetch_unified_conversation_page_groups_inbox_and_sent_with_directions(self):
         connection = Mock()
         connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Sent) "/" "Sent"'])

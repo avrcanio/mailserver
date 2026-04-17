@@ -277,7 +277,7 @@ class ImapClient:
         return tuple(_extract_message_parts(message)[2])
 
     def _fetch_conversation_summaries(self, folder):
-        return list(self.fetch_recent_conversation_summaries(folder=folder, limit=1000000))
+        return list(self.fetch_recent_conversation_summaries(folder=folder, limit=_conversation_scan_limit()))
 
     def _search_undeleted_uid_ints(self, folder):
         connection = self._require_connection()
@@ -777,6 +777,13 @@ def _uid_int(uid):
         return int(uid)
     except (TypeError, ValueError):
         return 0
+
+
+def _conversation_scan_limit():
+    try:
+        return max(1, int(getattr(settings, "MAIL_CONVERSATION_SCAN_LIMIT", 1000)))
+    except (TypeError, ValueError):
+        return 1000
 
 
 def _message_id_values(value):
