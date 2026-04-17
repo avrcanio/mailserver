@@ -32,6 +32,9 @@ from .schemas import (
     MailMessageRestoreResult,
     MailMessageSummary,
     MailMessageSummaryPage,
+    MailUnifiedConversationSummary,
+    MailUnifiedConversationSummaryPage,
+    MailUnifiedMessageSummary,
 )
 
 
@@ -174,30 +177,10 @@ class ImapClient:
             raise MailProtocolError(f"IMAP summary fetch failed for {folder}") from exc
 
     def fetch_conversation_page(self, folder="INBOX", limit=50):
-        connection = self._require_connection()
-        self.select_folder(folder, readonly=True)
         if limit < 1:
             return MailConversationSummaryPage()
         try:
-            status, data = connection.uid("search", None, "UNDELETED")
-            self._expect_ok(status, data, f"IMAP conversation search failed for {folder}")
-            uids = _parse_uid_list(data[0] or b"")
-            summaries = []
-            for uid_int in reversed(uids):
-                uid = str(uid_int).encode("ascii")
-                status, fetch_data = connection.uid(
-                    "fetch",
-                    uid,
-                    "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])",
-                )
-                self._expect_ok(status, fetch_data, f"IMAP conversation fetch failed for UID {uid.decode()}")
-                summary = _parse_summary_response(folder, uid.decode(), fetch_data)
-                if summary.has_visible_attachments and _summary_needs_visible_attachment_refinement(fetch_data):
-                    status, full_fetch_data = connection.uid("fetch", uid, "(FLAGS RFC822.SIZE RFC822)")
-                    self._expect_ok(status, full_fetch_data, f"IMAP conversation visibility fetch failed for UID {uid.decode()}")
-                    detail = _parse_detail_response(folder, uid.decode(), full_fetch_data)
-                    summary = replace(summary, has_visible_attachments=detail.has_visible_attachments)
-                summaries.append(summary)
+            summaries = self._fetch_conversation_summaries(folder)
             return _build_conversation_page(folder, summaries, limit)
         except socket.timeout as exc:
             raise MailTimeoutError(f"Timed out fetching IMAP conversations for {folder}") from exc
@@ -207,6 +190,75 @@ class ImapClient:
             raise MailProtocolError(f"IMAP conversation fetch failed for {folder}: {exc}") from exc
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP conversation fetch failed for {folder}") from exc
+
+    def fetch_unified_conversation_page(self, account_email, limit=50):
+        if limit < 1:
+            return MailUnifiedConversationSummaryPage(folders=("INBOX",))
+        try:
+            sent_folder = self._resolve_sent_folder()
+            folders = ("INBOX",)
+            if sent_folder and not _same_folder(sent_folder, "INBOX"):
+                folders = ("INBOX", sent_folder)
+            summaries_by_folder = {folder: self._fetch_conversation_summaries(folder) for folder in folders}
+            return _build_unified_conversation_page(
+                folders=folders,
+                sent_folder=sent_folder,
+                account_email=account_email,
+                summaries_by_folder=summaries_by_folder,
+                limit=limit,
+            )
+        except socket.timeout as exc:
+            raise MailTimeoutError("Timed out fetching IMAP unified conversations") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP unified conversation fetch connection failure: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP unified conversation fetch failed: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError("IMAP unified conversation fetch failed") from exc
+
+    def fetch_folder_uidvalidity(self, folder):
+        connection = self._require_connection()
+        try:
+            self.select_folder(folder, readonly=True)
+            _, data = connection.response("UIDVALIDITY")
+            if not data:
+                return ""
+            return _safe_decode(data[-1]).strip()
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching IMAP UIDVALIDITY for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP UIDVALIDITY fetch connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP UIDVALIDITY fetch failed for {folder}") from exc
+
+    def fetch_recent_conversation_summaries(self, folder="INBOX", limit=100):
+        if limit < 1:
+            return tuple()
+        try:
+            uids = self._search_undeleted_uid_ints(folder)
+            return tuple(self._fetch_conversation_summaries_for_uid_ints(folder, reversed(uids[-limit:]), select_folder=False))
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching recent IMAP index summaries for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP recent index summary fetch connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP recent index summary fetch failed for {folder}") from exc
+
+    def fetch_conversation_summaries_since_uid(self, folder="INBOX", min_uid=0, limit=500):
+        if limit < 1:
+            return tuple()
+        try:
+            min_uid_int = _parse_positive_uid(min_uid) if min_uid else 0
+            uids = [uid for uid in self._search_undeleted_uid_ints(folder) if uid > min_uid_int]
+            return tuple(self._fetch_conversation_summaries_for_uid_ints(folder, reversed(uids[-limit:]), select_folder=False))
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out fetching incremental IMAP index summaries for {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP incremental index summary fetch connection failure for {folder}: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}") from exc
 
     def fetch_message_detail(self, folder, uid):
         metadata, message = self._fetch_full_message(folder, uid)
@@ -223,6 +275,38 @@ class ImapClient:
     def fetch_attachments(self, folder, uid):
         _, message = self._fetch_full_message(folder, uid)
         return tuple(_extract_message_parts(message)[2])
+
+    def _fetch_conversation_summaries(self, folder):
+        return list(self.fetch_recent_conversation_summaries(folder=folder, limit=1000000))
+
+    def _search_undeleted_uid_ints(self, folder):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=True)
+        status, data = connection.uid("search", None, "UNDELETED")
+        self._expect_ok(status, data, f"IMAP conversation search failed for {folder}")
+        return _parse_uid_list(data[0] or b"")
+
+    def _fetch_conversation_summaries_for_uid_ints(self, folder, uid_ints, select_folder=True):
+        connection = self._require_connection()
+        if select_folder:
+            self.select_folder(folder, readonly=True)
+        summaries = []
+        for uid_int in uid_ints:
+            uid = str(uid_int).encode("ascii")
+            status, fetch_data = connection.uid(
+                "fetch",
+                uid,
+                "(FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])",
+            )
+            self._expect_ok(status, fetch_data, f"IMAP conversation fetch failed for UID {uid.decode()}")
+            summary = _parse_summary_response(folder, uid.decode(), fetch_data)
+            if summary.has_visible_attachments and _summary_needs_visible_attachment_refinement(fetch_data):
+                status, full_fetch_data = connection.uid("fetch", uid, "(FLAGS RFC822.SIZE RFC822)")
+                self._expect_ok(status, full_fetch_data, f"IMAP conversation visibility fetch failed for UID {uid.decode()}")
+                detail = _parse_detail_response(folder, uid.decode(), full_fetch_data)
+                summary = replace(summary, has_visible_attachments=detail.has_visible_attachments)
+            summaries.append(summary)
+        return summaries
 
     def _fetch_full_message(self, folder, uid):
         connection = self._require_connection()
@@ -290,6 +374,17 @@ class ImapClient:
             if candidate in folder_by_lower_name:
                 return folder_by_lower_name[candidate]
         raise MailProtocolError("Could not resolve IMAP Trash folder")
+
+    def _resolve_sent_folder(self):
+        folders = [folder for folder in self.list_folders() if folder.selectable]
+        for folder in folders:
+            if any(flag.lower() == "sent" for flag in folder.flags):
+                return folder.name
+        folder_by_lower_name = {folder.name.lower(): folder.name for folder in folders}
+        for candidate in ("sent", "inbox/sent", "inbox.sent", "sent messages"):
+            if candidate in folder_by_lower_name:
+                return folder_by_lower_name[candidate]
+        return None
 
     def _search_count(self, criterion):
         connection = self._require_connection()
@@ -450,6 +545,126 @@ def _build_conversation_page(folder, summaries, limit):
         )
     conversations.sort(key=_conversation_sort_key)
     return MailConversationSummaryPage(conversations=tuple(conversations[:limit]))
+
+
+def _build_unified_conversation_page(folders, sent_folder, account_email, summaries_by_folder, limit):
+    items = []
+    for folder in folders:
+        for summary in summaries_by_folder.get(folder, ()):
+            items.append(MailUnifiedMessageSummary(summary=summary, direction=_folder_direction(summary.folder, sent_folder)))
+    message_ids = {}
+    for item in items:
+        message_id = _normalize_message_id(item.summary.message_id)
+        if message_id and message_id not in message_ids:
+            message_ids[message_id] = item.summary
+
+    conversations_by_key = defaultdict(list)
+    for item in items:
+        conversations_by_key[_conversation_key(item.summary, message_ids)].append(item)
+
+    conversations = []
+    for key, grouped_items in conversations_by_key.items():
+        deduped_items = _dedupe_unified_items(grouped_items, account_email, sent_folder)
+        if not deduped_items:
+            continue
+        ordered_items = tuple(sorted(deduped_items, key=_unified_item_sort_key))
+        latest_item = max(ordered_items, key=lambda item: _message_activity_key(item.summary))
+        conversations.append(
+            MailUnifiedConversationSummary(
+                conversation_id=_unified_conversation_id(key),
+                message_count=len(ordered_items),
+                reply_count=max(0, len(ordered_items) - 1),
+                has_unread=any(item.direction == "inbound" and not _message_is_seen(item.summary) for item in ordered_items),
+                has_attachments=any(item.summary.has_attachments for item in ordered_items),
+                has_visible_attachments=any(item.summary.has_visible_attachments for item in ordered_items),
+                participants=_conversation_participants(tuple(item.summary for item in ordered_items)),
+                messages=ordered_items,
+                latest_date=latest_item.summary.date,
+            )
+        )
+    conversations.sort(key=_unified_conversation_sort_key)
+    return MailUnifiedConversationSummaryPage(folders=tuple(folders), conversations=tuple(conversations[:limit]))
+
+
+def _dedupe_unified_items(items, account_email, sent_folder):
+    best_by_key = {}
+    for item in items:
+        key = _unified_dedupe_key(item.summary)
+        current = best_by_key.get(key)
+        if current is None or _prefer_unified_item(item, current, account_email, sent_folder):
+            best_by_key[key] = item
+    return tuple(best_by_key.values())
+
+
+def _unified_dedupe_key(summary):
+    message_id = _normalize_message_id(summary.message_id)
+    if message_id:
+        return ("message-id", message_id)
+    return ("folder-uid", str(summary.folder).strip().lower(), str(summary.uid))
+
+
+def _prefer_unified_item(candidate, current, account_email, sent_folder):
+    inferred = _infer_message_direction(candidate.summary, account_email)
+    if inferred:
+        candidate_matches = candidate.direction == inferred
+        current_matches = current.direction == inferred
+        if candidate_matches != current_matches:
+            return candidate_matches
+    return _unified_item_preference_key(candidate, sent_folder) < _unified_item_preference_key(current, sent_folder)
+
+
+def _infer_message_direction(summary, account_email):
+    normalized_account = str(account_email or "").strip().lower()
+    if not normalized_account:
+        return None
+    sender_email = _first_email(summary.sender)
+    if sender_email == normalized_account:
+        return "outbound"
+    recipients = set()
+    for value in (*summary.to, *summary.cc):
+        recipients.update(email for _, email in getaddresses([value]))
+    if normalized_account in {str(email or "").strip().lower() for email in recipients}:
+        return "inbound"
+    return None
+
+
+def _first_email(value):
+    addresses = getaddresses([str(value or "")])
+    if not addresses:
+        return ""
+    return str(addresses[0][1] or "").strip().lower()
+
+
+def _unified_item_preference_key(item, sent_folder):
+    if _same_folder(item.summary.folder, "INBOX"):
+        folder_priority = 0
+    elif sent_folder and _same_folder(item.summary.folder, sent_folder):
+        folder_priority = 1
+    else:
+        folder_priority = 2
+    return (folder_priority, _uid_int(item.summary.uid))
+
+
+def _folder_direction(folder, sent_folder):
+    if sent_folder and _same_folder(folder, sent_folder):
+        return "outbound"
+    return "inbound"
+
+
+def _unified_item_sort_key(item):
+    direction_order = 0 if item.direction == "inbound" else 1
+    timestamp, uid = _message_age_key(item.summary)
+    return (timestamp, direction_order, uid)
+
+
+def _unified_conversation_id(key):
+    return hashlib.sha256(f"unified\0{key}".encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _unified_conversation_sort_key(conversation):
+    latest_item = max(conversation.messages, key=lambda item: _message_activity_key(item.summary))
+    latest_timestamp = latest_item.summary.date.timestamp() if latest_item.summary.date else 0
+    return (-latest_timestamp, -_uid_int(latest_item.summary.uid))
 
 
 def _conversation_key(summary, message_ids):

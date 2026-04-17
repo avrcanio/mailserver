@@ -162,6 +162,28 @@ class ConversationListResponseSerializer(serializers.Serializer):
     conversations = ConversationSerializer(many=True)
 
 
+class UnifiedMessageSummarySerializer(MessageSummarySerializer):
+    direction = serializers.ChoiceField(choices=("inbound", "outbound"))
+
+
+class UnifiedConversationSerializer(serializers.Serializer):
+    conversation_id = serializers.CharField()
+    message_count = serializers.IntegerField()
+    reply_count = serializers.IntegerField()
+    has_unread = serializers.BooleanField()
+    has_attachments = serializers.BooleanField()
+    has_visible_attachments = serializers.BooleanField()
+    participants = ConversationParticipantSerializer(many=True)
+    latest_date = serializers.DateTimeField(allow_null=True)
+    messages = UnifiedMessageSummarySerializer(many=True)
+
+
+class UnifiedConversationListResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folders = serializers.ListField(child=serializers.CharField())
+    conversations = UnifiedConversationSerializer(many=True)
+
+
 class MessageDetailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folder = serializers.CharField()

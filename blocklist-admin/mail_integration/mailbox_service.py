@@ -40,6 +40,17 @@ class MailboxService:
             client.login(credentials)
             return client.fetch_conversation_page(folder=folder, limit=limit)
 
+    def list_unified_conversations(self, credentials, limit=50, user=None):
+        if user is not None:
+            from mailops.mail_indexing import MailIndexService
+
+            indexed_page = MailIndexService().get_unified_conversation_page(user=user, account_email=credentials.email, limit=limit)
+            if indexed_page is not None:
+                return indexed_page
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.fetch_unified_conversation_page(account_email=credentials.email, limit=limit)
+
     def get_message_detail(self, credentials, folder, uid):
         with self.imap_client_factory() as client:
             client.login(credentials)

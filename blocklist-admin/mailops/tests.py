@@ -22,6 +22,7 @@ from mail_integration.exceptions import (
     MailInvalidOperationError,
     MailSendError,
 )
+from mail_integration.mailbox_service import MailboxService
 from mail_integration.schemas import (
     MailAttachmentContent,
     MailAttachmentSummary,
@@ -30,6 +31,9 @@ from mail_integration.schemas import (
     MailConversationSummary,
     MailConversationSummaryPage,
     MailFolderSummary,
+    MailUnifiedConversationSummary,
+    MailUnifiedConversationSummaryPage,
+    MailUnifiedMessageSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
     MailMessageMoveToTrashResult,
@@ -45,7 +49,8 @@ from .credential_crypto import (
     decrypt_mailbox_password,
     encrypt_mailbox_password,
 )
-from .models import DeviceRegistration, MailboxTokenCredential, PushNotificationLog
+from .mail_indexing import MailIndexService
+from .models import DeviceRegistration, MailAccountIndex, MailConversationIndex, MailMessageIndex, MailboxTokenCredential, PushNotificationLog
 
 
 TEST_ENCRYPTION_KEY = "DhbKZLv4bil01DI7X2u09Q69vebV7py6A9m9q0gOCfg="
@@ -493,6 +498,212 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"], "mail_connection_failed")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_unified_conversations_returns_timeline_messages_with_directions(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        service = service_class.return_value
+        inbound = MailMessageSummary(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender Name <sender@example.com>",
+            to=("user@example.com",),
+            cc=(),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+            flags=("Seen",),
+            size=1234,
+            has_attachments=False,
+            has_visible_attachments=False,
+        )
+        outbound = MailMessageSummary(
+            uid="7",
+            folder="Sent",
+            subject="Re: Hello",
+            sender="User <user@example.com>",
+            to=("sender@example.com",),
+            cc=(),
+            date=datetime(2026, 4, 16, 8, 0, tzinfo=dt_timezone.utc),
+            message_id="<m2@example.com>",
+            flags=(),
+            size=2345,
+            has_attachments=True,
+            has_visible_attachments=True,
+        )
+        service.list_unified_conversations.return_value = MailUnifiedConversationSummaryPage(
+            folders=("INBOX", "Sent"),
+            conversations=(
+                MailUnifiedConversationSummary(
+                    conversation_id="thread-1",
+                    message_count=2,
+                    reply_count=1,
+                    has_unread=False,
+                    has_attachments=True,
+                    has_visible_attachments=True,
+                    participants=(MailConversationParticipant(name="Sender Name", email="sender@example.com"),),
+                    messages=(
+                        MailUnifiedMessageSummary(summary=inbound, direction="inbound"),
+                        MailUnifiedMessageSummary(summary=outbound, direction="outbound"),
+                    ),
+                    latest_date=datetime(2026, 4, 16, 8, 0, tzinfo=dt_timezone.utc),
+                ),
+            ),
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_unified_conversations"), {"limit": 25}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        conversation = payload["conversations"][0]
+        self.assertEqual(payload["folders"], ["INBOX", "Sent"])
+        self.assertEqual(conversation["participants"], [{"name": "Sender Name", "email": "sender@example.com"}])
+        self.assertFalse(conversation["has_unread"])
+        self.assertTrue(conversation["has_attachments"])
+        self.assertTrue(conversation["has_visible_attachments"])
+        self.assertEqual([message["folder"] for message in conversation["messages"]], ["INBOX", "Sent"])
+        self.assertEqual([message["uid"] for message in conversation["messages"]], ["42", "7"])
+        self.assertEqual([message["direction"] for message in conversation["messages"]], ["inbound", "outbound"])
+        self.assertEqual(service.list_unified_conversations.call_args.kwargs, {"limit": 25, "user": token.user})
+
+    def test_mail_unified_conversations_requires_token_and_validates_limit(self):
+        missing_token = self.client.get(reverse("mailops:api_mail_unified_conversations"))
+        headers = self.auth_headers()
+        invalid_limit = self.client.get(reverse("mailops:api_mail_unified_conversations"), {"limit": 500}, **headers)
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(invalid_limit.status_code, 400)
+        self.assertEqual(invalid_limit.json()["error"], "invalid_limit")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_unified_conversations_maps_mail_errors(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.list_unified_conversations.side_effect = MailConnectionError("down")
+
+        response = self.client.get(reverse("mailops:api_mail_unified_conversations"), **headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "mail_connection_failed")
+
+    def test_mail_unified_conversations_reads_usable_index_before_live_imap(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        inbound = MailMessageSummary(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender Name <sender@example.com>",
+            to=(self.account_email,),
+            cc=(),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+            flags=("Seen",),
+            size=1234,
+            has_attachments=False,
+            has_visible_attachments=False,
+        )
+        outbound = MailMessageSummary(
+            uid="7",
+            folder="Sent",
+            subject="Re: Hello",
+            sender=f"User <{self.account_email}>",
+            to=("sender@example.com",),
+            cc=(),
+            date=datetime(2026, 4, 16, 8, 0, tzinfo=dt_timezone.utc),
+            message_id="<m2@example.com>",
+            in_reply_to=("<m1@example.com>",),
+            references=("<m1@example.com>",),
+            flags=(),
+            size=2345,
+            has_attachments=True,
+            has_visible_attachments=True,
+        )
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (inbound,), "Sent": (outbound,)},
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_unified_conversations"), {"limit": 25}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        conversation = payload["conversations"][0]
+        self.assertEqual(payload["folders"], ["INBOX", "Sent"])
+        self.assertEqual(conversation["participants"], [{"name": "Sender Name", "email": "sender@example.com"}, {"name": "", "email": self.account_email}])
+        self.assertEqual([message["folder"] for message in conversation["messages"]], ["INBOX", "Sent"])
+        self.assertEqual([message["uid"] for message in conversation["messages"]], ["42", "7"])
+        self.assertEqual([message["direction"] for message in conversation["messages"]], ["inbound", "outbound"])
+        self.assertTrue(conversation["has_attachments"])
+        self.assertTrue(conversation["has_visible_attachments"])
+
+    def test_mailbox_service_falls_back_to_live_imap_when_index_missing(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        credentials = mailbox_credentials_from_request(Mock(auth=token))
+        imap_client = Mock()
+        imap_client.__enter__ = Mock(return_value=Mock())
+        imap_client.__exit__ = Mock(return_value=None)
+        entered = imap_client.__enter__.return_value
+        entered.fetch_unified_conversation_page.return_value = MailUnifiedConversationSummaryPage(folders=("INBOX",), conversations=())
+
+        page = MailboxService(imap_client_factory=lambda: imap_client).list_unified_conversations(credentials, limit=6, user=token.user)
+
+        self.assertEqual(page.folders, ("INBOX",))
+        entered.login.assert_called_once_with(credentials)
+        entered.fetch_unified_conversation_page.assert_called_once_with(account_email=self.account_email, limit=6)
+
+    def test_mail_index_upsert_is_idempotent_and_dedupes_duplicate_message_ids(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        inbound = MailMessageSummary(
+            uid="101",
+            folder="INBOX",
+            subject="Receipt",
+            sender="Shop <shop@example.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<same@example.com>",
+            flags=(),
+            size=100,
+            has_attachments=True,
+            has_visible_attachments=True,
+        )
+        sent_copy = MailMessageSummary(
+            uid="202",
+            folder="Sent",
+            subject="Receipt",
+            sender="Shop <shop@example.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<same@example.com>",
+            flags=("Seen",),
+            size=100,
+            has_attachments=True,
+            has_visible_attachments=True,
+        )
+
+        service = MailIndexService()
+        service.index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (inbound,), "Sent": (sent_copy,)},
+        )
+        service.index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (inbound,), "Sent": (sent_copy,)},
+        )
+
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        conversation = MailConversationIndex.objects.get(account=account)
+        self.assertEqual(MailMessageIndex.objects.filter(account=account).count(), 2)
+        self.assertEqual(conversation.message_count, 1)
+        self.assertTrue(conversation.has_unread)
+        self.assertEqual(conversation.participants_json, [{"name": "Shop", "email": "shop@example.com"}, {"name": "", "email": self.account_email}])
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_detail_returns_service_result(self, service_class):
@@ -1163,6 +1374,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/{uid}/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
         self.assertContains(schema, "/api/mail/conversations")
+        self.assertContains(schema, "/api/mail/unified-conversations")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/accounts/summaries")

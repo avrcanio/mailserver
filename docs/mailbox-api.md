@@ -258,6 +258,86 @@ Threading rules:
 - Replies are sorted chronologically after the root, then by lower UID. Conversations are sorted by latest activity descending.
 - `has_attachments` is true when any message in the conversation has any attachment-like MIME part. `has_visible_attachments` is true when any message has at least one visible attachment.
 
+## Unified Conversations
+
+`GET /api/mail/unified-conversations?limit=50`
+
+Unified conversations are computed across `INBOX` and the account's Sent folder so the client can render a full inbound/outbound timeline. `limit` defaults to `50`, accepts `1` through `200`, and applies to the number of conversations returned. The backend may fetch or scan more than `limit` messages internally.
+
+The endpoint keeps the same response contract whether data comes from the Django mail index or from live IMAP. When a usable index exists for the authenticated mailbox, the backend serves indexed metadata first. If the index is missing, empty, stale, or not ready, the backend falls back to the live IMAP implementation.
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folders": ["INBOX", "Sent"],
+  "conversations": [
+    {
+      "conversation_id": "thread-hash",
+      "message_count": 2,
+      "reply_count": 1,
+      "has_unread": false,
+      "has_attachments": true,
+      "has_visible_attachments": true,
+      "participants": [
+        {
+          "name": "Sender Name",
+          "email": "sender@example.com"
+        }
+      ],
+      "latest_date": "2026-04-16T08:00:00Z",
+      "messages": [
+        {
+          "uid": "42",
+          "folder": "INBOX",
+          "direction": "inbound",
+          "subject": "Hello",
+          "sender": "Sender Name <sender@example.com>",
+          "to": ["user@finestar.hr"],
+          "cc": [],
+          "date": "2026-04-16T07:00:00Z",
+          "message_id": "<root@example.com>",
+          "flags": ["Seen"],
+          "size": 1234,
+          "has_attachments": false,
+          "has_visible_attachments": false
+        },
+        {
+          "uid": "7",
+          "folder": "Sent",
+          "direction": "outbound",
+          "subject": "Re: Hello",
+          "sender": "User <user@finestar.hr>",
+          "to": ["sender@example.com"],
+          "cc": [],
+          "date": "2026-04-16T08:00:00Z",
+          "message_id": "<reply@example.com>",
+          "flags": [],
+          "size": 2345,
+          "has_attachments": true,
+          "has_visible_attachments": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+The backend resolves the Sent folder by special-use `\Sent` flag first, then common names such as `Sent`, `INBOX/Sent`, `INBOX.Sent`, and `Sent Messages`. If Sent cannot be resolved, the endpoint returns INBOX-only unified conversations and `folders: ["INBOX"]`.
+
+Threading uses the same ID-first rules as folder-local conversations, but the deterministic `conversation_id` is independent of source folder so matching INBOX/Sent messages appear in one thread. Each message keeps its original `folder` and `uid`; clients must use those values for detail and message actions.
+
+Duplicate messages with the same normalized `Message-ID` are rendered once. When possible, the backend infers logical direction from sender/recipient data and keeps the copy whose folder matches that direction: inbound prefers `INBOX`, outbound prefers Sent. If direction cannot be inferred confidently, a stable folder/UID tie-break is used. `has_unread` considers inbound messages only; Sent messages do not create unread state.
+
+Indexing can be refreshed operationally with:
+
+```bash
+python manage.py sync_mail_index --account user@finestar.hr --limit 500
+```
+
+By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
+
 `GET /api/mail/messages/42?folder=INBOX`
 
 Response:

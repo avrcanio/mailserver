@@ -29,6 +29,7 @@ from .schemas import (
     MailConversationParticipant,
     MailConversationSummary,
     MailConversationSummaryPage,
+    MailUnifiedConversationSummaryPage,
     SendMailAttachment,
     SendMailRequest,
 )
@@ -522,6 +523,112 @@ class ImapClientTests(SimpleTestCase):
 
         self.assertEqual(len(page.conversations), 1)
         self.assertEqual(connection.uid.call_count, 4)
+
+    def test_fetch_unified_conversation_page_groups_inbox_and_sent_with_directions(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Sent) "/" "Sent"'])
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"101"]),
+            _conversation_fetch(
+                "101",
+                subject="Project",
+                sender="Alice <alice@example.com>",
+                to="User <user@example.com>",
+                date="Thu, 16 Apr 2026 07:00:00 +0000",
+                message_id="<root@example.com>",
+                flags="\\Seen",
+            ),
+            ("OK", [b"201"]),
+            _conversation_fetch(
+                "201",
+                subject="Re: Project",
+                sender="User <user@example.com>",
+                to="Alice <alice@example.com>",
+                date="Thu, 16 Apr 2026 08:00:00 +0000",
+                message_id="<reply@example.com>",
+                in_reply_to="<root@example.com>",
+                references="<root@example.com>",
+                flags="",
+                attach=True,
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_unified_conversation_page(account_email="user@example.com", limit=10)
+
+        self.assertEqual(page.folders, ("INBOX", "Sent"))
+        self.assertEqual(len(page.conversations), 1)
+        conversation = page.conversations[0]
+        self.assertEqual([item.summary.folder for item in conversation.messages], ["INBOX", "Sent"])
+        self.assertEqual([item.summary.uid for item in conversation.messages], ["101", "201"])
+        self.assertEqual([item.direction for item in conversation.messages], ["inbound", "outbound"])
+        self.assertFalse(conversation.has_unread)
+        self.assertTrue(conversation.has_attachments)
+        self.assertTrue(conversation.has_visible_attachments)
+
+    def test_fetch_unified_conversation_page_dedupes_by_inferred_direction(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Sent) "/" "Sent"'])
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"101"]),
+            _conversation_fetch(
+                "101",
+                subject="Inbound duplicate",
+                sender="Alice <alice@example.com>",
+                to="User <user@example.com>",
+                date="Thu, 16 Apr 2026 07:00:00 +0000",
+                message_id="<dup-in@example.com>",
+            ),
+            ("OK", [b"201 202"]),
+            _conversation_fetch(
+                "202",
+                subject="Outbound duplicate",
+                sender="User <user@example.com>",
+                to="Alice <alice@example.com>",
+                date="Thu, 16 Apr 2026 08:00:00 +0000",
+                message_id="<dup-out@example.com>",
+            ),
+            _conversation_fetch(
+                "201",
+                subject="Inbound duplicate",
+                sender="Alice <alice@example.com>",
+                to="User <user@example.com>",
+                date="Thu, 16 Apr 2026 07:00:00 +0000",
+                message_id="<dup-in@example.com>",
+            ),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_unified_conversation_page(account_email="user@example.com", limit=10)
+
+        messages_by_id = {
+            conversation.messages[0].summary.message_id: conversation.messages[0]
+            for conversation in page.conversations
+            if conversation.messages
+        }
+        self.assertEqual(messages_by_id["<dup-in@example.com>"].summary.folder, "INBOX")
+        self.assertEqual(messages_by_id["<dup-in@example.com>"].direction, "inbound")
+        self.assertEqual(messages_by_id["<dup-out@example.com>"].summary.folder, "Sent")
+        self.assertEqual(messages_by_id["<dup-out@example.com>"].direction, "outbound")
+
+    def test_fetch_unified_conversation_page_falls_back_when_sent_folder_missing(self):
+        connection = Mock()
+        connection.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"'])
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [
+            ("OK", [b"101"]),
+            _conversation_fetch("101", subject="Inbox only", sender="Alice <alice@example.com>", to="user@example.com", message_id="<m1@example.com>"),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().fetch_unified_conversation_page(account_email="user@example.com", limit=10)
+
+        self.assertEqual(page.folders, ("INBOX",))
+        self.assertEqual(len(page.conversations), 1)
+        self.assertEqual(page.conversations[0].messages[0].direction, "inbound")
+        connection.select.assert_called_once_with(b'"INBOX"', readonly=True)
 
     def test_fetch_message_summary_page_empty_when_no_older_messages_remain(self):
         connection = Mock()
@@ -1195,6 +1302,7 @@ class MailboxServiceTests(SimpleTestCase):
         entered.fetch_account_summary.return_value = MailboxAccountSummary(unread_count=2, important_count=1)
         entered.fetch_message_summary_page.return_value = "summary-page"
         entered.fetch_conversation_page.return_value = "conversation-page"
+        entered.fetch_unified_conversation_page.return_value = "unified-conversation-page"
         entered.fetch_message_detail.return_value = "detail"
         entered.fetch_attachment.return_value = "attachment"
         entered.fetch_attachments.return_value = "attachments"
@@ -1208,17 +1316,19 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.get_account_summary(credentials), MailboxAccountSummary(unread_count=2, important_count=1))
         self.assertEqual(service.list_message_summary_page(credentials, folder="Archive", limit=10, before_uid="99"), "summary-page")
         self.assertEqual(service.list_conversations(credentials, folder="Archive", limit=5), "conversation-page")
+        self.assertEqual(service.list_unified_conversations(credentials, limit=6), "unified-conversation-page")
         self.assertEqual(service.get_message_detail(credentials, folder="Archive", uid="99"), "detail")
         self.assertEqual(service.get_attachment(credentials, folder="Archive", uid="99", attachment_id="att_1"), "attachment")
         self.assertEqual(service.get_attachments(credentials, folder="Archive", uid="99"), "attachments")
         self.assertEqual(service.move_messages_to_trash(credentials, folder="Archive", uids=("99",)), "move-result")
         self.assertEqual(service.restore_messages_from_trash(credentials, folder="Trash", target_folder="INBOX", uids=("99",)), "restore-result")
-        self.assertEqual(entered.login.call_count, 10)
+        self.assertEqual(entered.login.call_count, 11)
         entered.login.assert_called_with(credentials)
         entered.fetch_message_summaries.assert_called_once_with(folder="Archive", limit=10)
         entered.fetch_account_summary.assert_called_once_with()
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_conversation_page.assert_called_once_with(folder="Archive", limit=5)
+        entered.fetch_unified_conversation_page.assert_called_once_with(account_email="user@example.com", limit=6)
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
         entered.fetch_attachment.assert_called_once_with(folder="Archive", uid="99", attachment_id="att_1")
         entered.fetch_attachments.assert_called_once_with(folder="Archive", uid="99")

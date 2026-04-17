@@ -114,6 +114,31 @@ class MailConversationSummaryPage:
 
 
 @dataclass(frozen=True)
+class MailUnifiedMessageSummary:
+    summary: MailMessageSummary
+    direction: str
+
+
+@dataclass(frozen=True)
+class MailUnifiedConversationSummary:
+    conversation_id: str
+    message_count: int
+    reply_count: int
+    has_unread: bool
+    has_attachments: bool
+    has_visible_attachments: bool
+    participants: tuple[MailConversationParticipant, ...]
+    messages: tuple[MailUnifiedMessageSummary, ...] = field(default_factory=tuple)
+    latest_date: datetime | None = None
+
+
+@dataclass(frozen=True)
+class MailUnifiedConversationSummaryPage:
+    folders: tuple[str, ...] = field(default_factory=tuple)
+    conversations: tuple[MailUnifiedConversationSummary, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class MailboxAccountSummary:
     unread_count: int = 0
     important_count: int = 0

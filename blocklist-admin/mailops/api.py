@@ -52,6 +52,7 @@ from .api_serializers import (
     SendMailMultipartRequestSerializer,
     SendMailRequestSerializer,
     SendMailResponseSerializer,
+    UnifiedConversationListResponseSerializer,
 )
 from .models import DeviceRegistration, MailboxTokenCredential
 from .services import send_mail_notification
@@ -223,6 +224,32 @@ def conversation_payload(conversation):
         "root_message": summary_payload(conversation.root_message),
         "replies": [summary_payload(reply) for reply in conversation.replies],
         "latest_date": conversation.latest_date,
+    }
+
+
+def unified_message_payload(message):
+    payload = summary_payload(message.summary)
+    payload["direction"] = message.direction
+    return payload
+
+
+def unified_conversation_payload(conversation):
+    return {
+        "conversation_id": conversation.conversation_id,
+        "message_count": conversation.message_count,
+        "reply_count": conversation.reply_count,
+        "has_unread": conversation.has_unread,
+        "has_attachments": conversation.has_attachments,
+        "has_visible_attachments": conversation.has_visible_attachments,
+        "participants": [
+            {
+                "name": participant.name,
+                "email": participant.email,
+            }
+            for participant in conversation.participants
+        ],
+        "latest_date": conversation.latest_date,
+        "messages": [unified_message_payload(message) for message in conversation.messages],
     }
 
 
@@ -535,6 +562,40 @@ class ConversationListView(APIView):
                 "account_email": credentials.email,
                 "folder": folder,
                 "conversations": [conversation_payload(conversation) for conversation in page.conversations],
+            }
+        )
+
+
+class UnifiedConversationListView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_unified_conversations_list",
+        parameters=[
+            OpenApiParameter("limit", int, required=False, description="Maximum unified conversations to return. 1-200, defaults to 50."),
+        ],
+        responses={200: UnifiedConversationListResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        if limit < 1 or limit > 200:
+            return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            page = MailboxService().list_unified_conversations(credentials, limit=limit, user=request.user)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(
+            {
+                "account_email": credentials.email,
+                "folders": list(page.folders),
+                "conversations": [unified_conversation_payload(conversation) for conversation in page.conversations],
             }
         )
 
