@@ -1,5 +1,6 @@
-import json
 import importlib
+import io
+import json
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
@@ -50,6 +51,7 @@ from .credential_crypto import (
     encrypt_mailbox_password,
 )
 from .mail_indexing import MailIndexService
+from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
 from .models import DeviceRegistration, MailAccountIndex, MailConversationIndex, MailMessageIndex, MailboxTokenCredential, PushNotificationLog
 
@@ -730,6 +732,91 @@ class MailApiTests(TestCase):
 
         self.assertTrue(MailMessageIndex.objects.filter(account=account, uid=101).exists())
         self.assertEqual(touched_thread_keys, set())
+
+    def test_mail_index_sync_runner_selects_due_accounts_and_skips_fresh_or_active_syncing(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        now = timezone.now()
+        due_never = MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
+        due_stale = MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="stale@example.com",
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=now - timezone.timedelta(minutes=30),
+        )
+        MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="fresh@example.com",
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=now,
+        )
+        MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="syncing@example.com",
+            index_status=MailAccountIndex.STATUS_SYNCING,
+            last_sync_started_at=now,
+        )
+
+        selected = select_accounts_for_sync(now=now, stale_after_seconds=600)
+
+        self.assertEqual([account.pk for account in selected], [due_never.pk, due_stale.pk])
+
+    def test_mail_index_sync_runner_retries_stale_syncing_and_respects_failure_cooldown(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        now = timezone.now()
+        stale_syncing = MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="stale-syncing@example.com",
+            index_status=MailAccountIndex.STATUS_SYNCING,
+            last_sync_started_at=now - timezone.timedelta(minutes=30),
+        )
+        retry_failed = MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="retry-failed@example.com",
+            index_status=MailAccountIndex.STATUS_FAILED,
+            last_indexed_at=now - timezone.timedelta(hours=2),
+            last_sync_finished_at=now - timezone.timedelta(hours=2),
+        )
+        MailAccountIndex.objects.create(
+            user=token.user,
+            account_email="cooldown@example.com",
+            index_status=MailAccountIndex.STATUS_FAILED,
+            last_indexed_at=now - timezone.timedelta(hours=2),
+            last_sync_finished_at=now,
+        )
+
+        selected = select_accounts_for_sync(now=now, stale_after_seconds=600, failure_cooldown_seconds=1800)
+
+        self.assertEqual([account.pk for account in selected], [stale_syncing.pk, retry_failed.pk])
+
+    def test_mail_index_sync_cycle_syncs_selected_accounts_and_skips_missing_credentials(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
+        MailAccountIndex.objects.create(user=token.user, account_email="missing@example.com")
+        service = Mock()
+
+        result = run_sync_cycle(mail_index_service=service)
+
+        self.assertEqual(result.scanned, 2)
+        self.assertEqual(result.selected, 2)
+        self.assertEqual(result.synced, 1)
+        self.assertEqual(result.skipped, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(service.sync_account.call_count, 1)
+        args, kwargs = service.sync_account.call_args
+        self.assertEqual(args[0], token.user)
+        self.assertEqual(args[1].email, self.account_email)
+        self.assertEqual(kwargs, {"limit": 500, "incremental": True})
+
+    @patch("mailops.mail_indexing.runner.run_sync_cycle")
+    def test_run_mail_index_sync_cycle_command_outputs_summary(self, run_cycle):
+        run_cycle.return_value = Mock(scanned=2, selected=1, synced=1, failed=0, skipped=1, elapsed_seconds=0.12)
+        output = io.StringIO()
+
+        call_command("run_mail_index_sync_cycle", "--max-accounts", "3", "--limit", "25", stdout=output)
+
+        self.assertIn("scanned=2 selected=1 synced=1 failed=0 skipped=1", output.getvalue())
+        self.assertEqual(run_cycle.call_args.kwargs["max_accounts"], 3)
+        self.assertEqual(run_cycle.call_args.kwargs["limit"], 25)
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_detail_returns_service_result(self, service_class):
