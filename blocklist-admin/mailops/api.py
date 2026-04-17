@@ -45,6 +45,8 @@ from .api_serializers import (
     LogoutResponseSerializer,
     MailHookRequestSerializer,
     MailHookResponseSerializer,
+    MailIndexStatusQuerySerializer,
+    MailIndexStatusResponseSerializer,
     MessageDetailResponseSerializer,
     MessageSummariesResponseSerializer,
     RestoreMessagesRequestSerializer,
@@ -54,7 +56,7 @@ from .api_serializers import (
     SendMailResponseSerializer,
     UnifiedConversationListResponseSerializer,
 )
-from .models import DeviceRegistration, MailboxTokenCredential
+from .models import DeviceRegistration, MailAccountIndex, MailboxTokenCredential
 from .services import send_mail_notification
 
 
@@ -259,6 +261,26 @@ def account_summary_payload(account_email, summary):
         "display_name": "",
         "unread_count": summary.unread_count,
         "important_count": summary.important_count,
+    }
+
+
+def mail_index_status_payload(index):
+    return {
+        "account_email": index.account_email,
+        "index_status": index.index_status,
+        "last_indexed_at": index.last_indexed_at,
+        "last_sync_started_at": index.last_sync_started_at,
+        "last_sync_finished_at": index.last_sync_finished_at,
+        "last_sync_error": index.last_sync_error,
+        "folders": [
+            {
+                "folder": folder_state.folder,
+                "uidvalidity": folder_state.uidvalidity,
+                "highest_indexed_uid": folder_state.highest_indexed_uid,
+                "last_synced_at": folder_state.last_synced_at,
+            }
+            for folder_state in index.folder_states.order_by("folder")
+        ],
     }
 
 
@@ -598,6 +620,33 @@ class UnifiedConversationListView(APIView):
                 "conversations": [unified_conversation_payload(conversation) for conversation in page.conversations],
             }
         )
+
+
+class MailIndexStatusView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_index_status",
+        parameters=[OpenApiParameter("account_email", str, required=False, description="Mailbox account email. Defaults to the current token mailbox.")],
+        responses={200: MailIndexStatusResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 404: ErrorSerializer},
+    )
+    def get(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        serializer = MailIndexStatusQuerySerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return Response({"error": "invalid_account_email"}, status=status.HTTP_400_BAD_REQUEST)
+        account_email = (serializer.validated_data.get("account_email") or credentials.email).strip().lower()
+        index = (
+            MailAccountIndex.objects.filter(user=request.user, account_email=account_email)
+            .prefetch_related("folder_states")
+            .first()
+        )
+        if index is None:
+            return Response({"error": "mail_index_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(mail_index_status_payload(index))
 
 
 class MessageDetailView(APIView):

@@ -184,6 +184,27 @@ class UnifiedConversationListResponseSerializer(serializers.Serializer):
     conversations = UnifiedConversationSerializer(many=True)
 
 
+class MailIndexStatusQuerySerializer(serializers.Serializer):
+    account_email = serializers.EmailField(required=False)
+
+
+class MailIndexFolderStatusSerializer(serializers.Serializer):
+    folder = serializers.CharField()
+    uidvalidity = serializers.CharField(allow_blank=True)
+    highest_indexed_uid = serializers.IntegerField()
+    last_synced_at = serializers.DateTimeField(allow_null=True)
+
+
+class MailIndexStatusResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    index_status = serializers.CharField()
+    last_indexed_at = serializers.DateTimeField(allow_null=True)
+    last_sync_started_at = serializers.DateTimeField(allow_null=True)
+    last_sync_finished_at = serializers.DateTimeField(allow_null=True)
+    last_sync_error = serializers.CharField(allow_blank=True)
+    folders = MailIndexFolderStatusSerializer(many=True)
+
+
 class MessageDetailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folder = serializers.CharField()

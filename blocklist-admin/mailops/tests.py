@@ -733,6 +733,97 @@ class MailApiTests(TestCase):
         self.assertTrue(MailMessageIndex.objects.filter(account=account, uid=101).exists())
         self.assertEqual(touched_thread_keys, set())
 
+    def test_mail_index_status_returns_account_and_folder_state(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        account = MailAccountIndex.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=datetime(2026, 4, 17, 13, 40, tzinfo=dt_timezone.utc),
+            last_sync_started_at=datetime(2026, 4, 17, 13, 39, 50, tzinfo=dt_timezone.utc),
+            last_sync_finished_at=datetime(2026, 4, 17, 13, 40, tzinfo=dt_timezone.utc),
+            last_sync_error="",
+        )
+        account.folder_states.create(
+            folder="Sent",
+            uidvalidity="67890",
+            highest_indexed_uid=120,
+            last_synced_at=datetime(2026, 4, 17, 13, 39, 58, tzinfo=dt_timezone.utc),
+        )
+        account.folder_states.create(
+            folder="INBOX",
+            uidvalidity="12345",
+            highest_indexed_uid=500,
+            last_synced_at=datetime(2026, 4, 17, 13, 40, tzinfo=dt_timezone.utc),
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_index_status"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["account_email"], self.account_email)
+        self.assertEqual(payload["index_status"], MailAccountIndex.STATUS_READY)
+        self.assertEqual(payload["last_sync_error"], "")
+        self.assertIn("2026-04-17T13:40:00", payload["last_indexed_at"])
+        self.assertEqual([folder["folder"] for folder in payload["folders"]], ["INBOX", "Sent"])
+        self.assertEqual(payload["folders"][0]["uidvalidity"], "12345")
+        self.assertEqual(payload["folders"][0]["highest_indexed_uid"], 500)
+
+    def test_mail_index_status_supports_all_statuses_without_folder_rows(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        statuses = [
+            MailAccountIndex.STATUS_EMPTY,
+            MailAccountIndex.STATUS_SYNCING,
+            MailAccountIndex.STATUS_READY,
+            MailAccountIndex.STATUS_PARTIAL,
+            MailAccountIndex.STATUS_FAILED,
+        ]
+        for index, index_status in enumerate(statuses):
+            email = f"status-{index}@example.com"
+            MailAccountIndex.objects.create(
+                user=token.user,
+                account_email=email,
+                index_status=index_status,
+                last_sync_error="stored operational status" if index_status == MailAccountIndex.STATUS_FAILED else "",
+            )
+
+            response = self.client.get(reverse("mailops:api_mail_index_status"), {"account_email": email}, **headers)
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["account_email"], email)
+            self.assertEqual(payload["index_status"], index_status)
+            self.assertEqual(payload["folders"], [])
+            if index_status == MailAccountIndex.STATUS_FAILED:
+                self.assertEqual(payload["last_sync_error"], "stored operational status")
+
+    def test_mail_index_status_requires_token_and_mailbox_credentials(self):
+        missing_token = self.client.get(reverse("mailops:api_mail_index_status"))
+        User = get_user_model()
+        user = User.objects.create_user(username="no-mailbox", email="no-mailbox@example.com")
+        token, _ = Token.objects.get_or_create(user=user)
+
+        missing_credentials = self.client.get(reverse("mailops:api_mail_index_status"), HTTP_AUTHORIZATION=f"Token {token.key}")
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(missing_credentials.status_code, 401)
+        self.assertEqual(missing_credentials.json()["error"], "mailbox_credentials_missing")
+
+    def test_mail_index_status_validates_account_and_returns_not_found(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
+        invalid = self.client.get(reverse("mailops:api_mail_index_status"), {"account_email": "not-an-email"}, **headers)
+        missing = self.client.get(reverse("mailops:api_mail_index_status"), {"account_email": "missing@example.com"}, **headers)
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.json()["error"], "invalid_account_email")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"], "mail_index_not_found")
+
     def test_mail_index_sync_runner_selects_due_accounts_and_skips_fresh_or_active_syncing(self):
         token = create_mailbox_token(self.account_email, self.password)
         now = timezone.now()
@@ -1488,6 +1579,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
         self.assertContains(schema, "/api/mail/conversations")
         self.assertContains(schema, "/api/mail/unified-conversations")
+        self.assertContains(schema, "/api/mail/index-status")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/accounts/summaries")
