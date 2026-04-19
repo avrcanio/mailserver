@@ -338,7 +338,7 @@ Indexing can be refreshed operationally with:
 python manage.py sync_mail_index --account user@finestar.hr --limit 500
 ```
 
-By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
+By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes. For the full operational and implementation overview, see `docs/mail-indexing.md`.
 
 The deployed stack also includes a periodic sync runner:
 
@@ -569,6 +569,8 @@ Request:
   "cc": ["copy@example.com"],
   "bcc": ["hidden@example.com"],
   "reply_to": "Reply Person <reply@finestar.hr>",
+  "in_reply_to": "<source-message-id@example.com>",
+  "references": ["<root-message-id@example.com>", "<source-message-id@example.com>"],
   "subject": "Status",
   "text_body": "Plain body",
   "html_body": "<p>HTML body</p>",
@@ -577,6 +579,10 @@ Request:
 ```
 
 Recipient fields accept either plain addresses such as `recipient@example.com` or mailbox-formatted values such as `Recipient Name <recipient@example.com>`. The backend normalizes them to one email address per item before sending. `Bcc` recipients are used only in the SMTP envelope and are not exposed in email headers.
+
+For reply and reply-all flows, clients should send `in_reply_to` and `references` from the source message headers when available. Use the source message's `message_id` as `in_reply_to`; build `references` from the source message's existing `references` plus the source `message_id`. The backend writes these values as `In-Reply-To` and `References` headers so later indexing can attach the Sent copy to the same thread.
+
+After SMTP delivery succeeds, the backend appends the exact generated MIME message to the resolved IMAP Sent folder with the `\Seen` flag and marks the existing mail index stale. The next unified conversation refresh can then see the Sent copy through live IMAP fallback while background indexing catches up. If SMTP succeeds but the Sent append fails, the API still returns `status: sent` and logs a warning to avoid duplicate sends from client retries.
 
 For attachments, send `multipart/form-data` to the same endpoint. Text fields keep the same names, and files use repeated `attachments` parts:
 

@@ -18,6 +18,7 @@ class SmtpClient:
         self.use_starttls = settings.MAIL_SMTP_USE_STARTTLS if use_starttls is None else use_starttls
         self.timeout = int(timeout or settings.MAIL_CLIENT_TIMEOUT_SECONDS)
         self.connection = None
+        self.last_sent_message = None
 
     def connect(self):
         try:
@@ -51,6 +52,7 @@ class SmtpClient:
             raise MailProtocolError(f"Could not build SMTP message: {exc}") from exc
         try:
             connection.send_message(message, from_addr=credentials.email, to_addrs=recipients)
+            self.last_sent_message = message
         except socket.timeout as exc:
             raise MailTimeoutError("Timed out sending SMTP message") from exc
         except smtplib.SMTPAuthenticationError as exc:
@@ -96,6 +98,10 @@ def build_email_message(from_email, request: SendMailRequest):
         message["Cc"] = ", ".join(request.cc)
     if request.reply_to:
         message["Reply-To"] = request.reply_to
+    if request.in_reply_to:
+        message["In-Reply-To"] = request.in_reply_to
+    if request.references:
+        message["References"] = " ".join(request.references)
     message["Subject"] = request.subject
     message["Date"] = format_datetime(localtime())
     message["Message-ID"] = make_msgid()

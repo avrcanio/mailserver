@@ -125,6 +125,19 @@ class ImapClient:
             raise MailProtocolError(f"IMAP folder selection failed for {folder}") from exc
         self._expect_ok(status, data, f"IMAP folder selection failed for {folder}")
 
+    def append_message(self, folder, message_bytes, flags=(r"\Seen",)):
+        connection = self._require_connection()
+        flag_list = f"({' '.join(flags)})" if flags else None
+        try:
+            status, data = connection.append(_imap_mailbox_arg(folder), flag_list, None, message_bytes)
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out appending IMAP message to {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP append connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP append failed for {folder}") from exc
+        self._expect_ok(status, data, f"IMAP append failed for {folder}")
+
     def fetch_message_summaries(self, folder="INBOX", limit=50):
         return list(self.fetch_message_summary_page(folder=folder, limit=limit).messages)
 
@@ -261,8 +274,10 @@ class ImapClient:
             raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}") from exc
 
     def fetch_message_detail(self, folder, uid):
-        metadata, message = self._fetch_full_message(folder, uid)
-        return _parse_detail_message(folder, str(uid), metadata, message)
+        metadata, message = self._fetch_full_message(folder, uid, readonly=False)
+        detail = _parse_detail_message(folder, str(uid), metadata, message)
+        self.mark_message_seen(folder, uid, select_folder=False)
+        return replace(detail, flags=_flags_with_seen(detail.flags))
 
     def fetch_attachment(self, folder, uid, attachment_id):
         metadata, message = self._fetch_full_message(folder, uid)
@@ -308,9 +323,23 @@ class ImapClient:
             summaries.append(summary)
         return summaries
 
-    def _fetch_full_message(self, folder, uid):
+    def mark_message_seen(self, folder, uid, select_folder=True):
         connection = self._require_connection()
-        self.select_folder(folder, readonly=True)
+        if select_folder:
+            self.select_folder(folder, readonly=False)
+        try:
+            status, data = connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)")
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out marking IMAP message {uid} as seen") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP mark seen connection failure for UID {uid}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP mark seen failed for UID {uid}") from exc
+        self._expect_ok(status, data, f"IMAP mark seen failed for UID {uid}")
+
+    def _fetch_full_message(self, folder, uid, readonly=True):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=readonly)
         try:
             status, data = connection.uid("fetch", str(uid), "(FLAGS RFC822.SIZE RFC822)")
         except socket.timeout as exc:
@@ -675,10 +704,16 @@ def _conversation_key(summary, message_ids):
             if parent_id in message_ids:
                 return f"id:{_thread_root_id(message_ids[parent_id], message_ids)}"
         if parent_ids:
+            subject = _normalize_thread_subject_for_grouping(summary.subject)
+            if subject:
+                return f"subject:{subject}"
             return f"id:{parent_ids[0]}"
+        subject = _business_thread_subject_key(summary.subject)
+        if subject:
+            return f"subject:{subject}"
         if own_id:
             return f"id:{own_id}"
-    subject = _normalize_thread_subject(summary.subject)
+    subject = _normalize_thread_subject_for_grouping(summary.subject)
     if subject:
         return f"subject:{subject}"
     if own_id:
@@ -772,6 +807,12 @@ def _message_is_seen(message):
     return any(flag.lower() == "seen" for flag in message.flags)
 
 
+def _flags_with_seen(flags):
+    if any(str(flag).lower() == "seen" for flag in flags):
+        return tuple(flags)
+    return (*tuple(flags), "Seen")
+
+
 def _uid_int(uid):
     try:
         return int(uid)
@@ -803,6 +844,23 @@ def _normalize_message_id(value):
 def _normalize_thread_subject(value):
     subject = _SUBJECT_PREFIX_RE.sub("", str(value or "")).strip().lower()
     return re.sub(r"\s+", " ", subject)
+
+
+def _normalize_thread_subject_for_grouping(value):
+    business_key = _business_thread_subject_key(value)
+    if business_key:
+        return business_key
+    return _normalize_thread_subject(value)
+
+
+def _business_thread_subject_key(value):
+    subject = _normalize_thread_subject(value)
+    offer_match = re.search(r"\bponuda\s+br\.?\s*([0-9][0-9 ._-]*)", subject)
+    if offer_match:
+        number = re.sub(r"\D+", "", offer_match.group(1))
+        if number:
+            return f"ponuda br. {number}"
+    return ""
 
 
 def _first_fetch_tuple(fetch_data):

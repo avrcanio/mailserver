@@ -245,6 +245,8 @@ class SendMailRequestSerializer(serializers.Serializer):
     cc = serializers.ListField(child=MailboxAddressField(), required=False, allow_empty=True, default=list)
     bcc = serializers.ListField(child=MailboxAddressField(), required=False, allow_empty=True, default=list)
     reply_to = MailboxAddressField(required=False, allow_blank=True, allow_null=True, default=None)
+    in_reply_to = serializers.CharField(required=False, allow_blank=True, default="")
+    references = serializers.ListField(child=serializers.CharField(allow_blank=False), required=False, allow_empty=True, default=list)
     from_display_name = serializers.CharField(required=False, allow_blank=True, default="")
     forward_source_message = ForwardSourceMessageField(required=False, allow_null=True, default=None)
 

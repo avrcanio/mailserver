@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pravila privatnosti | Finestar Mail</title>
+    <style>
+      :root {
+        --bg: #f7f8fb;
+        --panel: #ffffff;
+        --ink: #18202f;
+        --muted: #5f6b7a;
+        --accent: #0f766e;
+        --border: #d8dee8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.62;
+      }
+      main {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 40px 20px 64px;
+      }
+      header {
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 28px;
+        padding-bottom: 22px;
+      }
+      h1 {
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        line-height: 1.08;
+        margin: 0 0 12px;
+      }
+      h2 {
+        margin-top: 34px;
+        font-size: 1.25rem;
+      }
+      p, li { color: var(--ink); }
+      .muted { color: var(--muted); }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 22px;
+      }
+      a { color: var(--accent); }
+      ul { padding-left: 22px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Pravila privatnosti</h1>
+        <p class="muted">Finestar Mail</p>
+        <p class="muted">Datum stupanja na snagu: {{ effective_date }}</p>
+      </header>
+
+      <section class="panel">
+        <p>
+          Ova pravila privatnosti objašnjavaju kako Finestar Mail obrađuje korisničke podatke
+          i podatke uređaja pri korištenju aplikacije i pratećih backend usluga.
+        </p>
+        <p>
+          Aplikacija je namijenjena poslovnoj i internoj komunikaciji korisnika koji imaju
+          valjani Finestar mailbox račun. Aplikacija nije namijenjena djeci mlađoj od 13 godina.
+        </p>
+      </section>
+
+      <h2>Podaci koje obrađujemo</h2>
+      <p>Ovisno o načinu korištenja aplikacije, možemo obrađivati sljedeće kategorije podataka:</p>
+      <ul>
+        <li>adresu e-pošte korisnika i podatke potrebne za prijavu u mailbox,</li>
+        <li>metapodatke poruka e-pošte, kao što su pošiljatelj, primatelji, predmet, datum, UID poruke, mapa i status pročitanosti,</li>
+        <li>sadržaj poruka i privitaka kada korisnik otvara, šalje, preuzima ili prosljeđuje e-poštu,</li>
+        <li>tehničke podatke uređaja potrebne za push obavijesti, uključujući FCM token, platformu uređaja i verziju aplikacije,</li>
+        <li>operativne zapise potrebne za sigurnost, dijagnostiku, isporuku obavijesti i održavanje usluge.</li>
+      </ul>
+
+      <h2>Kako koristimo podatke</h2>
+      <p>Podatke koristimo za:</p>
+      <ul>
+        <li>prijavu korisnika i pristup mailboxu,</li>
+        <li>prikaz, slanje, preuzimanje i organizaciju e-pošte,</li>
+        <li>prikaz razgovora i indeksiranje osnovnih metapodataka poruka radi bržeg rada aplikacije,</li>
+        <li>slanje push obavijesti o novim porukama,</li>
+        <li>sprječavanje zlouporabe, otklanjanje grešaka i održavanje sigurnosti sustava.</li>
+      </ul>
+
+      <h2>Čuvanje i zaštita podataka</h2>
+      <p>
+        Pristupni podaci mailboxa pohranjuju se u šifriranom obliku. Indeks e-pošte pohranjuje
+        metapodatke potrebne za prikaz razgovora i status sinkronizacije; ne koristi se za prodaju
+        podataka ili oglašavanje.
+      </p>
+      <p>
+        Podaci se čuvaju dok su potrebni za pružanje usluge, sigurnost, dijagnostiku i zakonske
+        ili operativne obveze. Korisnik može odjavom ili zahtjevom za podršku zatražiti uklanjanje
+        podataka povezanih s aplikacijskim pristupom, gdje je to primjenjivo.
+      </p>
+
+      <h2>Dijeljenje podataka</h2>
+      <p>
+        Ne prodajemo korisničke podatke. Podatke možemo obrađivati putem pružatelja infrastrukture
+        i usluga koje su nužne za rad aplikacije, uključujući hosting, bazu podataka, mail server i
+        uslugu push obavijesti. Ti se podaci koriste samo za pružanje i održavanje funkcionalnosti aplikacije.
+      </p>
+
+      <h2>Push obavijesti</h2>
+      <p>
+        Ako korisnik omogući push obavijesti, aplikacija i backend obrađuju token uređaja kako bi se
+        obavijesti mogle isporučiti. Korisnik može onemogućiti obavijesti u postavkama uređaja ili aplikacije.
+      </p>
+
+      <h2>Djeca</h2>
+      <p>
+        Finestar Mail nije namijenjen djeci mlađoj od 13 godina i ne prikupljamo svjesno podatke djece
+        mlađe od 13 godina. Ako smatrate da su takvi podaci obrađeni, kontaktirajte nas radi uklanjanja.
+      </p>
+
+      <h2>Prava korisnika</h2>
+      <p>
+        Korisnik može zatražiti informacije o obradi svojih podataka, ispravak netočnih podataka ili
+        brisanje podataka kada je to primjenjivo i tehnički izvedivo.
+      </p>
+
+      <h2>Kontakt</h2>
+      <p>
+        Za pitanja o privatnosti i obradi podataka kontaktirajte nas na
+        <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>.
+      </p>
+
+      <h2>Promjene pravila privatnosti</h2>
+      <p>
+        Ova pravila možemo povremeno ažurirati. Nova verzija bit će objavljena na ovoj stranici,
+        uz ažurirani datum stupanja na snagu.
+      </p>
+    </main>
+  </body>
+</html>
