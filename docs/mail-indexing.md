@@ -42,6 +42,38 @@ Reply clients should pass source-thread metadata in the send request:
 When those headers are missing, the index can still group narrow business
 subjects such as `Ponuda br. 121714` by their extracted reference number.
 
+Verified behavior:
+
+- messages sent through `POST /api/mail/send` are delivered by SMTP
+- the same generated MIME message is appended to IMAP Sent with the `\Seen` flag
+- the returned `message_id` is the `Message-ID` of both the delivered message and
+  the Sent copy
+- the mailbox index is marked stale immediately after the successful API send
+- the next unified conversation request can use live IMAP fallback until the
+  background index catches up
+- once `mailindex-sync` runs, the Sent copy is stored in `MailMessageIndex` and
+  included in the matching `MailConversationIndex`
+
+Important limitation: messages that were sent before this behavior existed may
+not appear in indexed Sent threads if they were never saved in server-side IMAP
+Sent. Those old missing Sent copies cannot be reconstructed from the index; they
+must exist in IMAP to be indexed.
+
+Client contract for replies:
+
+- send `in_reply_to` from the source message `message_id`
+- send `references` as the source message's `references` plus the source
+  `message_id` when building a reply chain
+- keep the reply subject consistent with the source thread, normally `Re:
+  <subject>`
+- do not rely on the visible `reply_to` address header for threading; it is only
+  a reply-address hint for mail clients
+
+For business offer threads, the backend also recognizes `Ponuda br. <number>`
+subjects. This lets messages such as `Fwd: Ponuda br. 121714`, `Re: Fwd: Ponuda
+br. 121714 razlika`, and matching Sent copies group under
+`subject:ponuda br. 121714` even when the referenced parent message is absent.
+
 ## Data Model
 
 The index tables are defined in `mailops.models`.
