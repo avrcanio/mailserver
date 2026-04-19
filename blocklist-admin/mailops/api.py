@@ -355,6 +355,39 @@ def mark_index_message_read(user, account_email, folder, uid):
         logger.warning("Could not mark indexed message read for %s %s/%s: %s", account_email, folder, uid, exc)
 
 
+def remove_indexed_messages_after_delete(user, account_email, folder, moved_uids):
+    if not moved_uids:
+        return
+    try:
+        from mailops.mail_indexing.sync import rebuild_conversation
+        from mailops.mail_indexing.threading import uid_int
+
+        account = MailAccountIndex.objects.filter(user=user, account_email=account_email.strip().lower()).first()
+        if account is None:
+            return
+        normalized_uids = [uid_int(uid) for uid in moved_uids if uid_int(uid)]
+        if not normalized_uids:
+            return
+        rows = list(account.messages.filter(folder=folder, uid__in=normalized_uids))
+        touched_thread_keys = {row.thread_key for row in rows}
+        account.messages.filter(id__in=[row.id for row in rows]).delete()
+        for thread_key in touched_thread_keys:
+            rebuild_conversation(account, thread_key)
+    except Exception as exc:
+        logger.warning("Could not remove deleted indexed messages for %s %s %s: %s", account_email, folder, moved_uids, exc)
+
+
+def delete_messages_response(request, credentials, folder, uids):
+    try:
+        result = MailboxService().move_messages_to_trash(credentials, folder=folder, uids=tuple(uids))
+    except MailInvalidOperationError:
+        return Response({"error": "delete_from_trash_not_supported"}, status=status.HTTP_400_BAD_REQUEST)
+    except MailIntegrationError as exc:
+        return mail_error_response(exc)
+    remove_indexed_messages_after_delete(request.user, credentials.email, folder, result.moved_to_trash)
+    return Response(delete_result_payload(credentials, folder, result))
+
+
 def validate_delete_payload(data):
     if "folder" not in data or not str(data.get("folder") or "").strip():
         return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
@@ -704,6 +737,21 @@ class MessageDetailView(APIView):
         mark_index_message_read(request.user, credentials.email, folder, uid)
         return Response({"account_email": credentials.email, "folder": folder, "message": detail_payload(detail)})
 
+    @extend_schema(
+        operation_id="mail_messages_detail_delete",
+        parameters=[OpenApiParameter("folder", str, required=False, description="Source mailbox folder name. Defaults to INBOX.")],
+        responses={200: DeleteMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def delete(self, request, uid):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "INBOX").strip() or "INBOX"
+        data, error = validate_delete_payload({"folder": folder, "uids": [uid]})
+        if error:
+            return error
+        return delete_messages_response(request, credentials, data["folder"], data["uids"])
+
 
 class AttachmentDownloadView(APIView):
     authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
@@ -749,13 +797,7 @@ class DeleteMessagesView(APIView):
         data, error = validate_delete_payload(request.data)
         if error:
             return error
-        try:
-            result = MailboxService().move_messages_to_trash(credentials, folder=data["folder"], uids=tuple(data["uids"]))
-        except MailInvalidOperationError:
-            return Response({"error": "delete_from_trash_not_supported"}, status=status.HTTP_400_BAD_REQUEST)
-        except MailIntegrationError as exc:
-            return mail_error_response(exc)
-        return Response(delete_result_payload(credentials, data["folder"], result))
+        return delete_messages_response(request, credentials, data["folder"], data["uids"])
 
 
 class DeleteMessageView(APIView):
@@ -769,20 +811,25 @@ class DeleteMessageView(APIView):
         responses={200: DeleteMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
     )
     def post(self, request, uid):
+        return self._delete(request, uid, default_folder="")
+
+    @extend_schema(
+        operation_id="mail_messages_delete_single_delete",
+        parameters=[OpenApiParameter("folder", str, required=False, description="Source mailbox folder name. Defaults to INBOX.")],
+        responses={200: DeleteMessagesResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def delete(self, request, uid):
+        return self._delete(request, uid, default_folder="INBOX")
+
+    def _delete(self, request, uid, default_folder):
         credentials, error = require_mailbox_credentials(request)
         if error:
             return error
-        folder = (request.query_params.get("folder") or "").strip()
+        folder = (request.query_params.get("folder") or default_folder).strip()
         data, error = validate_delete_payload({"folder": folder, "uids": [uid]})
         if error:
             return error
-        try:
-            result = MailboxService().move_messages_to_trash(credentials, folder=data["folder"], uids=tuple(data["uids"]))
-        except MailInvalidOperationError:
-            return Response({"error": "delete_from_trash_not_supported"}, status=status.HTTP_400_BAD_REQUEST)
-        except MailIntegrationError as exc:
-            return mail_error_response(exc)
-        return Response(delete_result_payload(credentials, data["folder"], result))
+        return delete_messages_response(request, credentials, data["folder"], data["uids"])
 
 
 class RestoreMessagesView(APIView):

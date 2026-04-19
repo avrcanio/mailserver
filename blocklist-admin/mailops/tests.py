@@ -1211,6 +1211,40 @@ class MailApiTests(TestCase):
         self.assertEqual(service_class.return_value.move_messages_to_trash.call_args.kwargs, {"folder": "Archive", "uids": ("42",)})
 
     @patch("mailops.api.MailboxService")
+    def test_mail_message_delete_detail_endpoint_defaults_to_inbox_and_removes_index_row(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        indexed_message = MailMessageSummary(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender <sender@example.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+        )
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (indexed_message,)},
+        )
+        service_class.return_value.move_messages_to_trash.return_value = MailMessageMoveToTrashResult(
+            trash_folder="Trash",
+            moved_to_trash=("42",),
+            failed=(),
+        )
+
+        response = self.client.delete(reverse("mailops:api_mail_message_detail", kwargs={"uid": "42"}), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["moved_to_trash"], ["42"])
+        self.assertEqual(service_class.return_value.move_messages_to_trash.call_args.kwargs, {"folder": "INBOX", "uids": ("42",)})
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        self.assertFalse(MailMessageIndex.objects.filter(account=account, folder="INBOX", uid=42).exists())
+        self.assertFalse(MailConversationIndex.objects.filter(account=account).exists())
+
+    @patch("mailops.api.MailboxService")
     def test_mail_messages_delete_serializes_partial_failures(self, service_class):
         headers = self.auth_headers()
         service_class.return_value.move_messages_to_trash.return_value = MailMessageMoveToTrashResult(
