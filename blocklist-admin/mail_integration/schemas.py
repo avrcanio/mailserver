@@ -214,6 +214,8 @@ class SendMailRequest:
     cc: tuple[str, ...] = field(default_factory=tuple)
     bcc: tuple[str, ...] = field(default_factory=tuple)
     reply_to: str | None = None
+    in_reply_to: str = ""
+    references: tuple[str, ...] = field(default_factory=tuple)
     from_display_name: str = ""
     attachments: tuple[SendMailAttachment, ...] = field(default_factory=tuple)
     forward_source_message: ForwardSourceMessage | None = None

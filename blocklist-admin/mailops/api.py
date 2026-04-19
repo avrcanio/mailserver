@@ -1,3 +1,4 @@
+import logging
 from email.utils import getaddresses
 
 from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
@@ -62,6 +63,7 @@ from .services import send_mail_notification
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
 MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
+logger = logging.getLogger("mailops.api")
 
 
 def create_mailbox_token(email, password):
@@ -324,6 +326,13 @@ def restore_result_payload(credentials, folder, result):
     }
 
 
+def mark_mail_index_stale_after_send(user, account_email):
+    try:
+        MailAccountIndex.objects.filter(user=user, account_email=account_email.strip().lower()).update(last_indexed_at=None)
+    except Exception as exc:
+        logger.warning("Could not mark mail index stale for %s: %s", account_email, exc)
+
+
 def validate_delete_payload(data):
     if "folder" not in data or not str(data.get("folder") or "").strip():
         return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
@@ -386,10 +395,13 @@ def send_form_data(data):
                 values.append(value)
         if values:
             normalized[field] = values
-    for field in ("reply_to", "subject", "text_body", "html_body", "from_display_name", "forward_source_message"):
+    for field in ("reply_to", "in_reply_to", "subject", "text_body", "html_body", "from_display_name", "forward_source_message"):
         values = data.getlist(field)
         if values:
             normalized[field] = values[-1]
+    references = data.getlist("references")
+    if references:
+        normalized["references"] = references
     return normalized
 
 
@@ -854,6 +866,8 @@ class SendMailView(APIView):
             cc=tuple(data.get("cc", ())),
             bcc=tuple(data.get("bcc", ())),
             reply_to=data.get("reply_to") or None,
+            in_reply_to=data.get("in_reply_to", ""),
+            references=tuple(data.get("references", ())),
             subject=data["subject"],
             text_body=data.get("text_body", ""),
             html_body=data.get("html_body", ""),
@@ -871,6 +885,7 @@ class SendMailView(APIView):
             return Response({"error": exc.code}, status=status.HTTP_400_BAD_REQUEST)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
+        mark_mail_index_stale_after_send(request.user, credentials.email)
         return Response({"account_email": credentials.email, "status": "sent", "message_id": message_id})
 
 

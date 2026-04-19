@@ -7,6 +7,17 @@ from .models import ApplyLog, SenderBlocklistRule
 from .services import apply_blocklist
 
 
+def privacy_policy(request):
+    return render(
+        request,
+        "mailops/privacy.html",
+        {
+            "contact_email": "postmaster@finestar.hr",
+            "effective_date": "17. travnja 2026.",
+        },
+    )
+
+
 @staff_member_required
 def dashboard(request):
     context = {

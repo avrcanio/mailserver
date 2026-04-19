@@ -10,6 +10,7 @@ from mail_integration.schemas import MailboxCredentials
 from mailops.models import MailAccountIndex, MailboxTokenCredential
 
 from .service import MailIndexService
+from .sync import ensure_account
 from .threading import normalize_email
 
 
@@ -78,6 +79,7 @@ def run_sync_cycle(
 ):
     started_at = time.monotonic()
     mail_index_service = mail_index_service or MailIndexService()
+    seed_account_indexes_for_credentials(account_email=account_email)
     selected_accounts = select_accounts_for_sync(
         account_email=account_email,
         max_accounts=max_accounts,
@@ -119,6 +121,15 @@ def run_sync_cycle(
         cycle_result.elapsed_seconds,
     )
     return cycle_result
+
+
+def seed_account_indexes_for_credentials(account_email=""):
+    credentials = MailboxTokenCredential.objects.select_related("token__user").order_by("mailbox_email")
+    normalized_account = normalize_email(account_email)
+    if normalized_account:
+        credentials = credentials.filter(mailbox_email=normalized_account)
+    for credential in credentials:
+        ensure_account(credential.token.user, credential.mailbox_email)
 
 
 def _credential_for_account(account):

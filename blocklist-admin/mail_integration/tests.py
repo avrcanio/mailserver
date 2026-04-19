@@ -3,7 +3,7 @@ import socket
 import smtplib
 import ssl
 from email.message import EmailMessage
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from django.test import SimpleTestCase, override_settings
 
@@ -87,6 +87,15 @@ class ImapClientTests(SimpleTestCase):
         self.assertIsNone(folders[2].delimiter)
         self.assertEqual(folders[2].flags, ("HasNoChildren", "Sent"))
         self.assertEqual(folders[3].name, "Junk Mail")
+
+    def test_append_message_writes_to_mailbox(self):
+        connection = Mock()
+        connection.append.return_value = ("OK", [b"APPEND completed"])
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            ImapClient().connect().append_message("Sent", b"Subject: Hi\r\n\r\nBody")
+
+        connection.append.assert_called_once_with(b'"Sent"', r"(\Seen)", None, b"Subject: Hi\r\n\r\nBody")
 
     def test_list_folders_preserves_nested_inbox_paths(self):
         connection = Mock()
@@ -1187,6 +1196,8 @@ class SmtpClientTests(SimpleTestCase):
                     cc=("cc@example.com",),
                     bcc=("bcc@example.com",),
                     reply_to="reply@example.com",
+                    in_reply_to="<root@example.com>",
+                    references=("<first@example.com>", "<root@example.com>"),
                     subject="Status Čakovec",
                     text_body="Plain body",
                     html_body="<p>HTML body</p>",
@@ -1201,6 +1212,8 @@ class SmtpClientTests(SimpleTestCase):
         self.assertEqual(sent_message["To"], "to@example.com")
         self.assertEqual(sent_message["Cc"], "cc@example.com")
         self.assertEqual(sent_message["Reply-To"], "reply@example.com")
+        self.assertEqual(sent_message["In-Reply-To"], "<root@example.com>")
+        self.assertEqual(sent_message["References"], "<first@example.com> <root@example.com>")
         self.assertEqual(str(sent_message["Subject"]), "Status Čakovec")
         self.assertIn("Date", sent_message)
         self.assertNotIn("Bcc", sent_message)
@@ -1210,6 +1223,7 @@ class SmtpClientTests(SimpleTestCase):
         self.assertEqual(sum(1 for _ in sent_message.walk() if "MIME-Version" in _), 1)
         self.assertEqual(connection.send_message.call_args.kwargs["to_addrs"], ["to@example.com", "cc@example.com", "bcc@example.com"])
         self.assertEqual(message_id, sent_message["Message-ID"])
+        self.assertEqual(client.last_sent_message, sent_message)
 
     def test_send_with_attachments_builds_multipart_mixed_message(self):
         connection = Mock()
@@ -1363,6 +1377,27 @@ class MailboxServiceTests(SimpleTestCase):
         self.assertEqual(service.send_mail(credentials, request), "<sent@example.com>")
         smtp_client.__enter__.return_value.login.assert_called_once_with(credentials)
         smtp_client.__enter__.return_value.send_mail.assert_called_once_with(credentials, request)
+
+    def test_service_send_appends_real_sent_message_to_sent_folder(self):
+        credentials = MailboxCredentials("sender@example.com", "secret")
+        request = SendMailRequest(to=("to@example.com",), subject="Hi", text_body="Body")
+        sent_message = EmailMessage()
+        sent_message["From"] = "sender@example.com"
+        sent_message["To"] = "to@example.com"
+        sent_message["Subject"] = "Hi"
+        sent_message["Message-ID"] = "<sent@example.com>"
+        sent_message.set_content("Body")
+        imap_client = _context_client()
+        imap_client.__enter__.return_value._resolve_sent_folder.return_value = "Sent"
+        smtp_client = _context_client()
+        smtp_client.__enter__.return_value.send_mail.return_value = "<sent@example.com>"
+        smtp_client.__enter__.return_value.last_sent_message = sent_message
+
+        service = MailboxService(imap_client_factory=lambda: imap_client, smtp_client_factory=lambda: smtp_client)
+
+        self.assertEqual(service.send_mail(credentials, request), "<sent@example.com>")
+        imap_client.__enter__.return_value.login.assert_called_once_with(credentials)
+        imap_client.__enter__.return_value.append_message.assert_called_once_with("Sent", ANY)
 
     def test_service_send_resolves_forwarded_visible_attachments_in_client_order(self):
         credentials = MailboxCredentials("sender@example.com", "secret")
