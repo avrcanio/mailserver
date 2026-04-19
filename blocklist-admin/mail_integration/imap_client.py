@@ -675,10 +675,13 @@ def _conversation_key(summary, message_ids):
             if parent_id in message_ids:
                 return f"id:{_thread_root_id(message_ids[parent_id], message_ids)}"
         if parent_ids:
+            subject = _normalize_thread_subject_for_grouping(summary.subject)
+            if subject:
+                return f"subject:{subject}"
             return f"id:{parent_ids[0]}"
         if own_id:
             return f"id:{own_id}"
-    subject = _normalize_thread_subject(summary.subject)
+    subject = _normalize_thread_subject_for_grouping(summary.subject)
     if subject:
         return f"subject:{subject}"
     if own_id:
@@ -803,6 +806,16 @@ def _normalize_message_id(value):
 def _normalize_thread_subject(value):
     subject = _SUBJECT_PREFIX_RE.sub("", str(value or "")).strip().lower()
     return re.sub(r"\s+", " ", subject)
+
+
+def _normalize_thread_subject_for_grouping(value):
+    subject = _normalize_thread_subject(value)
+    offer_match = re.search(r"\bponuda\s+br\.?\s*([0-9][0-9 ._-]*)", subject)
+    if offer_match:
+        number = re.sub(r"\D+", "", offer_match.group(1))
+        if number:
+            return f"ponuda br. {number}"
+    return subject
 
 
 def _first_fetch_tuple(fetch_data):

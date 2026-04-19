@@ -717,6 +717,43 @@ class MailApiTests(TestCase):
         self.assertTrue(conversation.has_unread)
         self.assertEqual(conversation.participants_json, [{"name": "Shop", "email": "shop@example.com"}, {"name": "", "email": self.account_email}])
 
+    def test_mail_index_groups_offer_subject_when_parent_message_is_missing(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        original_forward = MailMessageSummary(
+            uid="222",
+            folder="INBOX",
+            subject="Fwd: Ponuda br. 121714",
+            sender="Ante Vrcan <avrcanus@gmail.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 18, 21, 33, tzinfo=dt_timezone.utc),
+            message_id="<gmail-forward@example.com>",
+            in_reply_to=("<missing-original@example.com>",),
+            references=("<missing-original@example.com>",),
+        )
+        reply_with_note = MailMessageSummary(
+            uid="223",
+            folder="INBOX",
+            subject="Re: Fwd: Ponuda br. 121714 razlika",
+            sender="Ante Vrcan <avrcanus@gmail.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 19, 8, 47, tzinfo=dt_timezone.utc),
+            message_id="<gmail-reply@example.com>",
+            in_reply_to=("<missing-local-reply@example.com>",),
+            references=("<missing-local-reply@example.com>",),
+        )
+
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (original_forward, reply_with_note)},
+        )
+
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        conversation = MailConversationIndex.objects.get(account=account)
+        self.assertEqual(conversation.thread_key, "subject:ponuda br. 121714")
+        self.assertEqual(conversation.message_count, 2)
+
     def test_mail_index_recent_missing_reconcile_does_not_delete_by_default(self):
         token = create_mailbox_token(self.account_email, self.password)
         account = MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
@@ -906,6 +943,19 @@ class MailApiTests(TestCase):
         self.assertEqual(args[0], token.user)
         self.assertEqual(args[1].email, self.account_email)
         self.assertEqual(kwargs, {"limit": 500, "incremental": True})
+
+    def test_mail_index_sync_cycle_seeds_account_indexes_from_credentials(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        service = Mock()
+
+        result = run_sync_cycle(mail_index_service=service)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.selected, 1)
+        self.assertEqual(result.synced, 1)
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        self.assertEqual(account.user, token.user)
+        service.sync_account.assert_called_once()
 
     @patch("mailops.mail_indexing.runner.run_sync_cycle")
     def test_run_mail_index_sync_cycle_command_outputs_summary(self, run_cycle):

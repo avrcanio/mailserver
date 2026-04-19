@@ -338,7 +338,7 @@ Indexing can be refreshed operationally with:
 python manage.py sync_mail_index --account user@finestar.hr --limit 500
 ```
 
-By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes.
+By default the command performs incremental UID-window sync when folder state exists. Use `--full` for a bounded initial-style rescan. The index stores message metadata only; it does not store message bodies, raw MIME payloads, or attachment bytes. For the full operational and implementation overview, see `docs/mail-indexing.md`.
 
 The deployed stack also includes a periodic sync runner:
 
