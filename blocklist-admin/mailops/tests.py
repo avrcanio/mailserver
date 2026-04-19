@@ -1067,6 +1067,48 @@ class MailApiTests(TestCase):
         self.assertEqual(service.get_message_detail.call_args.kwargs, {"folder": "INBOX", "uid": "42"})
 
     @patch("mailops.api.MailboxService")
+    def test_mail_message_detail_marks_indexed_message_read(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        indexed_message = MailMessageSummary(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender <sender@example.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+            flags=(),
+        )
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (indexed_message,)},
+        )
+        service_class.return_value.get_message_detail.return_value = MailMessageDetail(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender <sender@example.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 16, 7, 0, tzinfo=dt_timezone.utc),
+            message_id="<m1@example.com>",
+            flags=("Seen",),
+            text_body="Plain body",
+        )
+
+        response = self.client.get(reverse("mailops:api_mail_message_detail", kwargs={"uid": "42"}), {"folder": "INBOX"}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        message = MailMessageIndex.objects.get(account=account, folder="INBOX", uid=42)
+        conversation = MailConversationIndex.objects.get(account=account)
+        self.assertTrue(message.is_read)
+        self.assertIn("Seen", message.flags_json)
+        self.assertFalse(conversation.has_unread)
+
+    @patch("mailops.api.MailboxService")
     def test_mail_message_detail_maps_connection_errors(self, service_class):
         headers = self.auth_headers()
         service_class.return_value.get_message_detail.side_effect = MailConnectionError("down")

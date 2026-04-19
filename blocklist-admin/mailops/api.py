@@ -333,6 +333,28 @@ def mark_mail_index_stale_after_send(user, account_email):
         logger.warning("Could not mark mail index stale for %s: %s", account_email, exc)
 
 
+def mark_index_message_read(user, account_email, folder, uid):
+    try:
+        from mailops.mail_indexing.sync import rebuild_conversation
+        from mailops.mail_indexing.threading import uid_int
+
+        account = MailAccountIndex.objects.filter(user=user, account_email=account_email.strip().lower()).first()
+        if account is None:
+            return
+        message = account.messages.filter(folder=folder, uid=uid_int(uid)).first()
+        if message is None or message.is_read:
+            return
+        flags = list(message.flags_json or [])
+        if not any(str(flag).lower() == "seen" for flag in flags):
+            flags.append("Seen")
+        message.flags_json = flags
+        message.is_read = True
+        message.save(update_fields=["flags_json", "is_read", "updated_at"])
+        rebuild_conversation(account, message.thread_key)
+    except Exception as exc:
+        logger.warning("Could not mark indexed message read for %s %s/%s: %s", account_email, folder, uid, exc)
+
+
 def validate_delete_payload(data):
     if "folder" not in data or not str(data.get("folder") or "").strip():
         return None, Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
@@ -679,6 +701,7 @@ class MessageDetailView(APIView):
             detail = MailboxService().get_message_detail(credentials, folder=folder, uid=uid)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
+        mark_index_message_read(request.user, credentials.email, folder, uid)
         return Response({"account_email": credentials.email, "folder": folder, "message": detail_payload(detail)})
 
 

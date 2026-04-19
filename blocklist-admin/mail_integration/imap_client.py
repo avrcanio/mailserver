@@ -274,8 +274,10 @@ class ImapClient:
             raise MailProtocolError(f"IMAP incremental index summary fetch failed for {folder}") from exc
 
     def fetch_message_detail(self, folder, uid):
-        metadata, message = self._fetch_full_message(folder, uid)
-        return _parse_detail_message(folder, str(uid), metadata, message)
+        metadata, message = self._fetch_full_message(folder, uid, readonly=False)
+        detail = _parse_detail_message(folder, str(uid), metadata, message)
+        self.mark_message_seen(folder, uid, select_folder=False)
+        return replace(detail, flags=_flags_with_seen(detail.flags))
 
     def fetch_attachment(self, folder, uid, attachment_id):
         metadata, message = self._fetch_full_message(folder, uid)
@@ -321,9 +323,23 @@ class ImapClient:
             summaries.append(summary)
         return summaries
 
-    def _fetch_full_message(self, folder, uid):
+    def mark_message_seen(self, folder, uid, select_folder=True):
         connection = self._require_connection()
-        self.select_folder(folder, readonly=True)
+        if select_folder:
+            self.select_folder(folder, readonly=False)
+        try:
+            status, data = connection.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Seen)")
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out marking IMAP message {uid} as seen") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP mark seen connection failure for UID {uid}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP mark seen failed for UID {uid}") from exc
+        self._expect_ok(status, data, f"IMAP mark seen failed for UID {uid}")
+
+    def _fetch_full_message(self, folder, uid, readonly=True):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=readonly)
         try:
             status, data = connection.uid("fetch", str(uid), "(FLAGS RFC822.SIZE RFC822)")
         except socket.timeout as exc:
@@ -789,6 +805,12 @@ def _message_activity_key(message):
 
 def _message_is_seen(message):
     return any(flag.lower() == "seen" for flag in message.flags)
+
+
+def _flags_with_seen(flags):
+    if any(str(flag).lower() == "seen" for flag in flags):
+        return tuple(flags)
+    return (*tuple(flags), "Seen")
 
 
 def _uid_int(uid):

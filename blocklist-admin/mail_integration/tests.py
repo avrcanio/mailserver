@@ -672,10 +672,10 @@ class ImapClientTests(SimpleTestCase):
         raw_message = _raw_detail_message(text_body="Plain body", html_body="<p><strong>HTML body</strong></p>", attach=True)
         connection = Mock()
         connection.select.return_value = ("OK", [b"1"])
-        connection.uid.return_value = (
-            "OK",
-            [(b"7 (UID 7 FLAGS (\\Seen \\Answered) RFC822.SIZE 2048 RFC822 {999}", raw_message)],
-        )
+        connection.uid.side_effect = [
+            ("OK", [(b"7 (UID 7 FLAGS (\\Answered) RFC822.SIZE 2048 RFC822 {999}", raw_message)]),
+            ("OK", [b""]),
+        ]
 
         with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
             detail = ImapClient().connect().fetch_message_detail("INBOX", "7")
@@ -691,8 +691,10 @@ class ImapClientTests(SimpleTestCase):
         self.assertFalse(detail.attachments[0].is_inline)
         self.assertEqual(detail.attachments[0].content_id, "")
         self.assertTrue(detail.has_visible_attachments)
-        connection.select.assert_called_once_with(b'"INBOX"', readonly=True)
-        connection.uid.assert_called_once_with("fetch", "7", "(FLAGS RFC822.SIZE RFC822)")
+        self.assertIn("Seen", detail.flags)
+        connection.select.assert_called_once_with(b'"INBOX"', readonly=False)
+        connection.uid.assert_any_call("fetch", "7", "(FLAGS RFC822.SIZE RFC822)")
+        connection.uid.assert_any_call("STORE", "7", "+FLAGS.SILENT", r"(\Seen)")
 
     def test_fetch_message_detail_extracts_inline_content_id_metadata(self):
         message = EmailMessage()
