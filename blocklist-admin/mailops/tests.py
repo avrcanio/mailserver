@@ -754,6 +754,42 @@ class MailApiTests(TestCase):
         self.assertEqual(conversation.thread_key, "subject:ponuda br. 121714")
         self.assertEqual(conversation.message_count, 2)
 
+    def test_mail_index_groups_offer_sent_copy_without_parent_headers(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        original_forward = MailMessageSummary(
+            uid="222",
+            folder="INBOX",
+            subject="Fwd: Ponuda br. 121714",
+            sender="Ante Vrcan <avrcanus@gmail.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 18, 21, 33, tzinfo=dt_timezone.utc),
+            message_id="<gmail-forward@example.com>",
+            in_reply_to=("<missing-original@example.com>",),
+            references=("<missing-original@example.com>",),
+        )
+        sent_reply = MailMessageSummary(
+            uid="58",
+            folder="Sent",
+            subject="Re: Fwd: Ponuda br. 121714 razlika",
+            sender=f"Ante Vrcan <{self.account_email}>",
+            to=("avrcanus@gmail.com",),
+            date=datetime(2026, 4, 19, 9, 15, tzinfo=dt_timezone.utc),
+            message_id="<sent-reply@example.com>",
+        )
+
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (original_forward,), "Sent": (sent_reply,)},
+        )
+
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        conversation = MailConversationIndex.objects.get(account=account)
+        self.assertEqual(conversation.thread_key, "subject:ponuda br. 121714")
+        self.assertEqual(conversation.message_count, 2)
+        self.assertEqual(conversation.folders_json, ["INBOX", "Sent"])
+
     def test_mail_index_recent_missing_reconcile_does_not_delete_by_default(self):
         token = create_mailbox_token(self.account_email, self.password)
         account = MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
@@ -1370,6 +1406,13 @@ class MailApiTests(TestCase):
     @patch("mailops.api.MailboxService")
     def test_mail_send_calls_service_and_returns_message_id(self, service_class):
         headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        index = MailAccountIndex.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=timezone.now(),
+        )
         service = service_class.return_value
         service.send_mail.return_value = "<sent@example.com>"
 
@@ -1380,6 +1423,8 @@ class MailApiTests(TestCase):
                 "cc": ["Copy Person <copy@example.com>"],
                 "bcc": ["Hidden Person <hidden@example.com>"],
                 "reply_to": "Reply Person <reply@example.com>",
+                "in_reply_to": "<root@example.com>",
+                "references": ["<first@example.com>", "<root@example.com>"],
                 "subject": "Status",
                 "text_body": "Plain body",
                 "html_body": "<p>HTML body</p>",
@@ -1398,11 +1443,15 @@ class MailApiTests(TestCase):
         self.assertEqual(request.cc, ("copy@example.com",))
         self.assertEqual(request.bcc, ("hidden@example.com",))
         self.assertEqual(request.reply_to, "reply@example.com")
+        self.assertEqual(request.in_reply_to, "<root@example.com>")
+        self.assertEqual(request.references, ("<first@example.com>", "<root@example.com>"))
         self.assertEqual(request.subject, "Status")
         self.assertEqual(request.text_body, "Plain body")
         self.assertEqual(request.html_body, "<p>HTML body</p>")
         self.assertEqual(request.from_display_name, "Sender Name")
         self.assertEqual(request.attachments, ())
+        index.refresh_from_db()
+        self.assertIsNone(index.last_indexed_at)
 
     @patch("mailops.api.MailboxService")
     def test_mail_send_accepts_multipart_attachments(self, service_class):

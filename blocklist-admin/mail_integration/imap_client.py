@@ -125,6 +125,19 @@ class ImapClient:
             raise MailProtocolError(f"IMAP folder selection failed for {folder}") from exc
         self._expect_ok(status, data, f"IMAP folder selection failed for {folder}")
 
+    def append_message(self, folder, message_bytes, flags=(r"\Seen",)):
+        connection = self._require_connection()
+        flag_list = f"({' '.join(flags)})" if flags else None
+        try:
+            status, data = connection.append(_imap_mailbox_arg(folder), flag_list, None, message_bytes)
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out appending IMAP message to {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP append connection failure for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP append failed for {folder}") from exc
+        self._expect_ok(status, data, f"IMAP append failed for {folder}")
+
     def fetch_message_summaries(self, folder="INBOX", limit=50):
         return list(self.fetch_message_summary_page(folder=folder, limit=limit).messages)
 
@@ -679,6 +692,9 @@ def _conversation_key(summary, message_ids):
             if subject:
                 return f"subject:{subject}"
             return f"id:{parent_ids[0]}"
+        subject = _business_thread_subject_key(summary.subject)
+        if subject:
+            return f"subject:{subject}"
         if own_id:
             return f"id:{own_id}"
     subject = _normalize_thread_subject_for_grouping(summary.subject)
@@ -809,13 +825,20 @@ def _normalize_thread_subject(value):
 
 
 def _normalize_thread_subject_for_grouping(value):
+    business_key = _business_thread_subject_key(value)
+    if business_key:
+        return business_key
+    return _normalize_thread_subject(value)
+
+
+def _business_thread_subject_key(value):
     subject = _normalize_thread_subject(value)
     offer_match = re.search(r"\bponuda\s+br\.?\s*([0-9][0-9 ._-]*)", subject)
     if offer_match:
         number = re.sub(r"\D+", "", offer_match.group(1))
         if number:
             return f"ponuda br. {number}"
-    return subject
+    return ""
 
 
 def _first_fetch_tuple(fetch_data):

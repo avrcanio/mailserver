@@ -21,6 +21,27 @@ The index is used by:
 Message details, full bodies, MIME payloads, and attachment bytes are still read
 live from IMAP by folder and UID.
 
+## Sent Copies
+
+Outgoing mail is sent through SMTP, then the backend appends the exact generated
+message to the account's resolved IMAP Sent folder. The Sent append happens after
+SMTP delivery succeeds. If SMTP succeeds but the Sent append fails, the API still
+returns `status: sent` and logs a warning instead of making the client retry and
+possibly send a duplicate email.
+
+After a successful send, the API marks the existing `MailAccountIndex` row stale
+by clearing `last_indexed_at`. The next unified conversation request can then use
+live IMAP fallback and see the newly appended Sent copy while the background
+`mailindex-sync` service refreshes the stored index.
+
+Reply clients should pass source-thread metadata in the send request:
+
+- `in_reply_to` becomes the outgoing `In-Reply-To` header
+- `references` becomes the outgoing `References` header
+
+When those headers are missing, the index can still group narrow business
+subjects such as `Ponuda br. 121714` by their extracted reference number.
+
 ## Data Model
 
 The index tables are defined in `mailops.models`.

@@ -1,4 +1,7 @@
+import logging
 from dataclasses import replace
+from email import policy as email_policy
+from email.message import EmailMessage
 
 from .exceptions import MailAttachmentLimitError, MailForwardAttachmentNotFoundError, MailForwardAttachmentNotVisibleError
 from .imap_client import ImapClient
@@ -8,6 +11,7 @@ from .smtp_client import SmtpClient
 
 MAX_SEND_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
 MAX_SEND_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024
+logger = logging.getLogger("mail_integration.mailbox_service")
 
 
 class MailboxService:
@@ -81,7 +85,22 @@ class MailboxService:
         _validate_attachment_limits(request.attachments)
         with self.smtp_client_factory() as client:
             client.login(credentials)
-            return client.send_mail(credentials, request)
+            message_id = client.send_mail(credentials, request)
+            sent_message = getattr(client, "last_sent_message", None)
+        self._append_sent_copy(credentials, sent_message)
+        return message_id
+
+    def _append_sent_copy(self, credentials, sent_message):
+        if not isinstance(sent_message, EmailMessage):
+            return
+        try:
+            with self.imap_client_factory() as client:
+                client.login(credentials)
+                sent_folder = client._resolve_sent_folder()
+                if sent_folder:
+                    client.append_message(sent_folder, sent_message.as_bytes(policy=email_policy.SMTP))
+        except Exception as exc:
+            logger.warning("Could not append sent copy for %s: %s", credentials.email, exc)
 
     def _resolve_forwarded_attachments(self, credentials, request):
         source = request.forward_source_message
