@@ -224,6 +224,7 @@ class GmailImportRunInline(admin.TabularInline):
 @admin.register(GmailImportAccount)
 class GmailImportAccountAdmin(admin.ModelAdmin):
     list_display = (
+        "user",
         "gmail_email",
         "target_mailbox_email",
         "delete_after_import",
@@ -233,7 +234,7 @@ class GmailImportAccountAdmin(admin.ModelAdmin):
         "updated_at",
     )
     list_filter = ("delete_after_import", "consecutive_failures")
-    search_fields = ("gmail_email", "target_mailbox_email", "last_history_id", "last_error")
+    search_fields = ("user__username", "user__email", "gmail_email", "target_mailbox_email", "last_history_id", "last_error")
     readonly_fields = ("refresh_token_status", "created_at", "updated_at")
     exclude = ("refresh_token",)
     inlines = (GmailImportRunInline, GmailImportMessageInline)
