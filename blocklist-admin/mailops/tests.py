@@ -790,6 +790,40 @@ class MailApiTests(TestCase):
         self.assertEqual(conversation.message_count, 2)
         self.assertEqual(conversation.folders_json, ["INBOX", "Sent"])
 
+    def test_mail_index_groups_generic_sent_reply_without_parent_headers(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        original = MailMessageSummary(
+            uid="224",
+            folder="INBOX",
+            subject="Prbno za brisanje",
+            sender="Ante Vrcan <dalekopro@gmail.com>",
+            to=(self.account_email,),
+            date=datetime(2026, 4, 20, 5, 58, tzinfo=dt_timezone.utc),
+            message_id="<gmail-original@example.com>",
+        )
+        sent_reply = MailMessageSummary(
+            uid="60",
+            folder="Sent",
+            subject="Re: Prbno za brisanje",
+            sender=f"Ante Vrcan <{self.account_email}>",
+            to=("dalekopro@gmail.com",),
+            date=datetime(2026, 4, 20, 6, 10, tzinfo=dt_timezone.utc),
+            message_id="<sent-reply@example.com>",
+        )
+
+        MailIndexService().index_summaries(
+            user=token.user,
+            account_email=self.account_email,
+            sent_folder="Sent",
+            summaries_by_folder={"INBOX": (original,), "Sent": (sent_reply,)},
+        )
+
+        account = MailAccountIndex.objects.get(account_email=self.account_email)
+        conversation = MailConversationIndex.objects.get(account=account)
+        self.assertEqual(conversation.thread_key, "subject:prbno za brisanje")
+        self.assertEqual(conversation.message_count, 2)
+        self.assertEqual(conversation.folders_json, ["INBOX", "Sent"])
+
     def test_mail_index_recent_missing_reconcile_does_not_delete_by_default(self):
         token = create_mailbox_token(self.account_email, self.password)
         account = MailAccountIndex.objects.create(user=token.user, account_email=self.account_email)
