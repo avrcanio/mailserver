@@ -56,7 +56,7 @@ def _http_error(status):
     return _FakeHttpError(status)
 
 
-def _gmail_service(list_payload=None, get_payload=None, history_payload=None, delete_payload=None):
+def _gmail_service(list_payload=None, get_payload=None, history_payload=None, delete_payload=None, profile_payload=None):
     service = Mock()
     users_api = Mock()
     messages_api = Mock()
@@ -71,6 +71,7 @@ def _gmail_service(list_payload=None, get_payload=None, history_payload=None, de
     messages_api.get.return_value = _FakeRequest(get_payload or {})
     messages_api.delete.return_value = _FakeRequest(delete_payload or {})
     history_api.list.return_value = _FakeRequest(history_payload or {})
+    users_api.getProfile.return_value = _FakeRequest(profile_payload or {})
     return service
 
 
@@ -142,6 +143,14 @@ class GmailClientTests(SimpleTestCase):
         GmailClient(refresh_token="refresh", service=service).delete_message("msg-1")
 
         service.users_api.messages_api.delete.assert_called_once_with(userId="me", id="msg-1")
+
+    def test_get_profile_email_reads_authenticated_gmail_identity(self):
+        service = _gmail_service(profile_payload={"emailAddress": " USER@Example.COM "})
+
+        email = GmailClient(refresh_token="refresh", service=service).get_profile_email()
+
+        self.assertEqual(email, "user@example.com")
+        service.users_api.getProfile.assert_called_once_with(userId="me")
 
     def test_execute_with_retry_retries_429_then_succeeds(self):
         request = Mock()

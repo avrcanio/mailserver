@@ -46,7 +46,7 @@ from mail_integration.schemas import (
     MailMessageSummaryPage,
 )
 
-from .api import create_mailbox_token, mailbox_credentials_from_request
+from .api import create_mailbox_token, mailbox_credentials_from_request, signed_gmail_oauth_state
 from .credential_crypto import (
     ENCRYPTED_VALUE_PREFIX,
     CredentialEncryptionError,
@@ -629,6 +629,149 @@ class MailApiTests(TestCase):
         self.assertEqual(account.get_refresh_token(), "refresh-secret")
         self.assertIn("Created Gmail import account", stdout.getvalue())
         exchange_code.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.build_authorization_url", return_value="https://accounts.google.test/auth?state=signed")
+    def test_gmail_connect_start_returns_signed_authorization_url(self, build_authorization_url):
+        headers = self.auth_headers()
+
+        response = self.client.post(reverse("mailops:api_gmail_connect_start"), data={}, content_type="application/json", **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["authorization_url"], "https://accounts.google.test/auth?state=signed")
+        self.assertEqual(payload["account_email"], self.account_email)
+        self.assertTrue(payload["state"])
+        self.assertEqual(GmailImportAccount.objects.count(), 0)
+        build_authorization_url.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email", return_value="user@example.com")
+    @patch("mailops.api.exchange_code_for_refresh_token", return_value="refresh-secret")
+    def test_gmail_connect_complete_creates_user_scoped_account(self, exchange_code, fetch_profile_email):
+        token = create_mailbox_token(self.account_email, self.password)
+        oauth_state = signed_gmail_oauth_state(token.user)
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_connect_complete"),
+            data={"code": "auth-code", "state": oauth_state},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {token.key}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["connected"], True)
+        self.assertEqual(payload["gmail_email"], self.account_email)
+        self.assertEqual(payload["target_mailbox_email"], self.account_email)
+        self.assertFalse(payload["delete_after_import"])
+        account = GmailImportAccount.objects.get()
+        self.assertEqual(account.user, token.user)
+        self.assertEqual(account.gmail_email, self.account_email)
+        self.assertEqual(account.target_mailbox_email, self.account_email)
+        self.assertEqual(account.get_refresh_token(), "refresh-secret")
+        exchange_code.assert_called_once()
+        fetch_profile_email.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email", return_value="other@example.com")
+    @patch("mailops.api.exchange_code_for_refresh_token", return_value="refresh-secret")
+    def test_gmail_connect_complete_rejects_mismatched_gmail_identity(self, exchange_code, fetch_profile_email):
+        token = create_mailbox_token(self.account_email, self.password)
+        oauth_state = signed_gmail_oauth_state(token.user)
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_connect_complete"),
+            data={"code": "auth-code", "state": oauth_state},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {token.key}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "gmail_identity_mismatch")
+        self.assertEqual(GmailImportAccount.objects.count(), 0)
+        exchange_code.assert_called_once()
+        fetch_profile_email.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email")
+    @patch("mailops.api.exchange_code_for_refresh_token")
+    def test_gmail_connect_complete_rejects_invalid_state(self, exchange_code, fetch_profile_email):
+        headers = self.auth_headers()
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_connect_complete"),
+            data={"code": "auth-code", "state": "bad-state"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_oauth_state")
+        exchange_code.assert_not_called()
+        fetch_profile_email.assert_not_called()
+
+    def test_gmail_connect_endpoints_require_authentication(self):
+        start_response = self.client.post(reverse("mailops:api_gmail_connect_start"), data={}, content_type="application/json")
+        complete_response = self.client.post(
+            reverse("mailops:api_gmail_connect_complete"),
+            data={"code": "auth-code", "state": "state"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(start_response.status_code, 401)
+        self.assertEqual(start_response.json()["error"], "not_authenticated")
+        self.assertEqual(complete_response.status_code, 401)
+        self.assertEqual(complete_response.json()["error"], "not_authenticated")
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email", return_value="user@example.com")
+    @patch("mailops.api.exchange_code_for_refresh_token", return_value="new-refresh-secret")
+    def test_gmail_connect_complete_updates_existing_user_account(self, exchange_code, fetch_profile_email):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("old-refresh-secret")
+        account.save()
+        oauth_state = signed_gmail_oauth_state(token.user)
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_connect_complete"),
+            data={"code": "auth-code", "state": oauth_state},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {token.key}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(GmailImportAccount.objects.count(), 1)
+        account.refresh_from_db()
+        self.assertEqual(account.get_refresh_token(), "new-refresh-secret")
+        exchange_code.assert_called_once()
+        fetch_profile_email.assert_called_once()
 
     def test_gmail_historical_import_dry_run_does_not_mutate_import_state(self):
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email)

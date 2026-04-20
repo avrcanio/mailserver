@@ -1,9 +1,12 @@
 import logging
+import secrets
 from email.utils import getaddresses
 
 from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core import signing
+from django.core.exceptions import ValidationError
 from django.http import HttpResponse
 from django.utils.http import content_disposition_header
 from django.utils import timezone
@@ -41,6 +44,9 @@ from .api_serializers import (
     DeleteMessagesResponseSerializer,
     ErrorSerializer,
     FoldersResponseSerializer,
+    GmailConnectedAccountSerializer,
+    GmailConnectCompleteRequestSerializer,
+    GmailConnectStartResponseSerializer,
     IdentitySerializer,
     LoginRequestSerializer,
     LogoutResponseSerializer,
@@ -57,12 +63,20 @@ from .api_serializers import (
     SendMailResponseSerializer,
     UnifiedConversationListResponseSerializer,
 )
-from .models import DeviceRegistration, MailAccountIndex, MailboxTokenCredential
+from mail_integration.gmail_client import (
+    build_authorization_url,
+    exchange_code_for_refresh_token,
+    fetch_gmail_profile_email,
+    oauth_config_from_settings,
+)
+
+from .models import DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
 from .services import send_mail_notification
 
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
 MAILBOX_API_PERMISSION_CLASSES = [IsAuthenticated]
+GMAIL_OAUTH_STATE_SALT = "mailops.gmail-oauth-state"
 logger = logging.getLogger("mailops.api")
 
 
@@ -153,6 +167,34 @@ def mail_error_response(exc):
         if isinstance(exc, error_type):
             return Response({"error": code, "detail": str(exc)}, status=response_status)
     return Response({"error": "mail_integration_failed", "detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+def signed_gmail_oauth_state(user):
+    return signing.dumps(
+        {
+            "user_id": user.pk,
+            "email": (user.email or "").strip().lower(),
+            "nonce": secrets.token_urlsafe(16),
+        },
+        salt=GMAIL_OAUTH_STATE_SALT,
+    )
+
+
+def validate_gmail_oauth_state(raw_state, user):
+    try:
+        payload = signing.loads(str(raw_state or ""), salt=GMAIL_OAUTH_STATE_SALT, max_age=600)
+    except signing.BadSignature:
+        return False
+    return payload.get("user_id") == user.pk and payload.get("email") == (user.email or "").strip().lower()
+
+
+def gmail_account_payload(account):
+    return {
+        "connected": True,
+        "gmail_email": account.gmail_email,
+        "target_mailbox_email": account.target_mailbox_email,
+        "delete_after_import": account.delete_after_import,
+    }
 
 
 def folder_payload(folder):
@@ -562,6 +604,89 @@ class LogoutView(APIView):
     def post(self, request):
         request.auth.delete()
         return Response({"success": True})
+
+
+class GmailConnectStartView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(request=None, responses={200: GmailConnectStartResponseSerializer, 401: ErrorSerializer, 502: ErrorSerializer})
+    def post(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        account_email = (request.user.email or "").strip().lower()
+        if credentials.email != account_email:
+            return Response(
+                {"error": "mailbox_identity_mismatch", "detail": "Authenticated mailbox must match the Django user email."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        try:
+            oauth_config = oauth_config_from_settings()
+            oauth_state = signed_gmail_oauth_state(request.user)
+            authorization_url = build_authorization_url(oauth_config, state=oauth_state)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response({"authorization_url": authorization_url, "state": oauth_state, "account_email": account_email})
+
+
+class GmailConnectCompleteView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        request=GmailConnectCompleteRequestSerializer,
+        responses={200: GmailConnectedAccountSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer},
+    )
+    def post(self, request):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        serializer = GmailConnectCompleteRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        account_email = (request.user.email or "").strip().lower()
+        if credentials.email != account_email:
+            return Response(
+                {"error": "mailbox_identity_mismatch", "detail": "Authenticated mailbox must match the Django user email."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        if not validate_gmail_oauth_state(serializer.validated_data["state"], request.user):
+            return Response({"error": "invalid_oauth_state"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            oauth_config = oauth_config_from_settings()
+            refresh_token = exchange_code_for_refresh_token(serializer.validated_data["code"], oauth_config)
+            gmail_email = fetch_gmail_profile_email(refresh_token, oauth_config)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+
+        if gmail_email != account_email:
+            return Response(
+                {
+                    "error": "gmail_identity_mismatch",
+                    "detail": "Connected Gmail account must match the Django user email.",
+                    "gmail_email": gmail_email,
+                    "expected_email": account_email,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        account = GmailImportAccount.objects.filter(user=request.user).first()
+        if account is None:
+            account = GmailImportAccount.objects.filter(user__isnull=True, gmail_email=account_email).first()
+        if account is None:
+            account = GmailImportAccount(user=request.user)
+        account.user = request.user
+        account.gmail_email = account_email
+        account.target_mailbox_email = account_email
+        account.last_error = ""
+        account.consecutive_failures = 0
+        account.set_refresh_token(refresh_token)
+        try:
+            account.save()
+        except ValidationError as exc:
+            return Response({"error": "gmail_account_invalid", "detail": exc.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(gmail_account_payload(account))
 
 
 class FolderListView(APIView):

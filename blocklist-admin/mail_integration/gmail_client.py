@@ -146,6 +146,14 @@ class GmailClient:
         request = self.service.users().messages().delete(userId=GMAIL_USER_ID, id=gmail_message_id)
         self._execute(request, f"Gmail message delete failed for {gmail_message_id}")
 
+    def get_profile_email(self):
+        request = self.service.users().getProfile(userId=GMAIL_USER_ID)
+        payload = self._execute(request, "Gmail profile fetch failed")
+        email = str(payload.get("emailAddress", "") or "").strip().lower()
+        if not email:
+            raise MailProtocolError("Gmail profile did not include an email address")
+        return email
+
     def _execute(self, request, error_message):
         return execute_with_retry(
             request,
@@ -199,6 +207,10 @@ def exchange_code_for_refresh_token(code, oauth_config=None):
     if not refresh_token:
         raise MailAuthError("Gmail OAuth token exchange did not return a refresh token")
     return refresh_token
+
+
+def fetch_gmail_profile_email(refresh_token, oauth_config=None):
+    return GmailClient(refresh_token, oauth_config=oauth_config).get_profile_email()
 
 
 def build_gmail_service(oauth_config, refresh_token):

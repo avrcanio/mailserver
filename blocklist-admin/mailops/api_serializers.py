@@ -77,6 +77,24 @@ class LogoutResponseSerializer(serializers.Serializer):
     success = serializers.BooleanField()
 
 
+class GmailConnectStartResponseSerializer(serializers.Serializer):
+    authorization_url = serializers.URLField()
+    state = serializers.CharField()
+    account_email = serializers.EmailField()
+
+
+class GmailConnectCompleteRequestSerializer(serializers.Serializer):
+    code = serializers.CharField(trim_whitespace=True, allow_blank=False)
+    state = serializers.CharField(trim_whitespace=True, allow_blank=False)
+
+
+class GmailConnectedAccountSerializer(serializers.Serializer):
+    connected = serializers.BooleanField()
+    gmail_email = serializers.EmailField()
+    target_mailbox_email = serializers.EmailField()
+    delete_after_import = serializers.BooleanField()
+
+
 class ErrorSerializer(serializers.Serializer):
     error = serializers.CharField()
     detail = serializers.CharField(required=False, allow_blank=True)
