@@ -1,4 +1,5 @@
 import imaplib
+import base64
 import socket
 import smtplib
 import ssl
@@ -19,6 +20,7 @@ from .exceptions import (
     MailTimeoutError,
 )
 from .imap_client import ImapClient
+from .gmail_client import GmailClient, execute_with_retry, oauth_config_from_settings
 from .mailbox_service import MailboxService
 from .schemas import (
     ForwardSourceMessage,
@@ -34,6 +36,134 @@ from .schemas import (
     SendMailRequest,
 )
 from .smtp_client import SmtpClient, build_email_message
+
+
+class _FakeRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self):
+        return self.payload
+
+
+class _FakeHttpError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.resp = Mock(status=status)
+
+
+def _http_error(status):
+    return _FakeHttpError(status)
+
+
+def _gmail_service(list_payload=None, get_payload=None, history_payload=None, delete_payload=None):
+    service = Mock()
+    users_api = Mock()
+    messages_api = Mock()
+    history_api = Mock()
+    service.users_api = users_api
+    users_api.messages_api = messages_api
+    users_api.history_api = history_api
+    service.users.return_value = users_api
+    users_api.messages.return_value = messages_api
+    users_api.history.return_value = history_api
+    messages_api.list.return_value = _FakeRequest(list_payload or {})
+    messages_api.get.return_value = _FakeRequest(get_payload or {})
+    messages_api.delete.return_value = _FakeRequest(delete_payload or {})
+    history_api.list.return_value = _FakeRequest(history_payload or {})
+    return service
+
+
+class GmailClientTests(SimpleTestCase):
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="urn:ietf:wg:oauth:2.0:oob",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    def test_oauth_config_reads_settings(self):
+        config = oauth_config_from_settings()
+
+        self.assertEqual(config.client_id, "client-id")
+        self.assertEqual(config.client_secret, "client-secret")
+        self.assertEqual(config.scopes, ("https://www.googleapis.com/auth/gmail.modify",))
+
+    def test_fetch_raw_message_decodes_payload_and_metadata(self):
+        raw_bytes = b"Message-ID: <gmail-msg@example.com>\r\nSubject: Hi\r\n\r\nBody"
+        raw_payload = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+        service = _gmail_service(
+            get_payload={
+                "id": "msg-1",
+                "threadId": "thread-1",
+                "historyId": "17",
+                "labelIds": ["INBOX"],
+                "raw": raw_payload,
+            }
+        )
+
+        message = GmailClient(refresh_token="refresh", service=service).fetch_raw_message("msg-1")
+
+        self.assertEqual(message.gmail_message_id, "msg-1")
+        self.assertEqual(message.gmail_thread_id, "thread-1")
+        self.assertEqual(message.history_id, "17")
+        self.assertEqual(message.label_ids, ("INBOX",))
+        self.assertEqual(message.raw_bytes, raw_bytes)
+        self.assertEqual(message.rfc_message_id, "<gmail-msg@example.com>")
+
+    def test_list_message_refs_and_history_messages(self):
+        service = _gmail_service(
+            list_payload={"messages": [{"id": "msg-1", "threadId": "thread-1"}], "nextPageToken": "next"},
+            history_payload={
+                "historyId": "99",
+                "history": [
+                    {
+                        "id": "98",
+                        "messagesAdded": [
+                            {"message": {"id": "msg-2", "threadId": "thread-2", "labelIds": ["SENT"]}},
+                        ],
+                    }
+                ],
+            },
+        )
+        client = GmailClient(refresh_token="refresh", service=service)
+
+        refs, next_page = client.list_message_refs(query="-in:spam", max_results=10)
+        history = client.list_history_page(start_history_id="97")
+
+        self.assertEqual(refs[0].gmail_message_id, "msg-1")
+        self.assertEqual(next_page, "next")
+        self.assertEqual(history.history_id, "99")
+        self.assertEqual(history.messages_added[0].gmail_message_id, "msg-2")
+        self.assertEqual(history.messages_added[0].label_ids, ("SENT",))
+
+    def test_delete_message_executes_delete_request(self):
+        service = _gmail_service(delete_payload={})
+
+        GmailClient(refresh_token="refresh", service=service).delete_message("msg-1")
+
+        service.users_api.messages_api.delete.assert_called_once_with(userId="me", id="msg-1")
+
+    def test_execute_with_retry_retries_429_then_succeeds(self):
+        request = Mock()
+        request.execute.side_effect = [_http_error(429), {"ok": True}]
+        sleep = Mock()
+
+        result = execute_with_retry(request, "Gmail failed", sleep=sleep, initial_backoff_seconds=0)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(request.execute.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_execute_with_retry_maps_auth_and_non_retryable_errors(self):
+        auth_request = Mock()
+        auth_request.execute.side_effect = _http_error(401)
+        bad_request = Mock()
+        bad_request.execute.side_effect = _http_error(400)
+
+        with self.assertRaises(MailAuthError):
+            execute_with_retry(auth_request, "Gmail failed", sleep=Mock())
+        with self.assertRaises(MailConnectionError):
+            execute_with_retry(bad_request, "Gmail failed", sleep=Mock())
 
 
 @override_settings(
