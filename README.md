@@ -204,8 +204,9 @@ docker compose logs -f gmail-import-sync
 docker compose exec mailadmin python manage.py run_gmail_import --help
 ```
 
-Setup, OAuth bootstrap, historical import, incremental sync, and smoke-test
-commands are documented in [docs/gmail-import.md](/opt/stacks/mailserver/docs/gmail-import.md).
+User-scoped Gmail onboarding, OAuth connection API, historical import,
+incremental sync, admin compatibility commands, and smoke-test checks are
+documented in [docs/gmail-import.md](/opt/stacks/mailserver/docs/gmail-import.md).
 
 - backup:
 
