@@ -479,6 +479,48 @@ class MailApiTests(TestCase):
         self.assertEqual(stored.get_refresh_token(), "refresh-secret")
         self.assertFalse(stored.delete_after_import)
 
+    def test_user_scoped_gmail_import_account_matches_owner_email(self):
+        user = get_user_model().objects.create_user(username="source", email=" Source@Example.COM ", password="secret")
+        account = GmailImportAccount(user=user, gmail_email=" SOURCE@example.com ", target_mailbox_email=" source@example.com ")
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        stored = GmailImportAccount.objects.get()
+        self.assertEqual(stored.user, user)
+        self.assertEqual(stored.gmail_email, "source@example.com")
+        self.assertEqual(stored.target_mailbox_email, "source@example.com")
+        self.assertEqual(stored.get_refresh_token(), "refresh-secret")
+
+    def test_user_scoped_gmail_import_account_rejects_mismatched_gmail_email(self):
+        user = get_user_model().objects.create_user(username="source", email="source@example.com", password="secret")
+        account = GmailImportAccount(user=user, gmail_email="other@example.com", target_mailbox_email="source@example.com")
+        account.set_refresh_token("refresh-secret")
+
+        with self.assertRaises(ValidationError) as ctx:
+            account.save()
+
+        self.assertIn("gmail_email", ctx.exception.message_dict)
+
+    def test_user_scoped_gmail_import_account_rejects_mismatched_target_mailbox(self):
+        user = get_user_model().objects.create_user(username="source", email="source@example.com", password="secret")
+        account = GmailImportAccount(user=user, gmail_email="source@example.com", target_mailbox_email="target@example.com")
+        account.set_refresh_token("refresh-secret")
+
+        with self.assertRaises(ValidationError) as ctx:
+            account.save()
+
+        self.assertIn("target_mailbox_email", ctx.exception.message_dict)
+
+    def test_legacy_gmail_import_account_can_remain_without_owner(self):
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email="target@example.com")
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        stored = GmailImportAccount.objects.get()
+        self.assertIsNone(stored.user)
+        self.assertEqual(stored.gmail_email, "source@gmail.com")
+        self.assertEqual(stored.target_mailbox_email, "target@example.com")
+
     def test_gmail_import_message_uses_gmail_id_as_unique_source_key(self):
         account = GmailImportAccount.objects.create(
             gmail_email="source@gmail.com",
@@ -532,6 +574,8 @@ class MailApiTests(TestCase):
 
         self.assertIn("refresh_token", account_admin.exclude)
         self.assertIn("refresh_token_status", account_admin.readonly_fields)
+        self.assertIn("user", account_admin.list_display)
+        self.assertIn("user__email", account_admin.search_fields)
 
     @override_settings(
         GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",

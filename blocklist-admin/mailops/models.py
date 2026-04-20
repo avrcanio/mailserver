@@ -195,6 +195,13 @@ class MailboxTokenCredential(models.Model):
 
 
 class GmailImportAccount(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="gmail_import_accounts",
+    )
     gmail_email = models.EmailField(unique=True, db_index=True)
     target_mailbox_email = models.EmailField(db_index=True)
     refresh_token = models.TextField()
@@ -209,6 +216,13 @@ class GmailImportAccount(models.Model):
 
     class Meta:
         ordering = ["gmail_email"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(user__isnull=False),
+                name="uniq_gmail_import_acct_user",
+            ),
+        ]
         verbose_name = "Gmail import account"
         verbose_name_plural = "Gmail import accounts"
 
@@ -216,6 +230,17 @@ class GmailImportAccount(models.Model):
         self.gmail_email = self.gmail_email.strip().lower()
         self.target_mailbox_email = self.target_mailbox_email.strip().lower()
         self.last_history_id = (self.last_history_id or "").strip()
+        if self.user_id:
+            user_email = (self.user.email or "").strip().lower()
+            errors = {}
+            if not user_email:
+                errors["user"] = "Owning Django user must have an email before Gmail connection."
+            if user_email and self.gmail_email != user_email:
+                errors["gmail_email"] = "Gmail email must match the owning Django user email."
+            if user_email and self.target_mailbox_email != user_email:
+                errors["target_mailbox_email"] = "Target mailbox email must match the owning Django user email."
+            if errors:
+                raise ValidationError(errors)
 
     def set_refresh_token(self, plaintext):
         self.refresh_token = encrypt_credential_value(plaintext)
