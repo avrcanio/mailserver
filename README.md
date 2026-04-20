@@ -85,6 +85,43 @@ Primjeri:
 
 Dodavanje nove domene bez mailboxa ide preko aliasa ili kreiranjem prvog mailboxa na toj domeni.
 
+### Automatsko kreiranje mailboxa iz mailadmin usera
+
+`mailadmin` moze automatski kreirati `docker-mailserver` mailbox kada se u Django adminu kreira obican non-staff user.
+Feature je opt-in. U `.env` ukljuci:
+
+```bash
+MAILBOX_AUTO_CREATE_FROM_USER_ADMIN=true
+MAILBOX_AUTO_CREATE_SKIP_STAFF=true
+```
+
+Zatim restartaj samo mailadmin:
+
+```bash
+docker compose up -d mailadmin
+```
+
+Operativni tok:
+
+1. Otvori `https://${MAILADMIN_HOST}/admin/`.
+2. Idi na `Authentication and Authorization` -> `Users` -> `Add user`.
+3. Upisi `username`, `email`, `password` i `password confirmation`.
+4. Spremi usera bez `staff` ili `superuser` oznake.
+5. `mailadmin` ce pozvati `setup email add <email> <password>` u `mailserver` kontejneru.
+6. Provjeri mailbox:
+
+```bash
+docker exec mailserver setup email list
+./scripts/mail.sh debug login user@example.com 'PasswordFromAdmin'
+```
+
+Napomene:
+
+- raw password se koristi samo tijekom create requesta i ne sprema se u Django model
+- ako mailbox provisioning padne, Django user creation se rollbacka
+- staff/superuser accounti se preskacu
+- v1 ne sinkronizira kasnije promjene emaila ili passworda; mailbox password mijenjaj preko `./scripts/mail.sh email update ...`
+
 DNS zapis predlozak za konkretnu domenu:
 
 ```bash

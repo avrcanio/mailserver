@@ -54,9 +54,153 @@ from .mail_indexing import MailIndexService
 from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
 from .models import DeviceRegistration, MailAccountIndex, MailConversationIndex, MailMessageIndex, MailboxTokenCredential, PushNotificationLog
+from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
 
 
 TEST_ENCRYPTION_KEY = "DhbKZLv4bil01DI7X2u09Q69vebV7py6A9m9q0gOCfg="
+
+
+class MailboxProvisioningServiceTests(TestCase):
+    @patch("mailops.services.docker.DockerClient")
+    def test_create_mailbox_account_executes_setup_add(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=0, output=b"created\n")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        output = create_mailbox_account(" USER@Example.COM ", "secret-password")
+
+        self.assertEqual(output, "created")
+        container.exec_run.assert_called_once_with(["setup", "email", "add", "user@example.com", "secret-password"])
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_create_mailbox_account_sanitizes_failure_output(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=1, output=b"failed secret-password\n")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        with self.assertRaises(MailboxProvisioningError) as context:
+            create_mailbox_account("user@example.com", "secret-password")
+
+        self.assertIn("[redacted-password]", str(context.exception))
+        self.assertNotIn("secret-password", str(context.exception))
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_delete_mailbox_account_executes_setup_del(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=0, output=b"deleted\n")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        output = delete_mailbox_account(" USER@Example.COM ", password="secret-password")
+
+        self.assertEqual(output, "deleted")
+        container.exec_run.assert_called_once_with(["setup", "email", "del", "-y", "user@example.com"])
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_delete_mailbox_account_raises_cleanup_error(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=1, output=b"delete failed secret-password\n")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        with self.assertRaises(MailboxCleanupError) as context:
+            delete_mailbox_account("user@example.com", password="secret-password")
+
+        self.assertNotIn("secret-password", str(context.exception))
+        self.assertIn("[redacted-password]", str(context.exception))
+
+    def test_sanitize_mailbox_command_output_redacts_password(self):
+        self.assertEqual(
+            sanitize_mailbox_command_output("before secret-password after", password="secret-password"),
+            "before [redacted-password] after",
+        )
+
+
+@override_settings(MAILBOX_AUTO_CREATE_FROM_USER_ADMIN=True, MAILBOX_AUTO_CREATE_SKIP_STAFF=True)
+class MailboxUserAdminTests(TestCase):
+    def setUp(self):
+        self.admin_user = get_user_model().objects.create_superuser(
+            username="admin",
+            email="admin@example.com",
+            password="admin-password",
+        )
+        self.client.force_login(self.admin_user)
+
+    def post_add_user(self, username="user@example.com", email="USER@Example.COM", password="mail-secret", follow=False):
+        return self.client.post(
+            reverse("admin:auth_user_add"),
+            data={
+                "username": username,
+                "email": email,
+                "usable_password": "true",
+                "password1": password,
+                "password2": password,
+                "_save": "Save",
+            },
+            follow=follow,
+        )
+
+    @patch("mailops.admin.create_mailbox_account")
+    def test_user_admin_create_provisions_mailbox_with_raw_password(self, create_mailbox):
+        response = self.post_add_user()
+
+        self.assertEqual(response.status_code, 302)
+        user = get_user_model().objects.get(email="user@example.com")
+        self.assertTrue(user.check_password("mail-secret"))
+        create_mailbox.assert_called_once_with("user@example.com", "mail-secret")
+
+    @patch("mailops.admin.create_mailbox_account", side_effect=MailboxProvisioningError("setup failed"))
+    def test_user_admin_provisioning_failure_rolls_back_user(self, create_mailbox):
+        response = self.post_add_user(follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(get_user_model().objects.filter(email="user@example.com").exists())
+        create_mailbox.assert_called_once_with("user@example.com", "mail-secret")
+
+    @patch("mailops.admin.delete_mailbox_account")
+    @patch("mailops.admin.create_mailbox_account")
+    @patch("mailops.admin.MailboxUserAdmin.save_related", side_effect=RuntimeError("database failed"))
+    def test_user_admin_later_failure_attempts_mailbox_cleanup(self, save_related, create_mailbox, delete_mailbox):
+        response = self.post_add_user(follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(get_user_model().objects.filter(email="user@example.com").exists())
+        create_mailbox.assert_called_once_with("user@example.com", "mail-secret")
+        delete_mailbox.assert_called_once_with("user@example.com")
+
+    @patch("mailops.admin.create_mailbox_account")
+    def test_user_admin_rejects_duplicate_email(self, create_mailbox):
+        get_user_model().objects.create_user(username="existing", email="user@example.com")
+
+        response = self.post_add_user()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_user_model().objects.filter(email__iexact="user@example.com").count(), 1)
+        create_mailbox.assert_not_called()
+
+    @override_settings(MAILBOX_AUTO_CREATE_FROM_USER_ADMIN=False)
+    @patch("mailops.admin.create_mailbox_account")
+    def test_feature_flag_disabled_preserves_user_create_without_mailbox(self, create_mailbox):
+        response = self.post_add_user(email="", username="plain-user")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(get_user_model().objects.filter(username="plain-user").exists())
+        create_mailbox.assert_not_called()
+
+    def test_user_admin_change_blocks_non_staff_email_change(self):
+        from .admin import MailboxUserChangeForm
+
+        user = get_user_model().objects.create_user(username="mailbox-user", email="mailbox@example.com", password="secret")
+        form = MailboxUserChangeForm(
+            data={
+                "username": "mailbox-user",
+                "email": "other@example.com",
+                "password": user.password,
+                "is_active": "on",
+            },
+            instance=user,
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("Email changes for mailbox-backed users are blocked in v1.", form.errors["email"])
 
 
 @override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY=TEST_ENCRYPTION_KEY)
