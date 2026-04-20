@@ -25,6 +25,7 @@ from mail_integration.exceptions import (
     MailInvalidOperationError,
     MailSendError,
 )
+from mail_integration.gmail_client import GmailMessageRef, GmailRawMessage
 from mail_integration.mailbox_service import MailboxService
 from mail_integration.schemas import (
     MailAttachmentContent,
@@ -53,6 +54,7 @@ from .credential_crypto import (
     encrypt_credential_value,
     encrypt_mailbox_password,
 )
+from .gmail_import import GmailImportService
 from .mail_indexing import MailIndexService
 from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
@@ -71,6 +73,56 @@ from .services import MailboxCleanupError, MailboxProvisioningError, create_mail
 
 
 TEST_ENCRYPTION_KEY = "DhbKZLv4bil01DI7X2u09Q69vebV7py6A9m9q0gOCfg="
+
+
+class FakeGmailClient:
+    def __init__(self, refs=(), raw_messages=None, events=None, delete_error=None):
+        self.refs = tuple(refs)
+        self.raw_messages = raw_messages or {}
+        self.events = events if events is not None else []
+        self.delete_error = delete_error
+        self.deleted = []
+        self.list_calls = []
+
+    def list_message_refs(self, query="", max_results=100, page_token=""):
+        self.list_calls.append({"query": query, "max_results": max_results, "page_token": page_token})
+        return self.refs[:max_results], ""
+
+    def fetch_raw_message(self, gmail_message_id):
+        self.events.append(f"fetch:{gmail_message_id}")
+        return self.raw_messages[gmail_message_id]
+
+    def delete_message(self, gmail_message_id):
+        self.events.append(f"delete:{gmail_message_id}")
+        if self.delete_error:
+            raise self.delete_error
+        self.deleted.append(gmail_message_id)
+
+
+class FakeImapClient:
+    def __init__(self, events=None, append_error=None, sent_folder="Sent"):
+        self.events = events if events is not None else []
+        self.append_error = append_error
+        self.sent_folder = sent_folder
+        self.appended = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return None
+
+    def login(self, credentials):
+        self.events.append(f"login:{credentials.email}")
+
+    def _resolve_sent_folder(self):
+        return self.sent_folder
+
+    def append_message(self, folder, message_bytes, flags=(r"\Seen",)):
+        self.events.append(f"append:{folder}")
+        if self.append_error:
+            raise self.append_error
+        self.appended.append((folder, message_bytes, flags))
 
 
 class MailboxProvisioningServiceTests(TestCase):
@@ -524,6 +576,205 @@ class MailApiTests(TestCase):
         self.assertEqual(account.get_refresh_token(), "refresh-secret")
         self.assertIn("Created Gmail import account", stdout.getvalue())
         exchange_code.assert_called_once()
+
+    def test_gmail_historical_import_dry_run_does_not_mutate_import_state(self):
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        gmail_client = FakeGmailClient(refs=(GmailMessageRef(gmail_message_id="gmail-1"),))
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(),
+        ).run_historical_import("source@gmail.com", self.account_email, limit=10, dry_run=True)
+
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.committed, 0)
+        self.assertEqual(GmailImportRun.objects.count(), 0)
+        self.assertEqual(GmailImportMessage.objects.count(), 0)
+        self.assertEqual(gmail_client.deleted, [])
+        self.assertIn("-in:drafts -in:spam -in:trash", gmail_client.list_calls[0]["query"])
+
+    def test_gmail_historical_import_appends_then_commits_without_default_delete(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        MailAccountIndex.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=timezone.now(),
+        )
+        events = []
+        gmail_client = FakeGmailClient(
+            refs=(GmailMessageRef(gmail_message_id="gmail-1", gmail_thread_id="thread-1"),),
+            raw_messages={
+                "gmail-1": GmailRawMessage(
+                    gmail_message_id="gmail-1",
+                    gmail_thread_id="thread-1",
+                    history_id="7",
+                    label_ids=("INBOX",),
+                    raw_bytes=b"Message-ID: <one@example.com>\r\n\r\nBody",
+                    rfc_message_id="<one@example.com>",
+                )
+            },
+            events=events,
+        )
+        imap_client = FakeImapClient(events=events)
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: imap_client,
+        ).run_historical_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.appended, 1)
+        self.assertEqual(result.committed, 1)
+        self.assertEqual(result.cleaned, 0)
+        self.assertEqual(events, ["login:user@example.com", "fetch:gmail-1", "append:INBOX"])
+        message = GmailImportMessage.objects.get()
+        self.assertEqual(message.state, GmailImportMessage.STATE_COMMITTED)
+        self.assertEqual(message.append_status, GmailImportMessage.STATUS_SUCCESS)
+        self.assertEqual(message.cleanup_status, GmailImportMessage.STATUS_PENDING)
+        self.assertEqual(message.target_folder, "INBOX")
+        self.assertEqual(message.rfc_message_id, "<one@example.com>")
+        self.assertEqual(gmail_client.deleted, [])
+        self.assertIsNone(MailAccountIndex.objects.get(account_email=self.account_email).last_indexed_at)
+        run = GmailImportRun.objects.get()
+        self.assertEqual(run.status, GmailImportRun.STATUS_SUCCESS)
+        self.assertEqual(run.committed_count, 1)
+
+    def test_gmail_historical_import_deletes_only_after_commit_when_enabled(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        events = []
+        gmail_client = FakeGmailClient(
+            refs=(GmailMessageRef(gmail_message_id="gmail-1"),),
+            raw_messages={
+                "gmail-1": GmailRawMessage(
+                    gmail_message_id="gmail-1",
+                    gmail_thread_id="thread-1",
+                    history_id="7",
+                    label_ids=("SENT",),
+                    raw_bytes=b"Message-ID: <sent@example.com>\r\n\r\nBody",
+                    rfc_message_id="<sent@example.com>",
+                )
+            },
+            events=events,
+        )
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(events=events, sent_folder="Sent"),
+        ).run_historical_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.cleaned, 1)
+        self.assertEqual(events, ["login:user@example.com", "fetch:gmail-1", "append:Sent", "delete:gmail-1"])
+        message = GmailImportMessage.objects.get()
+        self.assertEqual(message.state, GmailImportMessage.STATE_CLEANED)
+        self.assertEqual(message.cleanup_status, GmailImportMessage.STATUS_SUCCESS)
+        self.assertEqual(message.target_folder, "Sent")
+
+    def test_gmail_historical_import_does_not_delete_when_append_fails(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        events = []
+        gmail_client = FakeGmailClient(
+            refs=(GmailMessageRef(gmail_message_id="gmail-1"),),
+            raw_messages={
+                "gmail-1": GmailRawMessage(
+                    gmail_message_id="gmail-1",
+                    gmail_thread_id="thread-1",
+                    history_id="7",
+                    label_ids=("INBOX",),
+                    raw_bytes=b"Message-ID: <one@example.com>\r\n\r\nBody",
+                    rfc_message_id="<one@example.com>",
+                )
+            },
+            events=events,
+        )
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(events=events, append_error=MailConnectionError("append failed")),
+        ).run_historical_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(result.cleaned, 0)
+        self.assertEqual(events, ["login:user@example.com", "fetch:gmail-1", "append:INBOX"])
+        self.assertEqual(gmail_client.deleted, [])
+        message = GmailImportMessage.objects.get()
+        self.assertEqual(message.state, GmailImportMessage.STATE_FAILED)
+        self.assertEqual(message.append_status, GmailImportMessage.STATUS_FAILED)
+        self.assertIsNone(message.committed_at)
+
+    def test_gmail_historical_import_recovers_appended_record_without_duplicate_append(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        GmailImportMessage.objects.create(
+            import_account=account,
+            gmail_message_id="gmail-1",
+            state=GmailImportMessage.STATE_APPENDED,
+            append_status=GmailImportMessage.STATUS_SUCCESS,
+            target_folder="INBOX",
+            appended_at=timezone.now(),
+        )
+        events = []
+        gmail_client = FakeGmailClient(refs=(GmailMessageRef(gmail_message_id="gmail-1"),), events=events)
+        imap_client = FakeImapClient(events=events)
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: imap_client,
+        ).run_historical_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.appended, 0)
+        self.assertEqual(result.committed, 1)
+        self.assertEqual(result.cleaned, 1)
+        self.assertEqual(events, ["login:user@example.com", "delete:gmail-1"])
+        message = GmailImportMessage.objects.get()
+        self.assertEqual(message.state, GmailImportMessage.STATE_CLEANED)
+
+    @patch("mailops.management.commands.run_gmail_import.GmailImportService")
+    def test_run_gmail_import_command_prints_summary(self, service_class):
+        service_class.return_value.run_historical_import.return_value = Mock(
+            scanned=2,
+            appended=1,
+            committed=1,
+            cleaned=0,
+            skipped=1,
+            failed=0,
+        )
+        stdout = io.StringIO()
+
+        call_command(
+            "run_gmail_import",
+            "--account",
+            "source@gmail.com",
+            "--target",
+            self.account_email,
+            "--limit",
+            "2",
+            "--dry-run",
+            "--no-delete",
+            stdout=stdout,
+        )
+
+        self.assertIn("scanned=2 appended=1 committed=1 cleaned=0 skipped=1 failed=0", stdout.getvalue())
+        service_class.return_value.run_historical_import.assert_called_once_with(
+            gmail_email="source@gmail.com",
+            target_mailbox_email=self.account_email,
+            limit=2,
+            since="",
+            dry_run=True,
+            no_delete=True,
+        )
 
     def test_legacy_plaintext_migration_encrypts_existing_rows(self):
         migration = importlib.import_module("mailops.migrations.0004_encrypt_mailbox_token_credentials")
