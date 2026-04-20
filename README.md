@@ -197,6 +197,16 @@ docker compose logs -f mailindex-sync
 docker compose exec mailadmin python manage.py run_mail_index_sync_cycle
 ```
 
+- Gmail import:
+
+```bash
+docker compose logs -f gmail-import-sync
+docker compose exec mailadmin python manage.py run_gmail_import --help
+```
+
+Setup, OAuth bootstrap, historical import, incremental sync, and smoke-test
+commands are documented in [docs/gmail-import.md](/opt/stacks/mailserver/docs/gmail-import.md).
+
 - backup:
 
 ```bash
