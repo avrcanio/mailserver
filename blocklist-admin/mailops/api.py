@@ -333,6 +333,13 @@ def mark_mail_index_stale_after_send(user, account_email):
         logger.warning("Could not mark mail index stale for %s: %s", account_email, exc)
 
 
+def mark_mail_index_stale_after_incoming(account_email):
+    try:
+        MailAccountIndex.objects.filter(account_email=account_email.strip().lower()).update(last_indexed_at=None)
+    except Exception as exc:
+        logger.warning("Could not mark incoming mail index stale for %s: %s", account_email, exc)
+
+
 def mark_index_message_read(user, account_email, folder, uid):
     try:
         from mailops.mail_indexing.sync import rebuild_conversation
@@ -1085,6 +1092,7 @@ class NewMailHookView(APIView):
             "uid": (data.get("uid") or "").strip(),
             "messageId": (data.get("messageId") or "").strip(),
         }
+        mark_mail_index_stale_after_incoming(event["accountEmail"])
         try:
             result = send_mail_notification(event)
         except Exception as exc:

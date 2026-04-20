@@ -2011,6 +2011,44 @@ class PushApiTests(TestCase):
         self.assertEqual(message.data["messageId"], "<m1@example.com>")
         self.assertEqual(PushNotificationLog.objects.get().status, PushNotificationLog.STATUS_SUCCESS)
 
+    @patch("mailops.services.get_firebase_app")
+    @patch("mailops.services.messaging.send_each_for_multicast")
+    def test_new_mail_marks_existing_index_stale(self, send_multicast, get_app):
+        get_app.return_value = Mock()
+        send_multicast.return_value = Mock(success_count=1, failure_count=0, responses=[Mock(success=True)])
+        user = get_user_model().objects.create_user(username="user@example.com", email="user@example.com")
+        index = MailAccountIndex.objects.create(
+            user=user,
+            account_email="user@example.com",
+            index_status=MailAccountIndex.STATUS_READY,
+            last_indexed_at=timezone.now(),
+        )
+        DeviceRegistration.objects.create(
+            account_email="user@example.com",
+            fcm_token="token-1",
+            platform=DeviceRegistration.PLATFORM_ANDROID,
+            last_seen_at=timezone.now(),
+        )
+
+        response = self.client.post(
+            reverse("mailops:new_mail"),
+            data={
+                "accountEmail": "user@example.com",
+                "sender": "Sender Name <sender@example.com>",
+                "subject": "Hello",
+                "messageId": "<m1@example.com>",
+                "receivedAt": "2026-04-16T07:00:00Z",
+                "folder": "INBOX",
+                "uid": "42",
+            },
+            content_type="application/json",
+            headers={"X-Mail-Hook-Secret": "hook-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        index.refresh_from_db()
+        self.assertIsNone(index.last_indexed_at)
+
     def test_new_mail_without_devices_is_successful_noop(self):
         response = self.client.post(
             reverse("mailops:new_mail"),
