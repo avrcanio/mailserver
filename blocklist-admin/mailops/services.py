@@ -5,6 +5,56 @@ from firebase_admin import credentials, get_app, initialize_app, messaging
 from .models import DeviceRegistration, PushNotificationLog, SenderBlocklistRule
 
 
+class MailboxProvisioningError(RuntimeError):
+    pass
+
+
+class MailboxCleanupError(RuntimeError):
+    pass
+
+
+def sanitize_mailbox_command_output(value, password=""):
+    output = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+    if password:
+        output = output.replace(password, "[redacted-password]")
+    return output.strip()
+
+
+def _mailserver_container():
+    client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
+    return client.containers.get(settings.MAILSERVER_CONTAINER_NAME)
+
+
+def _exec_mailserver_setup(args, password=""):
+    try:
+        container = _mailserver_container()
+        result = container.exec_run(["setup", *args])
+    except Exception as exc:
+        message = sanitize_mailbox_command_output(str(exc), password=password)
+        raise MailboxProvisioningError(message or "Unable to execute mailserver setup command.") from exc
+    output = sanitize_mailbox_command_output(result.output, password=password)
+    return result.exit_code, output
+
+
+def create_mailbox_account(email, password):
+    normalized_email = email.strip().lower()
+    exit_code, output = _exec_mailserver_setup(["email", "add", normalized_email, password], password=password)
+    if exit_code != 0:
+        raise MailboxProvisioningError(output or f"Mailbox provisioning failed for {normalized_email}.")
+    return output
+
+
+def delete_mailbox_account(email, password=""):
+    normalized_email = email.strip().lower()
+    try:
+        exit_code, output = _exec_mailserver_setup(["email", "del", "-y", normalized_email], password=password)
+    except MailboxProvisioningError as exc:
+        raise MailboxCleanupError(str(exc)) from exc
+    if exit_code != 0:
+        raise MailboxCleanupError(output or f"Mailbox cleanup failed for {normalized_email}.")
+    return output
+
+
 def render_postfix_map():
     lines = [
         "# Managed by mailadmin.",
@@ -16,8 +66,7 @@ def render_postfix_map():
 
 
 def reload_mailserver():
-    client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
-    container = client.containers.get(settings.MAILSERVER_CONTAINER_NAME)
+    container = _mailserver_container()
     result = container.exec_run(["postfix", "reload"])
     if result.exit_code != 0:
         raise RuntimeError(result.output.decode("utf-8", errors="replace"))

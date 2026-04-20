@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 from django.conf import settings
 from django.db import models
 
-from .credential_crypto import decrypt_mailbox_password, encrypt_mailbox_password
+from .credential_crypto import decrypt_credential_value, decrypt_mailbox_password, encrypt_credential_value, encrypt_mailbox_password
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -192,6 +192,157 @@ class MailboxTokenCredential(models.Model):
 
     def __str__(self):
         return self.mailbox_email
+
+
+class GmailImportAccount(models.Model):
+    gmail_email = models.EmailField(unique=True, db_index=True)
+    target_mailbox_email = models.EmailField(db_index=True)
+    refresh_token = models.TextField()
+    last_history_id = models.CharField(max_length=128, blank=True, default="")
+    last_success_at = models.DateTimeField(null=True, blank=True)
+    historical_import_completed_at = models.DateTimeField(null=True, blank=True)
+    consecutive_failures = models.PositiveIntegerField(default=0)
+    delete_after_import = models.BooleanField(default=False)
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["gmail_email"]
+        verbose_name = "Gmail import account"
+        verbose_name_plural = "Gmail import accounts"
+
+    def clean(self):
+        self.gmail_email = self.gmail_email.strip().lower()
+        self.target_mailbox_email = self.target_mailbox_email.strip().lower()
+        self.last_history_id = (self.last_history_id or "").strip()
+
+    def set_refresh_token(self, plaintext):
+        self.refresh_token = encrypt_credential_value(plaintext)
+
+    def get_refresh_token(self):
+        return decrypt_credential_value(self.refresh_token, label="Gmail refresh token")
+
+    def save(self, *args, **kwargs):
+        self.gmail_email = self.gmail_email.strip().lower()
+        self.target_mailbox_email = self.target_mailbox_email.strip().lower()
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.gmail_email} -> {self.target_mailbox_email}"
+
+
+class GmailImportMessage(models.Model):
+    STATE_FETCHED = "fetched"
+    STATE_APPENDED = "appended"
+    STATE_COMMITTED = "committed"
+    STATE_CLEANED = "cleaned"
+    STATE_FAILED = "failed"
+    STATE_CHOICES = [
+        (STATE_FETCHED, "Fetched"),
+        (STATE_APPENDED, "Appended"),
+        (STATE_COMMITTED, "Committed"),
+        (STATE_CLEANED, "Cleaned"),
+        (STATE_FAILED, "Failed"),
+    ]
+    STATUS_PENDING = "pending"
+    STATUS_SUCCESS = "success"
+    STATUS_FAILED = "failed"
+    STATUS_SKIPPED = "skipped"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_SKIPPED, "Skipped"),
+    ]
+
+    import_account = models.ForeignKey(GmailImportAccount, on_delete=models.CASCADE, related_name="messages")
+    gmail_message_id = models.CharField(max_length=255)
+    gmail_thread_id = models.CharField(max_length=255, blank=True, default="")
+    rfc_message_id = models.CharField(max_length=998, blank=True, default="")
+    target_folder = models.CharField(max_length=255, blank=True, default="")
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default=STATE_FETCHED, db_index=True)
+    append_status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    cleanup_status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    fetched_at = models.DateTimeField(null=True, blank=True)
+    appended_at = models.DateTimeField(null=True, blank=True)
+    committed_at = models.DateTimeField(null=True, blank=True)
+    cleaned_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["import_account", "gmail_message_id"]
+        constraints = [
+            models.UniqueConstraint(fields=["import_account", "gmail_message_id"], name="uniq_gmail_import_msg_acct_id"),
+        ]
+        indexes = [
+            models.Index(fields=["import_account", "state"], name="gmailmsg_account_state_idx"),
+            models.Index(fields=["import_account", "rfc_message_id"], name="gmailmsg_account_rfcid_idx"),
+        ]
+        verbose_name = "Gmail import message"
+        verbose_name_plural = "Gmail import messages"
+
+    def clean(self):
+        self.gmail_message_id = self.gmail_message_id.strip()
+        self.gmail_thread_id = (self.gmail_thread_id or "").strip()
+        self.rfc_message_id = (self.rfc_message_id or "").strip()
+        self.target_folder = (self.target_folder or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.import_account.gmail_email} {self.gmail_message_id}"
+
+
+class GmailImportRun(models.Model):
+    STATUS_RUNNING = "running"
+    STATUS_SUCCESS = "success"
+    STATUS_PARTIAL = "partial"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_RUNNING, "Running"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_PARTIAL, "Partial"),
+        (STATUS_FAILED, "Failed"),
+    ]
+    MODE_HISTORICAL = "historical"
+    MODE_INCREMENTAL = "incremental"
+    MODE_DRY_RUN = "dry_run"
+    MODE_CHOICES = [
+        (MODE_HISTORICAL, "Historical"),
+        (MODE_INCREMENTAL, "Incremental"),
+        (MODE_DRY_RUN, "Dry run"),
+    ]
+
+    import_account = models.ForeignKey(GmailImportAccount, on_delete=models.CASCADE, related_name="runs")
+    mode = models.CharField(max_length=16, choices=MODE_CHOICES, default=MODE_HISTORICAL)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_RUNNING, db_index=True)
+    scanned_count = models.PositiveIntegerField(default=0)
+    appended_count = models.PositiveIntegerField(default=0)
+    committed_count = models.PositiveIntegerField(default=0)
+    cleaned_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True, default="")
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["import_account", "started_at"], name="gmailrun_account_started_idx"),
+            models.Index(fields=["import_account", "status"], name="gmailrun_account_status_idx"),
+        ]
+        verbose_name = "Gmail import run"
+        verbose_name_plural = "Gmail import runs"
+
+    def __str__(self):
+        return f"{self.import_account.gmail_email}: {self.status} @ {self.started_at:%Y-%m-%d %H:%M:%S}"
 
 
 class MailAccountIndex(models.Model):

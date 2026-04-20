@@ -97,6 +97,8 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 MAILADMIN_HOST = os.environ.get("MAILADMIN_HOST", "mailadmin.example.com")
 BLOCKLIST_CONFIG_PATH = Path(os.environ.get("BLOCKLIST_CONFIG_PATH", "/app/shared-config/postfix-sender-blocklist"))
 MAILSERVER_CONTAINER_NAME = os.environ.get("MAILSERVER_CONTAINER_NAME", "mailserver")
+MAILBOX_AUTO_CREATE_FROM_USER_ADMIN = env_bool("MAILBOX_AUTO_CREATE_FROM_USER_ADMIN", False)
+MAILBOX_AUTO_CREATE_SKIP_STAFF = env_bool("MAILBOX_AUTO_CREATE_SKIP_STAFF", True)
 BLOCKLIST_REJECT_MESSAGE = os.environ.get("BLOCKLIST_REJECT_MESSAGE", "Blocked by local policy")
 MAIL_NOTIFY_HOOK_SECRET = os.environ.get("MAIL_NOTIFY_HOOK_SECRET", "")
 DEVICE_REGISTRATION_SECRET = os.environ.get("DEVICE_REGISTRATION_SECRET", "")
@@ -115,6 +117,17 @@ MAIL_INDEX_SYNC_STALE_AFTER_SECONDS = int(os.environ.get("MAIL_INDEX_SYNC_STALE_
 MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS", "1800"))
 MAIL_INDEX_SYNC_MAX_ACCOUNTS = int(os.environ.get("MAIL_INDEX_SYNC_MAX_ACCOUNTS", "50"))
 MAIL_INDEX_SYNC_LIMIT = int(os.environ.get("MAIL_INDEX_SYNC_LIMIT", "500"))
+GMAIL_IMPORT_GOOGLE_CLIENT_ID = os.environ.get("GMAIL_IMPORT_GOOGLE_CLIENT_ID", "")
+GMAIL_IMPORT_GOOGLE_CLIENT_SECRET = os.environ.get("GMAIL_IMPORT_GOOGLE_CLIENT_SECRET", "")
+GMAIL_IMPORT_OAUTH_REDIRECT_URI = os.environ.get("GMAIL_IMPORT_OAUTH_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+GMAIL_IMPORT_OAUTH_SCOPES = tuple(
+    scope.strip()
+    for scope in os.environ.get(
+        "GMAIL_IMPORT_OAUTH_SCOPES",
+        "https://www.googleapis.com/auth/gmail.modify",
+    ).split(",")
+    if scope.strip()
+)
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
