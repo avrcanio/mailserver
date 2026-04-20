@@ -5,9 +5,11 @@ from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
 from django.apps import apps
+from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import transaction
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -48,12 +50,23 @@ from .credential_crypto import (
     ENCRYPTED_VALUE_PREFIX,
     CredentialEncryptionError,
     decrypt_mailbox_password,
+    encrypt_credential_value,
     encrypt_mailbox_password,
 )
 from .mail_indexing import MailIndexService
 from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
-from .models import DeviceRegistration, MailAccountIndex, MailConversationIndex, MailMessageIndex, MailboxTokenCredential, PushNotificationLog
+from .models import (
+    DeviceRegistration,
+    GmailImportAccount,
+    GmailImportMessage,
+    GmailImportRun,
+    MailAccountIndex,
+    MailConversationIndex,
+    MailMessageIndex,
+    MailboxTokenCredential,
+    PushNotificationLog,
+)
 from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
 
 
@@ -391,6 +404,73 @@ class MailApiTests(TestCase):
         with override_settings(MAILBOX_CREDENTIAL_ENCRYPTION_KEY="not-a-fernet-key"):
             with self.assertRaises(ImproperlyConfigured):
                 decrypt_mailbox_password(f"{ENCRYPTED_VALUE_PREFIX}bad")
+
+    def test_gmail_import_account_encrypts_refresh_token_and_normalizes_email(self):
+        account = GmailImportAccount(gmail_email=" USER@Gmail.COM ", target_mailbox_email=" TARGET@Example.COM ")
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        stored = GmailImportAccount.objects.get()
+        self.assertEqual(stored.gmail_email, "user@gmail.com")
+        self.assertEqual(stored.target_mailbox_email, "target@example.com")
+        self.assertTrue(stored.refresh_token.startswith(ENCRYPTED_VALUE_PREFIX))
+        self.assertNotIn("refresh-secret", stored.refresh_token)
+        self.assertEqual(stored.get_refresh_token(), "refresh-secret")
+        self.assertFalse(stored.delete_after_import)
+
+    def test_gmail_import_message_uses_gmail_id_as_unique_source_key(self):
+        account = GmailImportAccount.objects.create(
+            gmail_email="source@gmail.com",
+            target_mailbox_email="target@example.com",
+            refresh_token=encrypt_credential_value("refresh-secret"),
+        )
+        GmailImportMessage.objects.create(
+            import_account=account,
+            gmail_message_id=" gmail-1 ",
+            gmail_thread_id=" thread-1 ",
+            rfc_message_id="<same@example.com>",
+            target_folder=" INBOX ",
+            state=GmailImportMessage.STATE_COMMITTED,
+            append_status=GmailImportMessage.STATUS_SUCCESS,
+        )
+
+        message = GmailImportMessage.objects.get()
+        self.assertEqual(message.gmail_message_id, "gmail-1")
+        self.assertEqual(message.gmail_thread_id, "thread-1")
+        self.assertEqual(message.target_folder, "INBOX")
+        self.assertEqual(message.cleanup_status, GmailImportMessage.STATUS_PENDING)
+        with transaction.atomic():
+            with self.assertRaises(ValidationError):
+                GmailImportMessage.objects.create(import_account=account, gmail_message_id="gmail-1")
+
+    def test_gmail_import_run_stores_operational_counters(self):
+        account = GmailImportAccount.objects.create(
+            gmail_email="source@gmail.com",
+            target_mailbox_email="target@example.com",
+            refresh_token=encrypt_credential_value("refresh-secret"),
+        )
+        run = GmailImportRun.objects.create(
+            import_account=account,
+            mode=GmailImportRun.MODE_HISTORICAL,
+            status=GmailImportRun.STATUS_PARTIAL,
+            scanned_count=10,
+            appended_count=8,
+            committed_count=8,
+            cleaned_count=0,
+            skipped_count=1,
+            failed_count=1,
+            error="one failed",
+        )
+
+        self.assertEqual(str(run).split(":")[0], "source@gmail.com")
+        self.assertEqual(run.committed_count, 8)
+        self.assertEqual(run.cleaned_count, 0)
+
+    def test_gmail_import_admin_hides_refresh_token_field(self):
+        account_admin = django_admin.site._registry[GmailImportAccount]
+
+        self.assertIn("refresh_token", account_admin.exclude)
+        self.assertIn("refresh_token_status", account_admin.readonly_fields)
 
     def test_legacy_plaintext_migration_encrypts_existing_rows(self):
         migration = importlib.import_module("mailops.migrations.0004_encrypt_mailbox_token_credentials")

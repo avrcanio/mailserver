@@ -61,6 +61,10 @@ services:
       MAIL_IMAP_HOST: ${MAIL_HOSTNAME}
       MAIL_SMTP_HOST: ${MAIL_HOSTNAME}
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
+      GMAIL_IMPORT_GOOGLE_CLIENT_ID: ${GMAIL_IMPORT_GOOGLE_CLIENT_ID:-}
+      GMAIL_IMPORT_GOOGLE_CLIENT_SECRET: ${GMAIL_IMPORT_GOOGLE_CLIENT_SECRET:-}
+      GMAIL_IMPORT_OAUTH_REDIRECT_URI: ${GMAIL_IMPORT_OAUTH_REDIRECT_URI:-urn:ietf:wg:oauth:2.0:oob}
+      GMAIL_IMPORT_OAUTH_SCOPES: ${GMAIL_IMPORT_OAUTH_SCOPES:-https://www.googleapis.com/auth/gmail.modify}
     ports:
       - "127.0.0.1:8081:8000"
     volumes:
@@ -116,6 +120,10 @@ services:
       MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS: ${MAIL_INDEX_SYNC_FAILURE_COOLDOWN_SECONDS:-1800}
       MAIL_INDEX_SYNC_MAX_ACCOUNTS: ${MAIL_INDEX_SYNC_MAX_ACCOUNTS:-50}
       MAIL_INDEX_SYNC_LIMIT: ${MAIL_INDEX_SYNC_LIMIT:-500}
+      GMAIL_IMPORT_GOOGLE_CLIENT_ID: ${GMAIL_IMPORT_GOOGLE_CLIENT_ID:-}
+      GMAIL_IMPORT_GOOGLE_CLIENT_SECRET: ${GMAIL_IMPORT_GOOGLE_CLIENT_SECRET:-}
+      GMAIL_IMPORT_OAUTH_REDIRECT_URI: ${GMAIL_IMPORT_OAUTH_REDIRECT_URI:-urn:ietf:wg:oauth:2.0:oob}
+      GMAIL_IMPORT_OAUTH_SCOPES: ${GMAIL_IMPORT_OAUTH_SCOPES:-https://www.googleapis.com/auth/gmail.modify}
     volumes:
       - ./docker-data/dms/config:/app/shared-config
       - ./docker-data/secrets/firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro

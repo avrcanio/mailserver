@@ -4,6 +4,9 @@ django==5.2.1
 djangorestframework==3.16.0
 drf-spectacular==0.28.0
 firebase-admin==6.8.0
+google-api-python-client==2.166.0
+google-auth==2.38.0
+google-auth-oauthlib==1.2.1
 gunicorn==23.0.0
 psycopg[binary]==3.2.6
 whitenoise==6.9.0

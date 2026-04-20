@@ -14,6 +14,9 @@ from .forms import SenderBlocklistRuleForm
 from .models import (
     ApplyLog,
     DeviceRegistration,
+    GmailImportAccount,
+    GmailImportMessage,
+    GmailImportRun,
     MailAccountIndex,
     MailConversationIndex,
     MailFolderIndexState,
@@ -183,6 +186,115 @@ class PushNotificationLogAdmin(admin.ModelAdmin):
         "failure_count",
         "error",
         "created_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+class GmailImportMessageInline(admin.TabularInline):
+    model = GmailImportMessage
+    extra = 0
+    fields = ("gmail_message_id", "state", "append_status", "cleanup_status", "target_folder", "committed_at", "cleaned_at")
+    readonly_fields = fields
+    can_delete = False
+    show_change_link = True
+    max_num = 0
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+class GmailImportRunInline(admin.TabularInline):
+    model = GmailImportRun
+    extra = 0
+    fields = ("mode", "status", "scanned_count", "committed_count", "cleaned_count", "failed_count", "started_at", "finished_at")
+    readonly_fields = fields
+    can_delete = False
+    show_change_link = True
+    max_num = 0
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(GmailImportAccount)
+class GmailImportAccountAdmin(admin.ModelAdmin):
+    list_display = (
+        "gmail_email",
+        "target_mailbox_email",
+        "delete_after_import",
+        "last_success_at",
+        "historical_import_completed_at",
+        "consecutive_failures",
+        "updated_at",
+    )
+    list_filter = ("delete_after_import", "consecutive_failures")
+    search_fields = ("gmail_email", "target_mailbox_email", "last_history_id", "last_error")
+    readonly_fields = ("refresh_token_status", "created_at", "updated_at")
+    exclude = ("refresh_token",)
+    inlines = (GmailImportRunInline, GmailImportMessageInline)
+
+    def refresh_token_status(self, obj):
+        if not obj or not obj.refresh_token:
+            return "Not configured"
+        return "Configured"
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(GmailImportMessage)
+class GmailImportMessageAdmin(admin.ModelAdmin):
+    list_display = ("import_account", "gmail_message_id", "state", "append_status", "cleanup_status", "target_folder", "committed_at", "cleaned_at")
+    list_filter = ("state", "append_status", "cleanup_status", "target_folder")
+    search_fields = ("import_account__gmail_email", "gmail_message_id", "gmail_thread_id", "rfc_message_id", "target_folder", "error")
+    readonly_fields = (
+        "import_account",
+        "gmail_message_id",
+        "gmail_thread_id",
+        "rfc_message_id",
+        "target_folder",
+        "state",
+        "append_status",
+        "cleanup_status",
+        "fetched_at",
+        "appended_at",
+        "committed_at",
+        "cleaned_at",
+        "error",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(GmailImportRun)
+class GmailImportRunAdmin(admin.ModelAdmin):
+    list_display = ("import_account", "mode", "status", "scanned_count", "committed_count", "cleaned_count", "failed_count", "started_at", "finished_at")
+    list_filter = ("mode", "status", "started_at")
+    search_fields = ("import_account__gmail_email", "import_account__target_mailbox_email", "error")
+    readonly_fields = (
+        "import_account",
+        "mode",
+        "status",
+        "scanned_count",
+        "appended_count",
+        "committed_count",
+        "cleaned_count",
+        "skipped_count",
+        "failed_count",
+        "error",
+        "started_at",
+        "finished_at",
     )
 
     def has_add_permission(self, request):
