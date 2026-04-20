@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 
+from django.conf import settings
 from django.db.models import Q
 from django.utils import timezone
 
-from mail_integration.gmail_client import GmailClient, GmailMessageRef
+from mail_integration.gmail_client import GMAIL_PERMANENT_DELETE_SCOPE, GmailClient, GmailMessageRef
 from mail_integration.imap_client import ImapClient
 from mail_integration.schemas import MailboxCredentials
 from mail_integration.exceptions import MailConnectionError, MailProtocolError
@@ -309,6 +310,8 @@ class GmailImportService:
         any_committed = False
         max_history_id = ""
         cleanup_enabled = bool(import_account.delete_after_import and not no_delete)
+        if cleanup_enabled:
+            _require_permanent_delete_scope()
 
         with self.imap_client_factory() as imap_client:
             imap_client.login(target_credentials)
@@ -522,6 +525,15 @@ def _historical_query(since):
     if since:
         query = f"{query} after:{since}"
     return query
+
+
+def _require_permanent_delete_scope():
+    configured_scopes = set(getattr(settings, "GMAIL_IMPORT_OAUTH_SCOPES", ()))
+    if GMAIL_PERMANENT_DELETE_SCOPE not in configured_scopes:
+        raise GmailImportError(
+            "Gmail permanent cleanup requires GMAIL_IMPORT_OAUTH_SCOPES to include "
+            f"{GMAIL_PERMANENT_DELETE_SCOPE}. Reconnect the Gmail account after changing the scope."
+        )
 
 
 def _target_folder(label_ids, sent_folder):

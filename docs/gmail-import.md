@@ -19,6 +19,9 @@ The importer remains conservative:
 - Gmail cleanup is disabled by default.
 - When cleanup is enabled, Gmail deletion happens only after committed import
   state.
+- Permanent Gmail cleanup uses the Gmail API permanent delete operation, not
+  trash or archive semantics, and requires the `https://mail.google.com/`
+  OAuth scope.
 
 ## Scope
 
@@ -97,13 +100,19 @@ docker compose exec -T mailadmin python manage.py shell -c \
 ## Google OAuth Setup
 
 Create a Google OAuth client for the mailadmin app. The redirect URI must be the
-URI used by the client/operator flow that receives Google's `code` and `state`
-and then posts them to the `connect/complete` API endpoint. The backend currently
-does not expose a browser callback page by itself.
-
-The importer uses the Gmail modify scope:
+URI used by the browser callback that receives Google's `code` and `state`:
 
 ```text
+https://mailadmin.example.com/oauth/gmail/callback
+```
+
+The importer requests the Gmail full-mail scope so cleanup can permanently
+delete Gmail source messages after committed import. It also keeps the
+`gmail.modify` scope in the request for compatibility with accounts that were
+previously connected before permanent cleanup was enabled:
+
+```text
+https://mail.google.com/
 https://www.googleapis.com/auth/gmail.modify
 ```
 
@@ -113,7 +122,7 @@ Set these values in the local `.env`:
 GMAIL_IMPORT_GOOGLE_CLIENT_ID=google-client-id
 GMAIL_IMPORT_GOOGLE_CLIENT_SECRET=google-client-secret
 GMAIL_IMPORT_OAUTH_REDIRECT_URI=https://app.example.com/oauth/gmail/callback
-GMAIL_IMPORT_OAUTH_SCOPES=https://www.googleapis.com/auth/gmail.modify
+GMAIL_IMPORT_OAUTH_SCOPES=https://mail.google.com/,https://www.googleapis.com/auth/gmail.modify
 GMAIL_IMPORT_SYNC_INTERVAL_SECONDS=600
 GMAIL_IMPORT_SYNC_LIMIT=100
 GMAIL_IMPORT_SYNC_MAX_ACCOUNTS=20
@@ -268,8 +277,9 @@ account.delete_after_import = True
 account.save(update_fields=["delete_after_import", "updated_at"])
 ```
 
-Run another bounded sync without `no_delete`. Gmail source messages are deleted
-only after the message reaches committed import state:
+Run another bounded sync without `no_delete`. Gmail source messages are eligible
+for cleanup only when the import record is in `committed` state and has not
+already been marked `cleaned`:
 
 ```bash
 curl -sS -X POST "https://${MAILADMIN_HOST}/api/external-accounts/gmail/sync" \
@@ -279,6 +289,8 @@ curl -sS -X POST "https://${MAILADMIN_HOST}/api/external-accounts/gmail/sync" \
 ```
 
 Use `"no_delete": true` any time you want to override cleanup for one run.
+Do not enable periodic or looped cleanup until a bounded manual cleanup batch
+succeeds with zero failures.
 
 ## Incremental Sync
 
@@ -458,6 +470,8 @@ Cleanup failed:
 - messages remain in committed state with `cleanup_status=failed`
 - rerun with cleanup enabled to retry Gmail deletion
 - use `"no_delete": true` to pause cleanup while investigating
+- verify `GMAIL_IMPORT_OAUTH_SCOPES=https://mail.google.com/` and reconnect the
+  Gmail account if cleanup fails with `permission denied`
 
 Logs:
 
