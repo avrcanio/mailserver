@@ -472,6 +472,59 @@ class MailApiTests(TestCase):
         self.assertIn("refresh_token", account_admin.exclude)
         self.assertIn("refresh_token_status", account_admin.readonly_fields)
 
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="urn:ietf:wg:oauth:2.0:oob",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.management.commands.bootstrap_gmail_import_oauth.build_authorization_url", return_value="https://accounts.google.test/auth")
+    def test_gmail_oauth_bootstrap_prints_consent_url_without_code(self, build_authorization_url):
+        stdout = io.StringIO()
+
+        call_command(
+            "bootstrap_gmail_import_oauth",
+            "--gmail",
+            "source@gmail.com",
+            "--target",
+            "target@example.com",
+            stdout=stdout,
+        )
+
+        self.assertIn("https://accounts.google.test/auth", stdout.getvalue())
+        self.assertEqual(GmailImportAccount.objects.count(), 0)
+        build_authorization_url.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="urn:ietf:wg:oauth:2.0:oob",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.management.commands.bootstrap_gmail_import_oauth.exchange_code_for_refresh_token", return_value="refresh-secret")
+    def test_gmail_oauth_bootstrap_stores_encrypted_refresh_token(self, exchange_code):
+        stdout = io.StringIO()
+
+        call_command(
+            "bootstrap_gmail_import_oauth",
+            "--gmail",
+            " SOURCE@Gmail.COM ",
+            "--target",
+            " TARGET@Example.COM ",
+            "--code",
+            "auth-code",
+            stdout=stdout,
+        )
+
+        account = GmailImportAccount.objects.get()
+        self.assertEqual(account.gmail_email, "source@gmail.com")
+        self.assertEqual(account.target_mailbox_email, "target@example.com")
+        self.assertTrue(account.refresh_token.startswith(ENCRYPTED_VALUE_PREFIX))
+        self.assertNotIn("refresh-secret", account.refresh_token)
+        self.assertEqual(account.get_refresh_token(), "refresh-secret")
+        self.assertIn("Created Gmail import account", stdout.getvalue())
+        exchange_code.assert_called_once()
+
     def test_legacy_plaintext_migration_encrypts_existing_rows(self):
         migration = importlib.import_module("mailops.migrations.0004_encrypt_mailbox_token_credentials")
         user = get_user_model().objects.create_user(username="legacy@example.com", email="legacy@example.com")
