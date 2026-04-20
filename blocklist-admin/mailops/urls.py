@@ -19,6 +19,7 @@ urlpatterns = [
     path("api/external-accounts/gmail/connect/complete", api.GmailConnectCompleteView.as_view(), name="api_gmail_connect_complete"),
     path("api/external-accounts/gmail/disconnect", api.GmailDisconnectView.as_view(), name="api_gmail_disconnect"),
     path("api/external-accounts/gmail/sync", api.GmailSyncTriggerView.as_view(), name="api_gmail_sync"),
+    path("oauth/gmail/callback", api.GmailOAuthCallbackView.as_view(), name="gmail_oauth_callback"),
     path("api/mail/folders", api.FolderListView.as_view(), name="api_mail_folders"),
     path("api/mail/conversations", api.ConversationListView.as_view(), name="api_mail_conversations"),
     path("api/mail/unified-conversations", api.UnifiedConversationListView.as_view(), name="api_mail_unified_conversations"),

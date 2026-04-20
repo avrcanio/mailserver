@@ -9,8 +9,14 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.http import HttpResponseRedirect
+from django.urls import path, reverse
+from django.utils.html import format_html
+
+from mail_integration.exceptions import MailIntegrationError
+from mail_integration.gmail_client import build_authorization_url, oauth_config_from_settings
 
 from .forms import SenderBlocklistRuleForm
+from .api import signed_gmail_oauth_state
 from .models import (
     ApplyLog,
     DeviceRegistration,
@@ -84,6 +90,15 @@ admin.site.unregister(User)
 class MailboxUserAdmin(DjangoUserAdmin):
     add_form = MailboxUserCreationForm
     form = MailboxUserChangeForm
+    readonly_fields = DjangoUserAdmin.readonly_fields + ("gmail_connection_status", "gmail_connect_link")
+    fieldsets = DjangoUserAdmin.fieldsets + (
+        (
+            "Gmail import",
+            {
+                "fields": ("gmail_connection_status", "gmail_connect_link"),
+            },
+        ),
+    )
     add_fieldsets = (
         (
             None,
@@ -93,6 +108,59 @@ class MailboxUserAdmin(DjangoUserAdmin):
             },
         ),
     )
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "<path:object_id>/connect-gmail/",
+                self.admin_site.admin_view(self.connect_gmail_view),
+                name="auth_user_connect_gmail",
+            ),
+        ]
+        return custom_urls + urls
+
+    def gmail_connection_status(self, obj):
+        if not obj or not obj.pk:
+            return "Save the user before connecting Gmail."
+        account = obj.gmail_import_accounts.first()
+        if account is None:
+            return "Not connected"
+        if account.refresh_token:
+            return f"Connected as {account.gmail_email}"
+        return "Account exists without OAuth token"
+
+    def gmail_connect_link(self, obj):
+        if not obj or not obj.pk:
+            return "Save the user before connecting Gmail."
+        if not normalize_mailbox_email(obj.email):
+            return "User email is required before Gmail connection."
+        url = reverse("admin:auth_user_connect_gmail", args=[obj.pk])
+        return format_html('<a class="button" href="{}">Connect Gmail</a>', url)
+
+    def connect_gmail_view(self, request, object_id):
+        user = self.get_object(request, object_id)
+        changelist_url = reverse("admin:auth_user_changelist")
+        if user is None:
+            self.message_user(request, "User not found.", level=messages.ERROR)
+            return HttpResponseRedirect(changelist_url)
+        change_url = reverse("admin:auth_user_change", args=[user.pk])
+        email = normalize_mailbox_email(user.email)
+        if not email:
+            self.message_user(request, "User email is required before Gmail connection.", level=messages.ERROR)
+            return HttpResponseRedirect(change_url)
+        try:
+            oauth_config = oauth_config_from_settings()
+            authorization_url = build_authorization_url(oauth_config, state=signed_gmail_oauth_state(user))
+        except MailIntegrationError as exc:
+            self.message_user(request, f"Gmail OAuth configuration failed: {exc}", level=messages.ERROR)
+            return HttpResponseRedirect(change_url)
+        self.message_user(
+            request,
+            "The browser consent step must be completed by the owner of the matching Gmail account.",
+            level=messages.INFO,
+        )
+        return HttpResponseRedirect(authorization_url)
 
     def should_provision_mailbox(self, obj):
         if not mailbox_auto_create_enabled():

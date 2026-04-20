@@ -773,6 +773,84 @@ class MailApiTests(TestCase):
         exchange_code.assert_called_once()
         fetch_profile_email.assert_called_once()
 
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email", return_value="user@example.com")
+    @patch("mailops.api.exchange_code_for_refresh_token", return_value="refresh-secret")
+    def test_gmail_oauth_callback_connects_matching_user(self, exchange_code, fetch_profile_email):
+        token = create_mailbox_token(self.account_email, self.password)
+        oauth_state = signed_gmail_oauth_state(token.user)
+
+        response = self.client.get(reverse("mailops:gmail_oauth_callback"), {"code": "auth-code", "state": oauth_state})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Gmail connected", response.content)
+        account = GmailImportAccount.objects.get()
+        self.assertEqual(account.user, token.user)
+        self.assertEqual(account.gmail_email, self.account_email)
+        self.assertEqual(account.target_mailbox_email, self.account_email)
+        self.assertEqual(account.get_refresh_token(), "refresh-secret")
+        exchange_code.assert_called_once()
+        fetch_profile_email.assert_called_once()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.api.fetch_gmail_profile_email", return_value="other@example.com")
+    @patch("mailops.api.exchange_code_for_refresh_token", return_value="refresh-secret")
+    def test_gmail_oauth_callback_rejects_mismatched_gmail_identity(self, exchange_code, fetch_profile_email):
+        user = get_user_model().objects.create_user(username=self.account_email, email=self.account_email, password="secret")
+        oauth_state = signed_gmail_oauth_state(user)
+
+        response = self.client.get(reverse("mailops:gmail_oauth_callback"), {"code": "auth-code", "state": oauth_state})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"Gmail connection rejected", response.content)
+        self.assertEqual(GmailImportAccount.objects.count(), 0)
+        exchange_code.assert_called_once()
+        fetch_profile_email.assert_called_once()
+
+    @patch("mailops.api.exchange_code_for_refresh_token")
+    def test_gmail_oauth_callback_rejects_invalid_state(self, exchange_code):
+        response = self.client.get(reverse("mailops:gmail_oauth_callback"), {"code": "auth-code", "state": "bad-state"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"OAuth state is invalid or expired", response.content)
+        exchange_code.assert_not_called()
+
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+    )
+    @patch("mailops.admin.build_authorization_url", return_value="https://accounts.google.test/auth")
+    def test_admin_user_connect_gmail_redirects_to_google(self, build_authorization_url):
+        admin_user = get_user_model().objects.create_superuser(username="admin", email="admin@example.com", password="secret")
+        target_user = get_user_model().objects.create_user(username=self.account_email, email=self.account_email, password="secret")
+        self.client.force_login(admin_user)
+
+        response = self.client.get(reverse("admin:auth_user_connect_gmail", args=[target_user.pk]))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://accounts.google.test/auth")
+        build_authorization_url.assert_called_once()
+
+    def test_admin_user_connect_gmail_requires_staff_authentication(self):
+        target_user = get_user_model().objects.create_user(username=self.account_email, email=self.account_email, password="secret")
+
+        response = self.client.get(reverse("admin:auth_user_connect_gmail", args=[target_user.pk]))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/admin/login/", response["Location"])
+
     def test_gmail_account_status_returns_disconnected_contract(self):
         response = self.client.get(reverse("mailops:api_gmail_account_status"), **self.auth_headers())
 
