@@ -80,14 +80,14 @@ class GmailClientTests(SimpleTestCase):
         GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
         GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
         GMAIL_IMPORT_OAUTH_REDIRECT_URI="urn:ietf:wg:oauth:2.0:oob",
-        GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",),
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/",),
     )
     def test_oauth_config_reads_settings(self):
         config = oauth_config_from_settings()
 
         self.assertEqual(config.client_id, "client-id")
         self.assertEqual(config.client_secret, "client-secret")
-        self.assertEqual(config.scopes, ("https://www.googleapis.com/auth/gmail.modify",))
+        self.assertEqual(config.scopes, ("https://mail.google.com/",))
 
     def test_fetch_raw_message_decodes_payload_and_metadata(self):
         raw_bytes = b"Message-ID: <gmail-msg@example.com>\r\nSubject: Hi\r\n\r\nBody"

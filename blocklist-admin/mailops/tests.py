@@ -1107,6 +1107,7 @@ class MailApiTests(TestCase):
                 imap_client_factory=lambda: FakeImapClient(),
             ).run_historical_import_for_user(owner, limit=10)
 
+    @override_settings(GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/",))
     def test_gmail_historical_import_deletes_only_after_commit_when_enabled(self):
         create_mailbox_token(self.account_email, self.password)
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
@@ -1140,6 +1141,7 @@ class MailApiTests(TestCase):
         self.assertEqual(message.cleanup_status, GmailImportMessage.STATUS_SUCCESS)
         self.assertEqual(message.target_folder, "Sent")
 
+    @override_settings(GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/",))
     def test_gmail_historical_import_does_not_delete_when_append_fails(self):
         create_mailbox_token(self.account_email, self.password)
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
@@ -1175,6 +1177,26 @@ class MailApiTests(TestCase):
         self.assertEqual(message.append_status, GmailImportMessage.STATUS_FAILED)
         self.assertIsNone(message.committed_at)
 
+    @override_settings(GMAIL_IMPORT_OAUTH_SCOPES=("https://www.googleapis.com/auth/gmail.modify",))
+    def test_gmail_cleanup_requires_permanent_delete_scope(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        with self.assertRaisesRegex(GmailImportError, "Gmail permanent cleanup requires"):
+            GmailImportService(
+                gmail_client_factory=lambda refresh_token: FakeGmailClient(refs=(GmailMessageRef(gmail_message_id="gmail-1"),)),
+                imap_client_factory=lambda: FakeImapClient(),
+            ).run_historical_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertFalse(GmailImportMessage.objects.exists())
+        run = GmailImportRun.objects.get(import_account=account)
+        self.assertEqual(run.status, GmailImportRun.STATUS_FAILED)
+        account.refresh_from_db()
+        self.assertIn("https://mail.google.com/", account.last_error)
+
+    @override_settings(GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/",))
     def test_gmail_historical_import_recovers_appended_record_without_duplicate_append(self):
         create_mailbox_token(self.account_email, self.password)
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)

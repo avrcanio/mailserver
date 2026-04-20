@@ -11,6 +11,7 @@ from .exceptions import MailAuthError, MailConnectionError, MailProtocolError
 
 
 GMAIL_USER_ID = "me"
+GMAIL_PERMANENT_DELETE_SCOPE = "https://mail.google.com/"
 DEFAULT_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -200,9 +201,7 @@ def exchange_code_for_refresh_token(code, oauth_config=None):
     try:
         flow.fetch_token(code=str(code).strip())
     except Exception as exc:
-        if _is_google_auth_error(exc):
-            raise MailAuthError("Gmail OAuth token exchange failed") from exc
-        raise
+        raise MailAuthError("Gmail OAuth token exchange failed") from exc
     refresh_token = getattr(flow.credentials, "refresh_token", "")
     if not refresh_token:
         raise MailAuthError("Gmail OAuth token exchange did not return a refresh token")

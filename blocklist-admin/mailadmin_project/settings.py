@@ -127,7 +127,7 @@ GMAIL_IMPORT_OAUTH_SCOPES = tuple(
     scope.strip()
     for scope in os.environ.get(
         "GMAIL_IMPORT_OAUTH_SCOPES",
-        "https://www.googleapis.com/auth/gmail.modify",
+        "https://mail.google.com/,https://www.googleapis.com/auth/gmail.modify",
     ).split(",")
     if scope.strip()
 )
