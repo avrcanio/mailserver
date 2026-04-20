@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 from email.utils import getaddresses
 
 from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
@@ -8,8 +9,10 @@ from django.contrib.auth import get_user_model
 from django.core import signing
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse
+from django.urls import reverse
 from django.utils.http import content_disposition_header
 from django.utils import timezone
+from django.utils.html import escape
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
@@ -180,6 +183,7 @@ def signed_gmail_oauth_state(user):
             "user_id": user.pk,
             "email": (user.email or "").strip().lower(),
             "nonce": secrets.token_urlsafe(16),
+            "iat": int(time.time()),
         },
         salt=GMAIL_OAUTH_STATE_SALT,
     )
@@ -230,6 +234,38 @@ def require_user_mailbox_identity(request):
 
 def user_gmail_account(user):
     return GmailImportAccount.objects.filter(user=user).first()
+
+
+def upsert_user_gmail_account(user, refresh_token):
+    account_email = (user.email or "").strip().lower()
+    account = GmailImportAccount.objects.filter(user=user).first()
+    if account is None:
+        account = GmailImportAccount.objects.filter(user__isnull=True, gmail_email=account_email).first()
+    if account is None:
+        account = GmailImportAccount(user=user)
+    account.user = user
+    account.gmail_email = account_email
+    account.target_mailbox_email = account_email
+    account.last_error = ""
+    account.consecutive_failures = 0
+    account.set_refresh_token(refresh_token)
+    account.save()
+    return account
+
+
+def gmail_oauth_result_html(title, message, status_code=200, admin_url=""):
+    admin_link = ""
+    if admin_url:
+        admin_link = f'<p><a href="{escape(admin_url)}">Back to Django admin</a></p>'
+    return HttpResponse(
+        (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>{escape(title)}</title></head><body>"
+            f"<h1>{escape(title)}</h1><p>{escape(message)}</p>{admin_link}"
+            "</body></html>"
+        ),
+        status=status_code,
+    )
 
 
 def folder_payload(folder):
@@ -694,22 +730,71 @@ class GmailConnectCompleteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        account = GmailImportAccount.objects.filter(user=request.user).first()
-        if account is None:
-            account = GmailImportAccount.objects.filter(user__isnull=True, gmail_email=account_email).first()
-        if account is None:
-            account = GmailImportAccount(user=request.user)
-        account.user = request.user
-        account.gmail_email = account_email
-        account.target_mailbox_email = account_email
-        account.last_error = ""
-        account.consecutive_failures = 0
-        account.set_refresh_token(refresh_token)
         try:
-            account.save()
+            account = upsert_user_gmail_account(request.user, refresh_token)
         except ValidationError as exc:
             return Response({"error": "gmail_account_invalid", "detail": exc.message_dict}, status=status.HTTP_400_BAD_REQUEST)
         return Response(gmail_account_payload(account))
+
+
+class GmailOAuthCallbackView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    @extend_schema(exclude=True)
+    def get(self, request):
+        admin_url = reverse("admin:mailops_gmailimportaccount_changelist")
+        oauth_error = (request.GET.get("error") or "").strip()
+        if oauth_error:
+            return gmail_oauth_result_html("Gmail connection failed", f"Google returned OAuth error: {oauth_error}", 400, admin_url)
+        code = (request.GET.get("code") or "").strip()
+        raw_state = (request.GET.get("state") or "").strip()
+        if not code or not raw_state:
+            return gmail_oauth_result_html("Gmail connection failed", "Missing OAuth code or state.", 400, admin_url)
+        try:
+            payload = signing.loads(raw_state, salt=GMAIL_OAUTH_STATE_SALT, max_age=600)
+        except signing.BadSignature:
+            return gmail_oauth_result_html("Gmail connection failed", "OAuth state is invalid or expired.", 400, admin_url)
+        user_id = payload.get("user_id")
+        expected_email = str(payload.get("email") or "").strip().lower()
+        User = get_user_model()
+        user = User.objects.filter(pk=user_id).first()
+        if user is None:
+            return gmail_oauth_result_html("Gmail connection failed", "The target Django user no longer exists.", 400, admin_url)
+        account_email = (user.email or "").strip().lower()
+        user_admin_url = reverse("admin:auth_user_change", args=[user.pk])
+        if not account_email or account_email != expected_email:
+            return gmail_oauth_result_html("Gmail connection failed", "The target Django user email changed before OAuth completion.", 400, user_admin_url)
+
+        try:
+            oauth_config = oauth_config_from_settings()
+            refresh_token = exchange_code_for_refresh_token(code, oauth_config)
+            gmail_email = fetch_gmail_profile_email(refresh_token, oauth_config)
+        except MailIntegrationError as exc:
+            return gmail_oauth_result_html("Gmail connection failed", str(exc), 502, user_admin_url)
+
+        if gmail_email != account_email:
+            return gmail_oauth_result_html(
+                "Gmail connection rejected",
+                f"Connected Gmail account {gmail_email} must match Django user email {account_email}.",
+                400,
+                user_admin_url,
+            )
+
+        try:
+            upsert_user_gmail_account(user, refresh_token)
+        except ValidationError as exc:
+            return gmail_oauth_result_html("Gmail connection failed", str(exc), 400, user_admin_url)
+
+        credential_exists = MailboxTokenCredential.objects.filter(mailbox_email=account_email).exists()
+        if credential_exists:
+            message = f"Gmail account {gmail_email} is connected for {account_email}."
+        else:
+            message = (
+                f"Gmail account {gmail_email} is connected for {account_email}, "
+                "but sync cannot run until the user logs in once through the mailbox API."
+            )
+        return gmail_oauth_result_html("Gmail connected", message, 200, user_admin_url)
 
 
 class ExternalAccountsView(APIView):
