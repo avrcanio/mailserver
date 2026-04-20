@@ -90,9 +90,42 @@ class GmailConnectCompleteRequestSerializer(serializers.Serializer):
 
 class GmailConnectedAccountSerializer(serializers.Serializer):
     connected = serializers.BooleanField()
-    gmail_email = serializers.EmailField()
-    target_mailbox_email = serializers.EmailField()
-    delete_after_import = serializers.BooleanField()
+    provider = serializers.CharField()
+    gmail_email = serializers.EmailField(required=False, allow_null=True)
+    target_mailbox_email = serializers.EmailField(required=False, allow_null=True)
+    delete_after_import = serializers.BooleanField(required=False)
+    last_success_at = serializers.DateTimeField(required=False, allow_null=True)
+    last_error = serializers.CharField(required=False, allow_blank=True)
+    historical_import_completed = serializers.BooleanField(required=False)
+    historical_import_completed_at = serializers.DateTimeField(required=False, allow_null=True)
+    consecutive_failures = serializers.IntegerField(required=False)
+
+
+class ExternalAccountsResponseSerializer(serializers.Serializer):
+    accounts = GmailConnectedAccountSerializer(many=True)
+
+
+class GmailDisconnectResponseSerializer(serializers.Serializer):
+    disconnected = serializers.BooleanField()
+    provider = serializers.CharField()
+
+
+class GmailSyncTriggerRequestSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=("auto", "historical", "incremental"), required=False, default="auto")
+    limit = serializers.IntegerField(required=False, default=100, min_value=1, max_value=500)
+    since = serializers.CharField(required=False, allow_blank=True, default="")
+    no_delete = serializers.BooleanField(required=False, default=False)
+
+
+class GmailSyncTriggerResponseSerializer(serializers.Serializer):
+    provider = serializers.CharField()
+    mode = serializers.CharField()
+    scanned = serializers.IntegerField()
+    appended = serializers.IntegerField()
+    committed = serializers.IntegerField()
+    cleaned = serializers.IntegerField()
+    skipped = serializers.IntegerField()
+    failed = serializers.IntegerField()
 
 
 class ErrorSerializer(serializers.Serializer):

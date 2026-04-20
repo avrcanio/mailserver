@@ -773,6 +773,135 @@ class MailApiTests(TestCase):
         exchange_code.assert_called_once()
         fetch_profile_email.assert_called_once()
 
+    def test_gmail_account_status_returns_disconnected_contract(self):
+        response = self.client.get(reverse("mailops:api_gmail_account_status"), **self.auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["connected"], False)
+        self.assertEqual(payload["provider"], "gmail")
+        self.assertIsNone(payload["gmail_email"])
+        self.assertIsNone(payload["target_mailbox_email"])
+
+    def test_external_accounts_lists_only_authenticated_users_gmail_account(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        other_token = create_mailbox_token("other@example.com", "other-secret")
+        account = GmailImportAccount(
+            user=token.user,
+            gmail_email=self.account_email,
+            target_mailbox_email=self.account_email,
+            last_success_at=timezone.now(),
+            historical_import_completed_at=timezone.now(),
+        )
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        other_account = GmailImportAccount(user=other_token.user, gmail_email="other@example.com", target_mailbox_email="other@example.com")
+        other_account.set_refresh_token("other-refresh-secret")
+        other_account.save()
+
+        response = self.client.get(reverse("mailops:api_external_accounts"), HTTP_AUTHORIZATION=f"Token {token.key}")
+
+        self.assertEqual(response.status_code, 200)
+        accounts = response.json()["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["provider"], "gmail")
+        self.assertEqual(accounts[0]["gmail_email"], self.account_email)
+        self.assertEqual(accounts[0]["target_mailbox_email"], self.account_email)
+        self.assertTrue(accounts[0]["historical_import_completed"])
+        self.assertNotIn("other@example.com", json.dumps(accounts))
+
+    def test_gmail_disconnect_removes_only_authenticated_users_account(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        other_token = create_mailbox_token("other@example.com", "other-secret")
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        other_account = GmailImportAccount(user=other_token.user, gmail_email="other@example.com", target_mailbox_email="other@example.com")
+        other_account.set_refresh_token("other-refresh-secret")
+        other_account.save()
+
+        response = self.client.post(reverse("mailops:api_gmail_disconnect"), data={}, content_type="application/json", HTTP_AUTHORIZATION=f"Token {token.key}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"disconnected": True, "provider": "gmail"})
+        self.assertFalse(GmailImportAccount.objects.filter(pk=account.pk).exists())
+        self.assertTrue(GmailImportAccount.objects.filter(pk=other_account.pk).exists())
+
+    @patch("mailops.api.GmailImportService")
+    def test_gmail_sync_trigger_runs_historical_until_completed(self, service_class):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        service_class.return_value.run_historical_import_for_user.return_value = Mock(
+            scanned=2,
+            appended=1,
+            committed=1,
+            cleaned=0,
+            skipped=1,
+            failed=0,
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_sync"),
+            data={"mode": "auto", "limit": 2, "since": "2026/04/01", "no_delete": True},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {token.key}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mode"], "historical")
+        self.assertEqual(payload["scanned"], 2)
+        service_class.return_value.run_historical_import_for_user.assert_called_once_with(
+            token.user,
+            limit=2,
+            since="2026/04/01",
+            dry_run=False,
+            no_delete=True,
+        )
+        service_class.return_value.run_incremental_import_for_user.assert_not_called()
+
+    @patch("mailops.api.GmailImportService")
+    def test_gmail_sync_trigger_runs_incremental_after_historical_completion(self, service_class):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(
+            user=token.user,
+            gmail_email=self.account_email,
+            target_mailbox_email=self.account_email,
+            historical_import_completed_at=timezone.now(),
+        )
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        service_class.return_value.run_incremental_import_for_user.return_value = Mock(
+            scanned=3,
+            appended=2,
+            committed=2,
+            cleaned=0,
+            skipped=1,
+            failed=0,
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_gmail_sync"),
+            data={"mode": "auto", "limit": 3},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {token.key}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mode"], "incremental")
+        self.assertEqual(payload["committed"], 2)
+        service_class.return_value.run_incremental_import_for_user.assert_called_once_with(token.user, limit=3, no_delete=False)
+        service_class.return_value.run_historical_import_for_user.assert_not_called()
+
+    def test_gmail_sync_trigger_requires_connected_account(self):
+        response = self.client.post(reverse("mailops:api_gmail_sync"), data={}, content_type="application/json", **self.auth_headers())
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "gmail_account_not_connected")
+
     def test_gmail_historical_import_dry_run_does_not_mutate_import_state(self):
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email)
         account.set_refresh_token("refresh-secret")
