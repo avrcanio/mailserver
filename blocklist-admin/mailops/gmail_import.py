@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 
+from django.db.models import Q
 from django.utils import timezone
 
-from mail_integration.gmail_client import GmailClient
+from mail_integration.gmail_client import GmailClient, GmailMessageRef
 from mail_integration.imap_client import ImapClient
 from mail_integration.schemas import MailboxCredentials
+from mail_integration.exceptions import MailConnectionError, MailProtocolError
 
 from .models import GmailImportAccount, GmailImportMessage, GmailImportRun, MailAccountIndex, MailboxTokenCredential
 
@@ -23,9 +25,23 @@ class GmailImportResult:
     cleaned: int
     skipped: int
     failed: int
+    history_id: str = ""
+
+
+@dataclass(frozen=True)
+class GmailImportCycleResult:
+    scanned: int
+    selected: int
+    synced: int
+    failed: int
+    skipped: int
 
 
 class GmailImportError(Exception):
+    pass
+
+
+class GmailHistoryUnavailableError(GmailImportError):
     pass
 
 
@@ -98,12 +114,106 @@ class GmailImportService:
             if not import_account.historical_import_completed_at:
                 import_account.historical_import_completed_at = import_account.last_success_at
                 update_fields.append("historical_import_completed_at")
+            if result.history_id:
+                import_account.last_history_id = result.history_id
+                update_fields.append("last_history_id")
             import_account.save(update_fields=update_fields)
-        elif result.committed:
+        elif result.failed:
             import_account.last_error = f"{result.failed} Gmail import message(s) failed"
             import_account.save(update_fields=["last_error", "updated_at"])
 
         return result
+
+    def run_incremental_import(self, gmail_email, target_mailbox_email, limit=100, no_delete=False):
+        gmail_email = _normalize_email(gmail_email)
+        target_mailbox_email = _normalize_email(target_mailbox_email)
+        limit = int(limit)
+        if limit < 1:
+            raise GmailImportError("--limit must be greater than zero")
+
+        import_account = self._get_import_account(gmail_email, target_mailbox_email)
+        run = GmailImportRun.objects.create(import_account=import_account, mode=GmailImportRun.MODE_INCREMENTAL)
+        try:
+            result = self._run_incremental_batch(
+                import_account=import_account,
+                target_mailbox_email=target_mailbox_email,
+                run=run,
+                limit=limit,
+                no_delete=no_delete,
+            )
+        except Exception as exc:
+            run.status = GmailImportRun.STATUS_FAILED
+            run.error = str(exc)[:2000]
+            run.finished_at = timezone.now()
+            run.save(update_fields=["status", "error", "finished_at"])
+            import_account.consecutive_failures += 1
+            import_account.last_error = str(exc)[:2000]
+            import_account.save(update_fields=["consecutive_failures", "last_error", "updated_at"])
+            raise
+
+        run.status = GmailImportRun.STATUS_SUCCESS if result.failed == 0 else GmailImportRun.STATUS_PARTIAL
+        run.scanned_count = result.scanned
+        run.appended_count = result.appended
+        run.committed_count = result.committed
+        run.cleaned_count = result.cleaned
+        run.skipped_count = result.skipped
+        run.failed_count = result.failed
+        run.finished_at = timezone.now()
+        run.save(
+            update_fields=[
+                "status",
+                "scanned_count",
+                "appended_count",
+                "committed_count",
+                "cleaned_count",
+                "skipped_count",
+                "failed_count",
+                "finished_at",
+            ]
+        )
+
+        if result.failed == 0:
+            import_account.consecutive_failures = 0
+            import_account.last_error = ""
+            import_account.last_success_at = run.finished_at
+            update_fields = ["consecutive_failures", "last_error", "last_success_at", "updated_at"]
+            if result.history_id:
+                import_account.last_history_id = result.history_id
+                update_fields.append("last_history_id")
+            import_account.save(update_fields=update_fields)
+        elif result.failed:
+            import_account.last_error = f"{result.failed} Gmail import message(s) failed"
+            import_account.save(update_fields=["last_error", "updated_at"])
+
+        return result
+
+    def run_incremental_cycle(self, limit=100, max_accounts=20, no_delete=False):
+        limit = int(limit)
+        max_accounts = int(max_accounts)
+        if limit < 1:
+            raise GmailImportError("--limit must be greater than zero")
+        if max_accounts < 1:
+            raise GmailImportError("--max-accounts must be greater than zero")
+
+        accounts = list(
+            GmailImportAccount.objects.filter(historical_import_completed_at__isnull=False)
+            .filter(Q(consecutive_failures=0) | Q(last_success_at__isnull=False))
+            .order_by("last_success_at", "gmail_email")[:max_accounts]
+        )
+        synced = failed = skipped = 0
+        for account in accounts:
+            try:
+                self.run_incremental_import(
+                    gmail_email=account.gmail_email,
+                    target_mailbox_email=account.target_mailbox_email,
+                    limit=limit,
+                    no_delete=no_delete,
+                )
+            except Exception:
+                failed += 1
+            else:
+                synced += 1
+        return GmailImportCycleResult(scanned=GmailImportAccount.objects.count(), selected=len(accounts), synced=synced, failed=failed, skipped=skipped)
 
     def _run_historical_batch(self, import_account, target_mailbox_email, run, limit, since, dry_run, no_delete):
         gmail_client = self.gmail_client_factory(import_account.get_refresh_token())
@@ -112,9 +222,48 @@ class GmailImportService:
         if dry_run:
             return self._dry_run_result(run, scanned=scanned)
 
+        return self._import_refs(
+            import_account=import_account,
+            target_mailbox_email=target_mailbox_email,
+            run=run,
+            refs=refs,
+            no_delete=no_delete,
+            gmail_client=gmail_client,
+        )
+
+    def _run_incremental_batch(self, import_account, target_mailbox_email, run, limit, no_delete):
+        gmail_client = self.gmail_client_factory(import_account.get_refresh_token())
+        history_id = ""
+        try:
+            refs, history_id = _incremental_refs(gmail_client, import_account.last_history_id, limit=limit)
+        except GmailHistoryUnavailableError:
+            refs = _bounded_refs(gmail_client, query=GMAIL_HISTORICAL_QUERY, limit=limit)
+        result = self._import_refs(
+            import_account=import_account,
+            target_mailbox_email=target_mailbox_email,
+            run=run,
+            refs=refs,
+            no_delete=no_delete,
+            gmail_client=gmail_client,
+        )
+        return GmailImportResult(
+            run=run,
+            scanned=result.scanned,
+            appended=result.appended,
+            committed=result.committed,
+            cleaned=result.cleaned,
+            skipped=result.skipped,
+            failed=result.failed,
+            history_id=history_id or result.history_id,
+        )
+
+    def _import_refs(self, import_account, target_mailbox_email, run, refs, no_delete, gmail_client=None):
+        gmail_client = gmail_client or self.gmail_client_factory(import_account.get_refresh_token())
+        scanned = len(refs)
         target_credentials = self._target_credentials(target_mailbox_email)
         appended = committed = cleaned = skipped = failed = 0
         any_committed = False
+        max_history_id = ""
         cleanup_enabled = bool(import_account.delete_after_import and not no_delete)
 
         with self.imap_client_factory() as imap_client:
@@ -146,6 +295,7 @@ class GmailImportService:
 
                 try:
                     raw_message = gmail_client.fetch_raw_message(ref.gmail_message_id)
+                    max_history_id = _max_history_id(max_history_id, raw_message.history_id)
                     target_folder = _target_folder(raw_message.label_ids, sent_folder)
                     self._mark_fetched(message_record, raw_message)
                     imap_client.append_message(target_folder, raw_message.raw_bytes)
@@ -166,7 +316,16 @@ class GmailImportService:
         if any_committed:
             self._mark_index_stale(target_mailbox_email)
 
-        return GmailImportResult(run=run, scanned=scanned, appended=appended, committed=committed, cleaned=cleaned, skipped=skipped, failed=failed)
+        return GmailImportResult(
+            run=run,
+            scanned=scanned,
+            appended=appended,
+            committed=committed,
+            cleaned=cleaned,
+            skipped=skipped,
+            failed=failed,
+            history_id=max_history_id,
+        )
 
     def _dry_run_result(self, run, scanned):
         return GmailImportResult(run=run, scanned=scanned, appended=0, committed=0, cleaned=0, skipped=0, failed=0)
@@ -266,6 +425,37 @@ def _bounded_refs(gmail_client, query, limit):
     return tuple(refs[:limit])
 
 
+def _incremental_refs(gmail_client, start_history_id, limit):
+    start_history_id = str(start_history_id or "").strip()
+    if not start_history_id:
+        raise GmailHistoryUnavailableError("Gmail history cursor is missing")
+    refs = []
+    page_token = ""
+    latest_history_id = ""
+    try:
+        while len(refs) < limit:
+            page = gmail_client.list_history_page(start_history_id=start_history_id, page_token=page_token)
+            latest_history_id = _max_history_id(latest_history_id, page.history_id)
+            for message in page.messages_added:
+                refs.append(
+                    GmailMessageRef(
+                        gmail_message_id=message.gmail_message_id,
+                        gmail_thread_id=message.gmail_thread_id,
+                        history_id=message.history_id,
+                        label_ids=message.label_ids,
+                    )
+                )
+                latest_history_id = _max_history_id(latest_history_id, message.history_id)
+                if len(refs) >= limit:
+                    break
+            page_token = page.next_page_token
+            if not page_token:
+                break
+    except (MailConnectionError, MailProtocolError) as exc:
+        raise GmailHistoryUnavailableError(str(exc)) from exc
+    return tuple(refs[:limit]), latest_history_id
+
+
 def _historical_query(since):
     query = GMAIL_HISTORICAL_QUERY
     since = str(since or "").strip()
@@ -283,3 +473,16 @@ def _target_folder(label_ids, sent_folder):
 
 def _normalize_email(value):
     return str(value or "").strip().lower()
+
+
+def _max_history_id(current, candidate):
+    current = str(current or "").strip()
+    candidate = str(candidate or "").strip()
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    try:
+        return str(max(int(current), int(candidate)))
+    except ValueError:
+        return candidate
