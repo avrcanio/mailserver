@@ -54,7 +54,7 @@ from .credential_crypto import (
     encrypt_credential_value,
     encrypt_mailbox_password,
 )
-from .gmail_import import GmailImportService
+from .gmail_import import GmailImportError, GmailImportService
 from .mail_indexing import MailIndexService
 from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
@@ -840,6 +840,66 @@ class MailApiTests(TestCase):
         self.assertEqual(run.status, GmailImportRun.STATUS_SUCCESS)
         self.assertEqual(run.committed_count, 1)
 
+    def test_user_scoped_gmail_historical_import_resolves_owner_mailbox(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        events = []
+        gmail_client = FakeGmailClient(
+            refs=(GmailMessageRef(gmail_message_id="gmail-1"),),
+            raw_messages={
+                "gmail-1": GmailRawMessage(
+                    gmail_message_id="gmail-1",
+                    gmail_thread_id="thread-1",
+                    history_id="7",
+                    label_ids=("INBOX",),
+                    raw_bytes=b"Message-ID: <one@example.com>\r\n\r\nBody",
+                    rfc_message_id="<one@example.com>",
+                )
+            },
+            events=events,
+        )
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(events=events),
+        ).run_historical_import_for_user(token.user, limit=10)
+
+        self.assertEqual(result.committed, 1)
+        self.assertEqual(events, ["login:user@example.com", "fetch:gmail-1", "append:INBOX"])
+        self.assertEqual(GmailImportRun.objects.get().import_account, account)
+
+    def test_user_scoped_gmail_import_rejects_other_user_without_connected_account(self):
+        owner_token = create_mailbox_token(self.account_email, self.password)
+        other_user = get_user_model().objects.create_user(username="other@example.com", email="other@example.com", password="secret")
+        account = GmailImportAccount(user=owner_token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        with self.assertRaisesRegex(GmailImportError, "No Gmail import account connected for other@example.com"):
+            GmailImportService(
+                gmail_client_factory=lambda refresh_token: FakeGmailClient(),
+                imap_client_factory=lambda: FakeImapClient(),
+            ).run_historical_import_for_user(other_user, limit=10)
+
+    def test_user_scoped_gmail_import_rejects_mailbox_credentials_owned_by_another_user(self):
+        owner = get_user_model().objects.create_user(username="user@example.com", email=self.account_email, password="secret")
+        other_user = get_user_model().objects.create_user(username="other@example.com", email="other@example.com", password="secret")
+        other_token = Token.objects.create(user=other_user)
+        credential = MailboxTokenCredential(token=other_token, mailbox_email=self.account_email)
+        credential.set_mailbox_password(self.password)
+        credential.save()
+        account = GmailImportAccount(user=owner, gmail_email=self.account_email, target_mailbox_email=self.account_email)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+
+        with self.assertRaisesRegex(GmailImportError, "not owned by the Gmail import account user"):
+            GmailImportService(
+                gmail_client_factory=lambda refresh_token: FakeGmailClient(refs=(GmailMessageRef(gmail_message_id="gmail-1"),)),
+                imap_client_factory=lambda: FakeImapClient(),
+            ).run_historical_import_for_user(owner, limit=10)
+
     def test_gmail_historical_import_deletes_only_after_commit_when_enabled(self):
         create_mailbox_token(self.account_email, self.password)
         account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, delete_after_import=True)
@@ -1014,6 +1074,23 @@ class MailApiTests(TestCase):
         self.assertEqual(run.status, GmailImportRun.STATUS_SUCCESS)
         self.assertEqual(gmail_client.history_calls[0]["start_history_id"], "10")
         self.assertEqual(gmail_client.list_calls, [])
+
+    def test_user_scoped_gmail_incremental_import_uses_owner_account(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email, last_history_id="10")
+        account.set_refresh_token("refresh-secret")
+        account.historical_import_completed_at = timezone.now()
+        account.save()
+        gmail_client = FakeGmailClient(history_pages=(GmailHistoryPage(history_id="10"),))
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(),
+        ).run_incremental_import_for_user(token.user, limit=10)
+
+        self.assertEqual(result.scanned, 0)
+        self.assertEqual(GmailImportRun.objects.get().import_account, account)
+        self.assertEqual(gmail_client.history_calls[0]["start_history_id"], "10")
 
     def test_gmail_incremental_import_does_not_advance_cursor_on_partial_failure(self):
         create_mailbox_token(self.account_email, self.password)

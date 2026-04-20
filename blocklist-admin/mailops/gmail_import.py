@@ -58,6 +58,30 @@ class GmailImportService:
             raise GmailImportError("--limit must be greater than zero")
 
         import_account = self._get_import_account(gmail_email, target_mailbox_email)
+        return self._run_historical_import_for_account(
+            import_account=import_account,
+            target_mailbox_email=target_mailbox_email,
+            limit=limit,
+            since=since,
+            dry_run=dry_run,
+            no_delete=no_delete,
+        )
+
+    def run_historical_import_for_user(self, user, limit=100, since="", dry_run=False, no_delete=False):
+        limit = int(limit)
+        if limit < 1:
+            raise GmailImportError("--limit must be greater than zero")
+        import_account = self._get_user_import_account(user)
+        return self._run_historical_import_for_account(
+            import_account=import_account,
+            target_mailbox_email=import_account.target_mailbox_email,
+            limit=limit,
+            since=since,
+            dry_run=dry_run,
+            no_delete=no_delete,
+        )
+
+    def _run_historical_import_for_account(self, import_account, target_mailbox_email, limit, since, dry_run, no_delete):
         run = None if dry_run else GmailImportRun.objects.create(import_account=import_account, mode=GmailImportRun.MODE_HISTORICAL)
 
         try:
@@ -132,6 +156,26 @@ class GmailImportService:
             raise GmailImportError("--limit must be greater than zero")
 
         import_account = self._get_import_account(gmail_email, target_mailbox_email)
+        return self._run_incremental_import_for_account(
+            import_account=import_account,
+            target_mailbox_email=target_mailbox_email,
+            limit=limit,
+            no_delete=no_delete,
+        )
+
+    def run_incremental_import_for_user(self, user, limit=100, no_delete=False):
+        limit = int(limit)
+        if limit < 1:
+            raise GmailImportError("--limit must be greater than zero")
+        import_account = self._get_user_import_account(user)
+        return self._run_incremental_import_for_account(
+            import_account=import_account,
+            target_mailbox_email=import_account.target_mailbox_email,
+            limit=limit,
+            no_delete=no_delete,
+        )
+
+    def _run_incremental_import_for_account(self, import_account, target_mailbox_email, limit, no_delete):
         run = GmailImportRun.objects.create(import_account=import_account, mode=GmailImportRun.MODE_INCREMENTAL)
         try:
             result = self._run_incremental_batch(
@@ -203,8 +247,8 @@ class GmailImportService:
         synced = failed = skipped = 0
         for account in accounts:
             try:
-                self.run_incremental_import(
-                    gmail_email=account.gmail_email,
+                self._run_incremental_import_for_account(
+                    import_account=account,
                     target_mailbox_email=account.target_mailbox_email,
                     limit=limit,
                     no_delete=no_delete,
@@ -260,7 +304,7 @@ class GmailImportService:
     def _import_refs(self, import_account, target_mailbox_email, run, refs, no_delete, gmail_client=None):
         gmail_client = gmail_client or self.gmail_client_factory(import_account.get_refresh_token())
         scanned = len(refs)
-        target_credentials = self._target_credentials(target_mailbox_email)
+        target_credentials = self._target_credentials(target_mailbox_email, owner=import_account.user)
         appended = committed = cleaned = skipped = failed = 0
         any_committed = False
         max_history_id = ""
@@ -339,11 +383,27 @@ class GmailImportService:
             raise GmailImportError(f"Gmail import account {gmail_email} is mapped to {account.target_mailbox_email}, not {target_mailbox_email}.")
         return account
 
-    def _target_credentials(self, target_mailbox_email):
+    def _get_user_import_account(self, user):
+        user_email = _normalize_email(getattr(user, "email", ""))
+        if not getattr(user, "is_authenticated", False):
+            raise GmailImportError("Authenticated Django user is required for user-scoped Gmail import.")
+        if not user_email:
+            raise GmailImportError("Django user must have an email before Gmail import.")
+        try:
+            account = GmailImportAccount.objects.get(user=user)
+        except GmailImportAccount.DoesNotExist as exc:
+            raise GmailImportError(f"No Gmail import account connected for {user_email}.") from exc
+        if account.gmail_email != user_email or account.target_mailbox_email != user_email:
+            raise GmailImportError(f"Gmail import account for {user_email} is not mapped to the owning user mailbox.")
+        return account
+
+    def _target_credentials(self, target_mailbox_email, owner=None):
         try:
             credential = MailboxTokenCredential.objects.select_related("token__user").get(mailbox_email=target_mailbox_email)
         except MailboxTokenCredential.DoesNotExist as exc:
             raise GmailImportError(f"No mailbox token credential found for target mailbox {target_mailbox_email}") from exc
+        if owner is not None and credential.token.user_id != owner.pk:
+            raise GmailImportError(f"Target mailbox {target_mailbox_email} is not owned by the Gmail import account user.")
         return MailboxCredentials(email=credential.mailbox_email, password=credential.get_mailbox_password())
 
     def _get_or_create_message_record(self, import_account, ref):
