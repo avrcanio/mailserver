@@ -587,9 +587,10 @@ def _build_unified_conversation_page(folders, sent_folder, account_email, summar
         if message_id and message_id not in message_ids:
             message_ids[message_id] = item.summary
 
+    subject_thread_keys = _sent_reply_subject_thread_keys((item.summary for item in items), sent_folder)
     conversations_by_key = defaultdict(list)
     for item in items:
-        conversations_by_key[_conversation_key(item.summary, message_ids)].append(item)
+        conversations_by_key[_conversation_key(item.summary, message_ids, subject_thread_keys=subject_thread_keys)].append(item)
 
     conversations = []
     for key, grouped_items in conversations_by_key.items():
@@ -696,7 +697,8 @@ def _unified_conversation_sort_key(conversation):
     return (-latest_timestamp, -_uid_int(latest_item.summary.uid))
 
 
-def _conversation_key(summary, message_ids):
+def _conversation_key(summary, message_ids, subject_thread_keys=None):
+    subject_thread_keys = subject_thread_keys or set()
     own_id = _normalize_message_id(summary.message_id)
     if _has_usable_thread_metadata(summary):
         parent_ids = _thread_parent_ids(summary)
@@ -708,6 +710,9 @@ def _conversation_key(summary, message_ids):
             if subject:
                 return f"subject:{subject}"
             return f"id:{parent_ids[0]}"
+        subject = _normalize_thread_subject_for_grouping(summary.subject)
+        if subject and subject in subject_thread_keys:
+            return f"subject:{subject}"
         subject = _business_thread_subject_key(summary.subject)
         if subject:
             return f"subject:{subject}"
@@ -723,6 +728,27 @@ def _conversation_key(summary, message_ids):
 
 def _has_usable_thread_metadata(summary):
     return bool(_normalize_message_id(summary.message_id) or summary.in_reply_to or summary.references)
+
+
+def _sent_reply_subject_thread_keys(summaries, sent_folder):
+    if not sent_folder:
+        return set()
+    groups = defaultdict(lambda: {"has_inbound": False, "has_sent_reply_without_parent": False})
+    for summary in summaries:
+        subject = _normalize_thread_subject_for_grouping(summary.subject)
+        if not subject:
+            continue
+        group = groups[subject]
+        if _same_folder(summary.folder, sent_folder):
+            if _has_thread_subject_prefix(summary.subject) and not _thread_parent_ids(summary):
+                group["has_sent_reply_without_parent"] = True
+        else:
+            group["has_inbound"] = True
+    return {
+        subject
+        for subject, flags in groups.items()
+        if flags["has_inbound"] and flags["has_sent_reply_without_parent"]
+    }
 
 
 def _thread_parent_ids(summary):
@@ -844,6 +870,10 @@ def _normalize_message_id(value):
 def _normalize_thread_subject(value):
     subject = _SUBJECT_PREFIX_RE.sub("", str(value or "")).strip().lower()
     return re.sub(r"\s+", " ", subject)
+
+
+def _has_thread_subject_prefix(value):
+    return bool(_SUBJECT_PREFIX_RE.match(str(value or "")))
 
 
 def _normalize_thread_subject_for_grouping(value):

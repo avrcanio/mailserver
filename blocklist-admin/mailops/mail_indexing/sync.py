@@ -26,6 +26,7 @@ from .threading import (
     normalize_message_id,
     normalize_subject,
     same_folder,
+    sent_reply_subject_thread_keys,
     summary_from_message_row,
     summary_thread_parent_values,
     uid_int,
@@ -146,6 +147,7 @@ def index_folder_results(user, account_email, folder_results, imap_host="", sent
     touched_thread_keys = set()
     summaries = tuple(summary for result in folder_results for summary in result.summaries)
     message_ids = message_ids_for_threading(account, summaries)
+    subject_thread_keys = sent_reply_subject_thread_keys(summaries, sent_folder or account.sent_folder)
 
     for summary in summaries:
         old_thread_key = (
@@ -153,7 +155,7 @@ def index_folder_results(user, account_email, folder_results, imap_host="", sent
             .values_list("thread_key", flat=True)
             .first()
         )
-        thread_key = compute_thread_key(summary, message_ids)
+        thread_key = compute_thread_key(summary, message_ids, subject_thread_keys=subject_thread_keys)
         upsert_message(account, summary, thread_key, sent_folder=sent_folder or account.sent_folder)
         touched_thread_keys.add(thread_key)
         if old_thread_key and old_thread_key != thread_key:

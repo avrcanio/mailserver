@@ -8,6 +8,7 @@ from mail_integration.imap_client import (
     _message_is_seen,
     _normalize_message_id,
     _normalize_thread_subject,
+    _sent_reply_subject_thread_keys,
     _same_folder,
 )
 from mail_integration.schemas import MailMessageSummary
@@ -25,6 +26,10 @@ def normalize_subject(value):
     return _normalize_thread_subject(value)
 
 
+def sent_reply_subject_thread_keys(summaries, sent_folder):
+    return _sent_reply_subject_thread_keys(summaries, sent_folder)
+
+
 def same_folder(left, right):
     return _same_folder(left, right)
 
@@ -33,8 +38,8 @@ def message_is_seen(summary):
     return _message_is_seen(summary)
 
 
-def compute_thread_key(summary, message_ids):
-    return _conversation_key(summary, message_ids)
+def compute_thread_key(summary, message_ids, subject_thread_keys=None):
+    return _conversation_key(summary, message_ids, subject_thread_keys=subject_thread_keys)
 
 
 def compute_conversation_id(account_email, thread_key):
