@@ -137,6 +137,59 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  gmail-import-sync:
+    build:
+      context: ./blocklist-admin
+    container_name: mailserver-gmail-import-sync
+    command:
+      - python
+      - manage.py
+      - run_gmail_import
+      - --incremental
+      - --all
+      - --loop
+      - --interval-seconds
+      - ${GMAIL_IMPORT_SYNC_INTERVAL_SECONDS:-600}
+      - --limit
+      - ${GMAIL_IMPORT_SYNC_LIMIT:-100}
+      - --max-accounts
+      - ${GMAIL_IMPORT_SYNC_MAX_ACCOUNTS:-20}
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@postgis:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
+      DJANGO_SECRET_KEY: ${MAILADMIN_SECRET_KEY:-change-me-too}
+      DJANGO_ALLOWED_HOSTS: ${MAILADMIN_ALLOWED_HOSTS:-mailadmin.example.com,127.0.0.1,localhost},mailadmin
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${MAILADMIN_CSRF_TRUSTED_ORIGINS:-https://mailadmin.example.com}
+      MAILADMIN_HOST: ${MAILADMIN_HOST:-mailadmin.example.com}
+      BLOCKLIST_CONFIG_PATH: /app/shared-config/postfix-sender-blocklist
+      MAILSERVER_CONTAINER_NAME: mailserver
+      BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
+      MAIL_NOTIFY_HOOK_SECRET: ${MAIL_NOTIFY_HOOK_SECRET}
+      DEVICE_REGISTRATION_SECRET: ${DEVICE_REGISTRATION_SECRET}
+      MAILBOX_CREDENTIAL_ENCRYPTION_KEY: ${MAILBOX_CREDENTIAL_ENCRYPTION_KEY}
+      MAIL_IMAP_HOST: ${MAIL_HOSTNAME}
+      MAIL_SMTP_HOST: ${MAIL_HOSTNAME}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-adminsdk.json
+      GMAIL_IMPORT_GOOGLE_CLIENT_ID: ${GMAIL_IMPORT_GOOGLE_CLIENT_ID:-}
+      GMAIL_IMPORT_GOOGLE_CLIENT_SECRET: ${GMAIL_IMPORT_GOOGLE_CLIENT_SECRET:-}
+      GMAIL_IMPORT_OAUTH_REDIRECT_URI: ${GMAIL_IMPORT_OAUTH_REDIRECT_URI:-urn:ietf:wg:oauth:2.0:oob}
+      GMAIL_IMPORT_OAUTH_SCOPES: ${GMAIL_IMPORT_OAUTH_SCOPES:-https://www.googleapis.com/auth/gmail.modify}
+      GMAIL_IMPORT_SYNC_INTERVAL_SECONDS: ${GMAIL_IMPORT_SYNC_INTERVAL_SECONDS:-600}
+      GMAIL_IMPORT_SYNC_LIMIT: ${GMAIL_IMPORT_SYNC_LIMIT:-100}
+      GMAIL_IMPORT_SYNC_MAX_ACCOUNTS: ${GMAIL_IMPORT_SYNC_MAX_ACCOUNTS:-20}
+    volumes:
+      - ./docker-data/dms/config:/app/shared-config
+      - ./docker-data/secrets/firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
+    networks:
+      - default
+      - postgis
+    depends_on:
+      mailserver:
+        condition: service_started
+      mailadmin:
+        condition: service_started
+    restart: unless-stopped
+
 networks:
   postgis:
     external: true
