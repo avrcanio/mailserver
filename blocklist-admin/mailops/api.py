@@ -78,6 +78,7 @@ from mail_integration.gmail_client import (
 )
 
 from .gmail_import import GmailImportError, GmailImportService
+from .gmail_send import GmailOutboundSendService
 from .models import DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
 from .services import send_mail_notification
 
@@ -1279,8 +1280,12 @@ class SendMailView(APIView):
             attachments=attachments,
             forward_source_message=forward_source,
         )
+        mailbox_service = MailboxService()
         try:
-            message_id = MailboxService().send_mail(credentials, send_request)
+            gmail_sender = GmailOutboundSendService(mailbox_service=mailbox_service)
+            message_id = gmail_sender.send_mail(request.user, credentials, send_request)
+            if message_id is None:
+                message_id = mailbox_service.send_mail(credentials, send_request)
         except MailForwardAttachmentNotVisibleError as exc:
             return Response({"error": "forward_attachment_not_visible", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except MailForwardAttachmentNotFoundError as exc:
