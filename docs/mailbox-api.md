@@ -557,6 +557,64 @@ POST /api/mail/messages/123/restore?folder=Trash&target_folder=INBOX
 
 Restore requires the source folder to resolve to the server Trash folder, and the target folder must be a non-Trash folder.
 
+## Contacts
+
+Contacts are stored per authenticated Django/mailbox user and are available across devices that use the same API token identity.
+
+`GET /api/contacts?search=&limit=50&offset=0`
+
+Use this endpoint for the address book screen and manual contact list/search. It is not the compose autocomplete endpoint. The default `limit` is 50, the maximum is 100, and larger values are clamped to 100. The default `offset` is 0, and negative offsets are normalized to 0. `search` is a case-insensitive partial match against `display_name` and `email`.
+
+`GET /api/contacts/suggest?q=abc&limit=20`
+
+Use this endpoint only for compose autocomplete. Suggestions are returned only when `q` has at least 3 characters; shorter queries return an empty list without an error. The maximum `limit` is 20, and larger values are clamped to 20. Matching is case-insensitive against `display_name` and `email`.
+
+Suggest results use this v1 ranking:
+
+1. exact email match
+2. email prefix match
+3. display name prefix match
+4. partial email match
+5. partial display name match
+
+Within the same match rank, results sort by `times_contacted` descending, `last_used_at` descending, `display_name` ascending, then `email` ascending.
+
+`POST /api/contacts`
+
+```json
+{
+  "email": "recipient@example.com",
+  "display_name": "Recipient Name"
+}
+```
+
+Manual contacts start with `source: manual`, `times_contacted: 0`, and `last_used_at: null`. If the same email already exists for the current user, the backend updates `display_name` when it is present, sets `source` to `manual`, preserves `times_contacted` and `last_used_at`, and does not create a duplicate row.
+
+`PATCH /api/contacts/{id}`
+
+Updates `email` and/or `display_name`. If the new email already exists for the same user, the API returns a validation error and does not merge automatically. Patched contacts are marked `manual`.
+
+`DELETE /api/contacts/{id}`
+
+Deletes only a contact owned by the current user.
+
+Contact responses use the same shape for list, suggest, create, and update:
+
+```json
+{
+  "id": 1,
+  "email": "recipient@example.com",
+  "display_name": "Recipient Name",
+  "source": "manual",
+  "times_contacted": 0,
+  "last_used_at": null,
+  "created_at": "2026-04-22T21:00:00Z",
+  "updated_at": "2026-04-22T21:00:00Z"
+}
+```
+
+After a successful `POST /api/mail/send`, the backend auto-saves unique `To`, `Cc`, and `Bcc` recipients once per send request. Auto-saved contacts use `source: auto`, increment `times_contacted` by 1, and set `last_used_at` to the send time. A manual `display_name` is not overwritten by auto-save.
+
 ## Send
 
 `POST /api/mail/send`

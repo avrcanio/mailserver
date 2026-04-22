@@ -8,6 +8,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core import signing
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError
+from django.db.models import Q
 from django.http import HttpResponse
 from django.urls import reverse
 from django.utils.http import content_disposition_header
@@ -40,6 +42,13 @@ from mail_integration.schemas import ForwardSourceMessage, MailboxCredentials, S
 from .api_serializers import (
     AccountSummariesResponseSerializer,
     AccountsSummaryQuerySerializer,
+    ContactListQuerySerializer,
+    ContactListResponseSerializer,
+    ContactPatchSerializer,
+    ContactSerializer,
+    ContactSuggestQuerySerializer,
+    ContactSuggestResponseSerializer,
+    ContactWriteSerializer,
     ConversationListResponseSerializer,
     DeviceRegistrationRequestSerializer,
     DeviceRegistrationResponseSerializer,
@@ -79,7 +88,7 @@ from mail_integration.gmail_client import (
 
 from .gmail_import import GmailImportError, GmailImportService
 from .gmail_send import GmailOutboundSendService
-from .models import DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
+from .models import AddressBookContact, DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
 from .services import send_mail_notification
 
 
@@ -445,6 +454,111 @@ def mark_mail_index_stale_after_send(user, account_email):
         MailAccountIndex.objects.filter(user=user, account_email=account_email.strip().lower()).update(last_indexed_at=None)
     except Exception as exc:
         logger.warning("Could not mark mail index stale for %s: %s", account_email, exc)
+
+
+def contact_payload(contact):
+    return {
+        "id": contact.id,
+        "email": contact.email,
+        "display_name": contact.display_name,
+        "source": contact.source,
+        "times_contacted": contact.times_contacted,
+        "last_used_at": contact.last_used_at,
+        "created_at": contact.created_at,
+        "updated_at": contact.updated_at,
+    }
+
+
+def contact_match_rank(contact, query):
+    normalized_query = query.strip().lower()
+    email = (contact.email or "").lower()
+    display_name = (contact.display_name or "").lower()
+    if email == normalized_query:
+        return 0
+    if email.startswith(normalized_query):
+        return 1
+    if display_name.startswith(normalized_query):
+        return 2
+    if normalized_query in email:
+        return 3
+    if normalized_query in display_name:
+        return 4
+    return 5
+
+
+def sort_suggest_contacts(contacts, query):
+    return sorted(
+        contacts,
+        key=lambda contact: (
+            contact_match_rank(contact, query),
+            -contact.times_contacted,
+            -(contact.last_used_at.timestamp() if contact.last_used_at else 0),
+            (contact.display_name or "").lower(),
+            contact.email.lower(),
+        ),
+    )
+
+
+def request_values(data, field):
+    if hasattr(data, "getlist"):
+        return data.getlist(field)
+    value = data.get(field) if hasattr(data, "get") else None
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def extract_recipient_contact_hints(raw_data, validated_data):
+    valid_emails = []
+    seen = set()
+    for field in ("to", "cc", "bcc"):
+        for email in validated_data.get(field, ()):
+            normalized_email = str(email or "").strip().lower()
+            if normalized_email and normalized_email not in seen:
+                valid_emails.append(normalized_email)
+                seen.add(normalized_email)
+
+    hints = {email: None for email in valid_emails}
+    valid_email_set = set(valid_emails)
+    for field in ("to", "cc", "bcc"):
+        for value in request_values(raw_data, field):
+            if not isinstance(value, str):
+                continue
+            for display_name, email in getaddresses([value]):
+                normalized_email = (email or "").strip().lower()
+                if normalized_email not in valid_email_set:
+                    continue
+                normalized_name = (display_name or "").strip() or None
+                if normalized_name and not hints.get(normalized_email):
+                    hints[normalized_email] = normalized_name
+    return [(email, hints[email]) for email in valid_emails]
+
+
+def auto_save_sent_contacts(user, contact_hints):
+    used_at = timezone.now()
+    for email, display_name in contact_hints:
+        try:
+            contact, created = AddressBookContact.objects.get_or_create(
+                user=user,
+                email=email,
+                defaults={
+                    "display_name": display_name,
+                    "source": AddressBookContact.SOURCE_AUTO,
+                    "times_contacted": 0,
+                    "last_used_at": None,
+                },
+            )
+            contact.times_contacted += 1
+            contact.last_used_at = used_at
+            if created:
+                contact.source = AddressBookContact.SOURCE_AUTO
+            if display_name and (created or contact.source == AddressBookContact.SOURCE_AUTO or not contact.display_name):
+                contact.display_name = display_name
+            contact.save(update_fields=["display_name", "source", "times_contacted", "last_used_at", "updated_at"])
+        except Exception as exc:
+            logger.warning("Could not auto-save sent contact %s for user %s: %s", email, user.pk, exc)
 
 
 def mark_mail_index_stale_after_incoming(account_email):
@@ -1233,6 +1347,134 @@ class RestoreMessageView(APIView):
         return Response(restore_result_payload(credentials, data["folder"], result))
 
 
+class ContactListCreateView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("search", str, required=False),
+            OpenApiParameter("limit", OpenApiTypes.INT, required=False),
+            OpenApiParameter("offset", OpenApiTypes.INT, required=False),
+        ],
+        responses={200: ContactListResponseSerializer, 401: ErrorSerializer},
+    )
+    def get(self, request):
+        serializer = ContactListQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        query = serializer.validated_data["search"]
+        limit = serializer.validated_data["limit"]
+        offset = serializer.validated_data["offset"]
+        contacts = AddressBookContact.objects.filter(user=request.user)
+        if query:
+            contacts = contacts.filter(Q(display_name__icontains=query) | Q(email__icontains=query))
+        contacts = contacts.order_by("display_name", "email", "id")
+        total_count = contacts.count()
+        page = contacts[offset : offset + limit]
+        return Response(
+            {
+                "contacts": [contact_payload(contact) for contact in page],
+                "limit": limit,
+                "offset": offset,
+                "count": total_count,
+            }
+        )
+
+    @extend_schema(
+        request=ContactWriteSerializer,
+        responses={200: ContactSerializer, 201: ContactSerializer, 400: ErrorSerializer, 401: ErrorSerializer},
+    )
+    def post(self, request):
+        serializer = ContactWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        defaults = {
+            "display_name": data.get("display_name"),
+            "source": AddressBookContact.SOURCE_MANUAL,
+            "times_contacted": 0,
+            "last_used_at": None,
+        }
+        try:
+            contact, created = AddressBookContact.objects.get_or_create(user=request.user, email=data["email"], defaults=defaults)
+        except IntegrityError:
+            contact = AddressBookContact.objects.get(user=request.user, email=data["email"])
+            created = False
+        if not created:
+            update_fields = ["source", "updated_at"]
+            contact.source = AddressBookContact.SOURCE_MANUAL
+            if "display_name" in data:
+                contact.display_name = data.get("display_name")
+                update_fields.append("display_name")
+            contact.save(update_fields=update_fields)
+        return Response(contact_payload(contact), status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class ContactSuggestView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("q", str, required=False),
+            OpenApiParameter("limit", OpenApiTypes.INT, required=False),
+        ],
+        responses={200: ContactSuggestResponseSerializer, 401: ErrorSerializer},
+    )
+    def get(self, request):
+        serializer = ContactSuggestQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        query = serializer.validated_data["q"]
+        limit = serializer.validated_data["limit"]
+        if len(query) < 3 or limit == 0:
+            return Response({"contacts": []})
+        contacts = list(
+            AddressBookContact.objects.filter(user=request.user).filter(Q(display_name__icontains=query) | Q(email__icontains=query))
+        )
+        contacts = sort_suggest_contacts(contacts, query)[:limit]
+        return Response({"contacts": [contact_payload(contact) for contact in contacts]})
+
+
+class ContactDetailView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    def get_contact(self, request, contact_id):
+        contact = AddressBookContact.objects.filter(user=request.user, id=contact_id).first()
+        if contact is None:
+            return None, Response({"error": "contact_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        return contact, None
+
+    @extend_schema(
+        request=ContactPatchSerializer,
+        responses={200: ContactSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 404: ErrorSerializer},
+    )
+    def patch(self, request, contact_id):
+        contact, error = self.get_contact(request, contact_id)
+        if error:
+            return error
+        serializer = ContactPatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if "email" in data:
+            existing = AddressBookContact.objects.filter(user=request.user, email=data["email"]).exclude(id=contact.id).exists()
+            if existing:
+                return Response({"email": ["A contact with this email already exists."]}, status=status.HTTP_400_BAD_REQUEST)
+            contact.email = data["email"]
+        if "display_name" in data:
+            contact.display_name = data.get("display_name")
+        contact.source = AddressBookContact.SOURCE_MANUAL
+        contact.save()
+        return Response(contact_payload(contact))
+
+    @extend_schema(responses={204: None, 401: ErrorSerializer, 404: ErrorSerializer})
+    def delete(self, request, contact_id):
+        contact, error = self.get_contact(request, contact_id)
+        if error:
+            return error
+        contact.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class SendMailView(APIView):
     authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
     permission_classes = MAILBOX_API_PERMISSION_CLASSES
@@ -1250,10 +1492,12 @@ class SendMailView(APIView):
         if error:
             return error
         is_multipart = request.content_type and request.content_type.startswith("multipart/form-data")
+        raw_data = request.data
         data = send_form_data(request.data) if is_multipart else request.data
         serializer = SendMailRequestSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        contact_hints = extract_recipient_contact_hints(raw_data, data)
         attachments = ()
         if is_multipart:
             attachments, error = uploaded_send_attachments(request.FILES)
@@ -1295,6 +1539,7 @@ class SendMailView(APIView):
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         mark_mail_index_stale_after_send(request.user, credentials.email)
+        auto_save_sent_contacts(request.user, contact_hints)
         return Response({"account_email": credentials.email, "status": "sent", "message_id": message_id})
 
 

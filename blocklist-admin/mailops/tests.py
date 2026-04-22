@@ -59,6 +59,7 @@ from .mail_indexing import MailIndexService
 from .mail_indexing.runner import run_sync_cycle, select_accounts_for_sync
 from .mail_indexing.sync import FolderSyncResult, reconcile_recent_missing_messages
 from .models import (
+    AddressBookContact,
     DeviceRegistration,
     GmailImportAccount,
     GmailImportMessage,
@@ -286,6 +287,146 @@ class MailApiTests(TestCase):
     def auth_headers(self):
         token = create_mailbox_token(self.account_email, self.password)
         return {"HTTP_AUTHORIZATION": f"Token {token.key}"}
+
+    def test_address_book_contact_normalizes_and_validates_email(self):
+        token = create_mailbox_token(self.account_email, self.password)
+        contact = AddressBookContact.objects.create(
+            user=token.user,
+            email=" Recipient@Example.COM ",
+            display_name="  Recipient Name  ",
+        )
+
+        self.assertEqual(contact.email, "recipient@example.com")
+        self.assertEqual(contact.display_name, "Recipient Name")
+        blank_name = AddressBookContact.objects.create(user=token.user, email="blank@example.com", display_name=" ")
+        self.assertIsNone(blank_name.display_name)
+        with self.assertRaises(ValidationError):
+            AddressBookContact.objects.create(user=token.user, email="not-an-email")
+        with self.assertRaises(ValidationError):
+            AddressBookContact.objects.create(user=token.user, email="RECIPIENT@example.com")
+
+        other_token = create_mailbox_token("other@example.com", "other-secret")
+        other_contact = AddressBookContact.objects.create(user=other_token.user, email="recipient@example.com")
+        self.assertEqual(other_contact.email, "recipient@example.com")
+
+    def test_contacts_list_is_user_scoped_and_clamps_pagination(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        other_token = create_mailbox_token("other@example.com", "other-secret")
+        for index in range(105):
+            AddressBookContact.objects.create(
+                user=token.user,
+                email=f"contact-{index:03d}@example.com",
+                display_name=f"Contact {index:03d}",
+            )
+        AddressBookContact.objects.create(user=other_token.user, email="contact-other@example.com", display_name="Contact Other")
+
+        response = self.client.get(reverse("mailops:api_contacts"), {"search": "contact", "limit": "500", "offset": "-10"}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["limit"], 100)
+        self.assertEqual(payload["offset"], 0)
+        self.assertEqual(payload["count"], 105)
+        self.assertEqual(len(payload["contacts"]), 100)
+        self.assertNotIn("contact-other@example.com", {contact["email"] for contact in payload["contacts"]})
+
+    def test_contacts_require_authentication(self):
+        list_response = self.client.get(reverse("mailops:api_contacts"))
+        suggest_response = self.client.get(reverse("mailops:api_contacts_suggest"), {"q": "abc"})
+
+        self.assertEqual(list_response.status_code, 401)
+        self.assertEqual(suggest_response.status_code, 401)
+
+    def test_contacts_suggest_rules_limit_and_sorting(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        now = timezone.now()
+        for index in range(25):
+            AddressBookContact.objects.create(
+                user=token.user,
+                email=f"alex-{index:03d}@example.com",
+                display_name=f"Alex {index:03d}",
+                times_contacted=index,
+                last_used_at=now,
+            )
+        frequent = AddressBookContact.objects.create(
+            user=token.user,
+            email="alex-frequent@example.com",
+            display_name="Alex Frequent",
+            times_contacted=999,
+            last_used_at=now,
+        )
+
+        short = self.client.get(reverse("mailops:api_contacts_suggest"), {"q": "al"}, **headers)
+        response = self.client.get(reverse("mailops:api_contacts_suggest"), {"q": "alex", "limit": "500"}, **headers)
+
+        self.assertEqual(short.status_code, 200)
+        self.assertEqual(short.json()["contacts"], [])
+        self.assertEqual(response.status_code, 200)
+        contacts = response.json()["contacts"]
+        self.assertEqual(len(contacts), 20)
+        self.assertEqual(contacts[0]["id"], frequent.id)
+
+    def test_contact_post_upserts_auto_contact_as_manual(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        used_at = timezone.now()
+        AddressBookContact.objects.create(
+            user=token.user,
+            email="recipient@example.com",
+            display_name="Old Auto",
+            source=AddressBookContact.SOURCE_AUTO,
+            times_contacted=4,
+            last_used_at=used_at,
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_contacts"),
+            data={"email": " Recipient@Example.COM ", "display_name": "Manual Name"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(AddressBookContact.objects.filter(user=token.user, email="recipient@example.com").count(), 1)
+        contact = AddressBookContact.objects.get(user=token.user, email="recipient@example.com")
+        self.assertEqual(contact.display_name, "Manual Name")
+        self.assertEqual(contact.source, AddressBookContact.SOURCE_MANUAL)
+        self.assertEqual(contact.times_contacted, 4)
+        self.assertEqual(contact.last_used_at, used_at)
+
+    def test_contact_patch_duplicate_email_returns_validation_error(self):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        first = AddressBookContact.objects.create(user=token.user, email="first@example.com")
+        AddressBookContact.objects.create(user=token.user, email="second@example.com")
+
+        response = self.client.patch(
+            reverse("mailops:api_contact_detail", kwargs={"contact_id": first.id}),
+            data={"email": "second@example.com"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        first.refresh_from_db()
+        self.assertEqual(first.email, "first@example.com")
+
+    def test_contact_delete_is_user_scoped(self):
+        headers = self.auth_headers()
+        owner_token = Token.objects.get(user__email=self.account_email)
+        other_token = create_mailbox_token("other@example.com", "other-secret")
+        owner_contact = AddressBookContact.objects.create(user=owner_token.user, email="mine@example.com")
+        other_contact = AddressBookContact.objects.create(user=other_token.user, email="other-contact@example.com")
+
+        missing = self.client.delete(reverse("mailops:api_contact_detail", kwargs={"contact_id": other_contact.id}), **headers)
+        deleted = self.client.delete(reverse("mailops:api_contact_detail", kwargs={"contact_id": owner_contact.id}), **headers)
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(deleted.status_code, 204)
+        self.assertTrue(AddressBookContact.objects.filter(id=other_contact.id).exists())
+        self.assertFalse(AddressBookContact.objects.filter(id=owner_contact.id).exists())
 
     @patch("mailops.api.MailboxService")
     def test_login_success_returns_token(self, service_class):
@@ -2744,6 +2885,14 @@ class MailApiTests(TestCase):
         self.assertEqual(request.attachments, ())
         index.refresh_from_db()
         self.assertIsNone(index.last_indexed_at)
+        contacts = {contact.email: contact for contact in AddressBookContact.objects.filter(user=token.user)}
+        self.assertEqual(set(contacts), {"to@example.com", "copy@example.com", "hidden@example.com"})
+        self.assertEqual(contacts["to@example.com"].display_name, "Recipient Name")
+        self.assertEqual(contacts["copy@example.com"].display_name, "Copy Person")
+        self.assertEqual(contacts["hidden@example.com"].display_name, "Hidden Person")
+        self.assertEqual(contacts["to@example.com"].source, AddressBookContact.SOURCE_AUTO)
+        self.assertEqual(contacts["to@example.com"].times_contacted, 1)
+        self.assertIsNotNone(contacts["to@example.com"].last_used_at)
 
     @override_settings(
         GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
@@ -2996,6 +3145,63 @@ class MailApiTests(TestCase):
         self.assertIn("body", missing_body.json())
 
     @patch("mailops.api.MailboxService")
+    def test_mail_send_dedupes_contacts_within_one_request_and_preserves_manual_name(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        manual = AddressBookContact.objects.create(
+            user=token.user,
+            email="same@example.com",
+            display_name="Manual Name",
+            source=AddressBookContact.SOURCE_MANUAL,
+            times_contacted=2,
+        )
+        unnamed_manual = AddressBookContact.objects.create(
+            user=token.user,
+            email="unnamed@example.com",
+            source=AddressBookContact.SOURCE_MANUAL,
+        )
+        service_class.return_value.send_mail.return_value = "<sent@example.com>"
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={
+                "to": ["Auto Name <same@example.com>", "same@example.com", "Filled Name <unnamed@example.com>"],
+                "cc": ["same@example.com"],
+                "subject": "Hi",
+                "text_body": "Body",
+            },
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        manual.refresh_from_db()
+        self.assertEqual(AddressBookContact.objects.filter(user=token.user, email="same@example.com").count(), 1)
+        self.assertEqual(manual.display_name, "Manual Name")
+        self.assertEqual(manual.source, AddressBookContact.SOURCE_MANUAL)
+        self.assertEqual(manual.times_contacted, 3)
+        unnamed_manual.refresh_from_db()
+        self.assertEqual(unnamed_manual.display_name, "Filled Name")
+        self.assertEqual(unnamed_manual.source, AddressBookContact.SOURCE_MANUAL)
+        self.assertEqual(unnamed_manual.times_contacted, 1)
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_failure_does_not_auto_save_contacts(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        service_class.return_value.send_mail.side_effect = MailSendError("rejected")
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={"to": ["to@example.com"], "subject": "Hi", "text_body": "Body"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(AddressBookContact.objects.filter(user=token.user, email="to@example.com").exists())
+
+    @patch("mailops.api.MailboxService")
     def test_mail_send_maps_send_errors(self, service_class):
         headers = self.auth_headers()
         service_class.return_value.send_mail.side_effect = MailSendError("rejected")
@@ -3030,6 +3236,8 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/conversations")
         self.assertContains(schema, "/api/mail/unified-conversations")
         self.assertContains(schema, "/api/mail/index-status")
+        self.assertContains(schema, "/api/contacts")
+        self.assertContains(schema, "/api/contacts/suggest")
         self.assertContains(schema, "/api/mail/send")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/accounts/summaries")
