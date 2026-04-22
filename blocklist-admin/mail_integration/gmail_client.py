@@ -147,6 +147,19 @@ class GmailClient:
         request = self.service.users().messages().delete(userId=GMAIL_USER_ID, id=gmail_message_id)
         self._execute(request, f"Gmail message delete failed for {gmail_message_id}")
 
+    def send_raw_message(self, raw_bytes):
+        raw_payload = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+        request = self.service.users().messages().send(userId=GMAIL_USER_ID, body={"raw": raw_payload})
+        payload = self._execute(request, "Gmail message send failed")
+        gmail_message_id = str(payload.get("id", "") or "")
+        if not gmail_message_id:
+            raise MailProtocolError("Gmail send response did not include a message id")
+        return GmailMessageRef(
+            gmail_message_id=gmail_message_id,
+            gmail_thread_id=str(payload.get("threadId", "") or ""),
+            label_ids=tuple(str(label) for label in payload.get("labelIds", ()) if label),
+        )
+
     def get_profile_email(self):
         request = self.service.users().getProfile(userId=GMAIL_USER_ID)
         payload = self._execute(request, "Gmail profile fetch failed")

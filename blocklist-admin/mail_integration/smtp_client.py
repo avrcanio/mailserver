@@ -85,7 +85,7 @@ class SmtpClient:
         return self.connection
 
 
-def build_email_message(from_email, request: SendMailRequest):
+def build_email_message(from_email, request: SendMailRequest, include_bcc=False):
     if not request.to:
         raise ValueError("At least one recipient is required")
     if not request.text_body and not request.html_body:
@@ -96,6 +96,8 @@ def build_email_message(from_email, request: SendMailRequest):
     message["To"] = ", ".join(request.to)
     if request.cc:
         message["Cc"] = ", ".join(request.cc)
+    if include_bcc and request.bcc:
+        message["Bcc"] = ", ".join(request.bcc)
     if request.reply_to:
         message["Reply-To"] = request.reply_to
     if request.in_reply_to:

@@ -81,16 +81,20 @@ class MailboxService:
             return client.restore_messages_from_trash(folder=folder, target_folder=target_folder, uids=uids)
 
     def send_mail(self, credentials, request):
-        request = self._resolve_forwarded_attachments(credentials, request)
-        _validate_attachment_limits(request.attachments)
+        request = self.prepare_send_request(credentials, request)
         with self.smtp_client_factory() as client:
             client.login(credentials)
             message_id = client.send_mail(credentials, request)
             sent_message = getattr(client, "last_sent_message", None)
-        self._append_sent_copy(credentials, sent_message)
+        self.append_sent_copy(credentials, sent_message)
         return message_id
 
-    def _append_sent_copy(self, credentials, sent_message):
+    def prepare_send_request(self, credentials, request):
+        request = self._resolve_forwarded_attachments(credentials, request)
+        _validate_attachment_limits(request.attachments)
+        return request
+
+    def append_sent_copy(self, credentials, sent_message):
         if not isinstance(sent_message, EmailMessage):
             return
         try:

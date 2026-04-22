@@ -2745,6 +2745,56 @@ class MailApiTests(TestCase):
         index.refresh_from_db()
         self.assertIsNone(index.last_indexed_at)
 
+    @override_settings(
+        GMAIL_IMPORT_GOOGLE_CLIENT_ID="client-id",
+        GMAIL_IMPORT_GOOGLE_CLIENT_SECRET="client-secret",
+        GMAIL_IMPORT_OAUTH_REDIRECT_URI="https://mailadmin.example.com/oauth/gmail/callback",
+        GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"),
+    )
+    @patch("mailops.gmail_send.GmailClient")
+    @patch("mailops.api.MailboxService")
+    def test_mail_send_for_connected_gmail_account_uses_gmail_api(self, service_class, gmail_client_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        account = GmailImportAccount(user=token.user, gmail_email=self.account_email, target_mailbox_email=self.account_email, delete_after_import=True)
+        account.set_refresh_token("refresh-secret")
+        account.save()
+        service = service_class.return_value
+        service.prepare_send_request.side_effect = lambda credentials, send_request: send_request
+        gmail_client = gmail_client_class.return_value
+        gmail_client.send_raw_message.return_value = GmailMessageRef(gmail_message_id="gmail-sent-1", gmail_thread_id="thread-1")
+
+        response = self.client.post(
+            reverse("mailops:api_mail_send"),
+            data={
+                "to": ["to@example.com"],
+                "bcc": ["hidden@example.com"],
+                "subject": "Via Gmail",
+                "text_body": "Body",
+                "from_display_name": "Sender",
+            },
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message_id"].startswith("<"), True)
+        service.send_mail.assert_not_called()
+        service.prepare_send_request.assert_called_once()
+        service.append_sent_copy.assert_called_once()
+        raw_message = gmail_client.send_raw_message.call_args.args[0]
+        self.assertIn(b"From: Sender <user@example.com>", raw_message)
+        self.assertIn(b"To: to@example.com", raw_message)
+        self.assertIn(b"Bcc: hidden@example.com", raw_message)
+        sent_copy = service.append_sent_copy.call_args.args[1]
+        self.assertNotIn("Bcc", sent_copy)
+        gmail_client.delete_message.assert_called_once_with("gmail-sent-1")
+        message = GmailImportMessage.objects.get(import_account=account, gmail_message_id="gmail-sent-1")
+        self.assertEqual(message.state, GmailImportMessage.STATE_CLEANED)
+        self.assertEqual(message.cleanup_status, GmailImportMessage.STATUS_SUCCESS)
+        self.assertEqual(message.target_folder, "Sent")
+        self.assertEqual(message.rfc_message_id, response.json()["message_id"])
+
     @patch("mailops.api.MailboxService")
     def test_mail_send_accepts_multipart_attachments(self, service_class):
         headers = self.auth_headers()

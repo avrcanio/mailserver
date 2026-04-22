@@ -56,7 +56,7 @@ def _http_error(status):
     return _FakeHttpError(status)
 
 
-def _gmail_service(list_payload=None, get_payload=None, history_payload=None, delete_payload=None, profile_payload=None):
+def _gmail_service(list_payload=None, get_payload=None, history_payload=None, delete_payload=None, profile_payload=None, send_payload=None):
     service = Mock()
     users_api = Mock()
     messages_api = Mock()
@@ -70,6 +70,7 @@ def _gmail_service(list_payload=None, get_payload=None, history_payload=None, de
     messages_api.list.return_value = _FakeRequest(list_payload or {})
     messages_api.get.return_value = _FakeRequest(get_payload or {})
     messages_api.delete.return_value = _FakeRequest(delete_payload or {})
+    messages_api.send.return_value = _FakeRequest(send_payload or {})
     history_api.list.return_value = _FakeRequest(history_payload or {})
     users_api.getProfile.return_value = _FakeRequest(profile_payload or {})
     return service
@@ -143,6 +144,19 @@ class GmailClientTests(SimpleTestCase):
         GmailClient(refresh_token="refresh", service=service).delete_message("msg-1")
 
         service.users_api.messages_api.delete.assert_called_once_with(userId="me", id="msg-1")
+
+    def test_send_raw_message_encodes_rfc822_payload(self):
+        service = _gmail_service(send_payload={"id": "gmail-sent-1", "threadId": "thread-1", "labelIds": ["SENT"]})
+
+        result = GmailClient(refresh_token="refresh", service=service).send_raw_message(b"From: sender@example.com\r\n\r\nBody")
+
+        service.users_api.messages_api.send.assert_called_once()
+        kwargs = service.users_api.messages_api.send.call_args.kwargs
+        self.assertEqual(kwargs["userId"], "me")
+        self.assertEqual(base64.urlsafe_b64decode(kwargs["body"]["raw"] + "=="), b"From: sender@example.com\r\n\r\nBody")
+        self.assertEqual(result.gmail_message_id, "gmail-sent-1")
+        self.assertEqual(result.gmail_thread_id, "thread-1")
+        self.assertEqual(result.label_ids, ("SENT",))
 
     def test_get_profile_email_reads_authenticated_gmail_identity(self):
         service = _gmail_service(profile_payload={"emailAddress": " USER@Example.COM "})

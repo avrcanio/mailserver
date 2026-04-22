@@ -8,7 +8,9 @@ The v1 model is intentionally strict:
 - the connected Gmail address must exactly match the Django user email
 - onboarding is admin-managed through Django admin
 - Gmail access is OAuth-only; admins must not enter or store Gmail passwords
-- mailbox read/send APIs continue to use the local mailserver mailbox
+- mailbox read APIs continue to use the local mailserver mailbox
+- send uses Gmail API for connected Gmail-backed mailboxes and local SMTP for
+  normal local-domain mailboxes
 
 The importer remains conservative:
 
