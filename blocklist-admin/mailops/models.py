@@ -3,6 +3,7 @@ import re
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from django.db import models
+from django.core.validators import validate_email
 
 from .credential_crypto import decrypt_credential_value, decrypt_mailbox_password, encrypt_credential_value, encrypt_mailbox_password
 
@@ -159,6 +160,58 @@ class PushNotificationLog(models.Model):
 
     def __str__(self):
         return f"{self.account_email}: {self.status} @ {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
+class AddressBookContact(models.Model):
+    SOURCE_MANUAL = "manual"
+    SOURCE_AUTO = "auto"
+    SOURCE_CHOICES = [
+        (SOURCE_MANUAL, "Manual"),
+        (SOURCE_AUTO, "Auto"),
+    ]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="address_book_contacts")
+    email = models.EmailField()
+    display_name = models.CharField(max_length=255, null=True, blank=True)
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default=SOURCE_MANUAL, db_index=True)
+    times_contacted = models.PositiveIntegerField(default=0)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["display_name", "email"]
+        constraints = [
+            models.UniqueConstraint(fields=["user", "email"], name="uniq_address_book_contact_user_email"),
+        ]
+        indexes = [
+            models.Index(fields=["user"], name="addrbook_user_idx"),
+            models.Index(fields=["user", "email"], name="addrbook_user_email_idx"),
+            models.Index(fields=["user", "display_name"], name="addrbook_user_name_idx"),
+        ]
+        verbose_name = "Address book contact"
+        verbose_name_plural = "Address book contacts"
+
+    def normalize_fields(self):
+        self.email = (self.email or "").strip().lower()
+        display_name = (self.display_name or "").strip()
+        self.display_name = display_name or None
+
+    def clean(self):
+        self.normalize_fields()
+        validate_email(self.email)
+        if self.source not in {self.SOURCE_MANUAL, self.SOURCE_AUTO}:
+            raise ValidationError({"source": "Unsupported contact source."})
+
+    def save(self, *args, **kwargs):
+        self.normalize_fields()
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        if self.display_name:
+            return f"{self.display_name} <{self.email}>"
+        return self.email
 
 
 class MailboxTokenCredential(models.Model):

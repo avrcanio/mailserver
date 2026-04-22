@@ -18,6 +18,7 @@ from mail_integration.gmail_client import build_authorization_url, oauth_config_
 from .forms import SenderBlocklistRuleForm
 from .api import signed_gmail_oauth_state
 from .models import (
+    AddressBookContact,
     ApplyLog,
     DeviceRegistration,
     GmailImportAccount,
@@ -228,6 +229,15 @@ class ApplyLogAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(AddressBookContact)
+class AddressBookContactAdmin(admin.ModelAdmin):
+    list_display = ("email", "display_name", "user", "source", "times_contacted", "last_used_at", "updated_at")
+    list_filter = ("source", "last_used_at")
+    search_fields = ("email", "display_name", "user__username", "user__email")
+    readonly_fields = ("created_at", "updated_at")
+    ordering = ("user__email", "display_name", "email")
 
 
 @admin.register(DeviceRegistration)

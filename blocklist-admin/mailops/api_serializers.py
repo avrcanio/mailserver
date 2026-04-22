@@ -28,6 +28,13 @@ def normalize_mailbox_address(value):
     return email
 
 
+def normalize_contact_display_name(value):
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 class MailboxAddressField(serializers.CharField):
     def to_internal_value(self, data):
         value = super().to_internal_value(data)
@@ -131,6 +138,78 @@ class GmailSyncTriggerResponseSerializer(serializers.Serializer):
 class ErrorSerializer(serializers.Serializer):
     error = serializers.CharField()
     detail = serializers.CharField(required=False, allow_blank=True)
+
+
+class ContactListQuerySerializer(serializers.Serializer):
+    search = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(required=False, default=50)
+    offset = serializers.IntegerField(required=False, default=0)
+
+    def validate(self, attrs):
+        attrs["search"] = (attrs.get("search") or "").strip()
+        attrs["limit"] = min(max(int(attrs.get("limit", 50)), 0), 100)
+        attrs["offset"] = max(int(attrs.get("offset", 0)), 0)
+        return attrs
+
+
+class ContactSuggestQuerySerializer(serializers.Serializer):
+    q = serializers.CharField(required=False, allow_blank=True, default="")
+    limit = serializers.IntegerField(required=False, default=20)
+
+    def validate(self, attrs):
+        attrs["q"] = (attrs.get("q") or "").strip()
+        attrs["limit"] = min(max(int(attrs.get("limit", 20)), 0), 20)
+        return attrs
+
+
+class ContactWriteSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    display_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+    def validate(self, attrs):
+        if "display_name" in attrs:
+            attrs["display_name"] = normalize_contact_display_name(attrs.get("display_name"))
+        return attrs
+
+
+class ContactPatchSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=False)
+    display_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+    def validate(self, attrs):
+        if "display_name" in attrs:
+            attrs["display_name"] = normalize_contact_display_name(attrs.get("display_name"))
+        if not attrs:
+            raise serializers.ValidationError("At least one field is required.")
+        return attrs
+
+
+class ContactSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    email = serializers.EmailField()
+    display_name = serializers.CharField(allow_null=True, required=False)
+    source = serializers.CharField()
+    times_contacted = serializers.IntegerField()
+    last_used_at = serializers.DateTimeField(allow_null=True)
+    created_at = serializers.DateTimeField()
+    updated_at = serializers.DateTimeField()
+
+
+class ContactListResponseSerializer(serializers.Serializer):
+    contacts = ContactSerializer(many=True)
+    limit = serializers.IntegerField()
+    offset = serializers.IntegerField()
+    count = serializers.IntegerField()
+
+
+class ContactSuggestResponseSerializer(serializers.Serializer):
+    contacts = ContactSerializer(many=True)
 
 
 class FolderSerializer(serializers.Serializer):
