@@ -351,6 +351,7 @@ def translation_payload(result):
         "source_language": result.source_language,
         "translated_subject": result.translated_subject,
         "translated_text": result.translated_text,
+        "translated_html": result.translated_html,
         "cached": result.cached,
         "truncated": result.truncated,
         "model": result.model,

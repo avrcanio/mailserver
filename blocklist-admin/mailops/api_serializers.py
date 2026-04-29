@@ -368,6 +368,7 @@ class MessageTranslationResponseSerializer(serializers.Serializer):
     source_language = serializers.CharField(allow_blank=True)
     translated_subject = serializers.CharField(allow_blank=True)
     translated_text = serializers.CharField(allow_blank=True)
+    translated_html = serializers.CharField(allow_blank=True)
     cached = serializers.BooleanField()
     truncated = serializers.BooleanField()
     model = serializers.CharField()

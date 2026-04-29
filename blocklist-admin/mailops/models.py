@@ -225,6 +225,7 @@ class MailMessageTranslation(models.Model):
     source_language = models.CharField(max_length=32, blank=True, default="")
     translated_subject = models.TextField(blank=True, default="")
     translated_text = models.TextField(blank=True, default="")
+    translated_html = models.TextField(blank=True, default="")
     model = models.CharField(max_length=128, blank=True, default="")
     truncated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

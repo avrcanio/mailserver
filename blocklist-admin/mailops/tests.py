@@ -2574,6 +2574,7 @@ class MailApiTests(TestCase):
             source_language="en",
             translated_subject="Pozdrav",
             translated_text="Prevedeni tekst",
+            translated_html="<p>Prevedeni HTML</p>",
             cached=False,
             truncated=False,
             model="gpt-5.4-mini",
@@ -2598,6 +2599,7 @@ class MailApiTests(TestCase):
                 "source_language": "en",
                 "translated_subject": "Pozdrav",
                 "translated_text": "Prevedeni tekst",
+                "translated_html": "<p>Prevedeni HTML</p>",
                 "cached": False,
                 "truncated": False,
                 "model": "gpt-5.4-mini",
@@ -3493,6 +3495,7 @@ class MailTranslationServiceTests(TestCase):
                     "source_language": "en",
                     "translated_subject": "Pozdrav",
                     "translated_text": "Prijevod",
+                    "translated_html_segments": [],
                 }
             )
         )
@@ -3525,8 +3528,8 @@ class MailTranslationServiceTests(TestCase):
         mailbox_service.get_message_detail.return_value = self.detail
         openai_client = Mock()
         openai_client.responses.create.side_effect = [
-            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Pozdrav", "translated_text": "Prijevod"})),
-            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Hello", "translated_text": "Translation"})),
+            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Pozdrav", "translated_text": "Prijevod", "translated_html_segments": []})),
+            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Hello", "translated_text": "Translation", "translated_html_segments": []})),
         ]
         service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
 
@@ -3549,7 +3552,7 @@ class MailTranslationServiceTests(TestCase):
         mailbox_service.get_message_detail.return_value = detail
         openai_client = Mock()
         openai_client.responses.create.return_value = Mock(
-            output_text=json.dumps({"source_language": "en", "translated_subject": "", "translated_text": "Sazetak"})
+            output_text=json.dumps({"source_language": "en", "translated_subject": "", "translated_text": "Sazetak", "translated_html_segments": []})
         )
         service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
 
@@ -3579,6 +3582,7 @@ class MailTranslationServiceTests(TestCase):
                     "source_language": "en",
                     "translated_subject": "Pozdrav",
                     "translated_text": "Prijevod",
+                    "translated_html_segments": [],
                 }
             )
         )

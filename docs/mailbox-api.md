@@ -223,6 +223,7 @@ Response:
   "source_language": "en",
   "translated_subject": "Pozdrav",
   "translated_text": "Prevedeni tekst poruke...",
+  "translated_html": "<html>...</html>",
   "cached": true,
   "truncated": false,
   "model": "gpt-5.4-mini"
