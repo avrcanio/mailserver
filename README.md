@@ -261,6 +261,18 @@ Portal je pripremljen i za kasnije sirenje prema:
 
 Interni mailbox JSON endpointi za staff korisnike dokumentirani su u [docs/mailbox-api.md](/opt/stacks/mailserver/docs/mailbox-api.md).
 
+### OpenAI prijevod mailova
+
+Za on-demand prijevod mailova kroz Django API postavi:
+
+```env
+OPENAI_API_KEY=...
+OPENAI_TRANSLATION_MODEL=gpt-5.4-mini
+OPENAI_TRANSLATION_TIMEOUT_SECONDS=20
+MAIL_TRANSLATION_DEFAULT_TARGET_LANGUAGE=hr
+MAIL_TRANSLATION_MAX_INPUT_CHARS=12000
+```
+
 Provjera odbijanja:
 
 ```bash

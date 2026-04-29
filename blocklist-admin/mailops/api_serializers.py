@@ -1,10 +1,13 @@
 import json
 from email.utils import getaddresses
 
+from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+
+from .translation import supported_target_languages
 
 
 def normalize_mailbox_address(value):
@@ -339,6 +342,35 @@ class MessageDetailResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folder = serializers.CharField()
     message = MessageDetailSerializer()
+
+
+class MessageTranslationRequestSerializer(serializers.Serializer):
+    folder = serializers.CharField(required=False, allow_blank=False, default="INBOX")
+    target_language = serializers.ChoiceField(
+        required=False,
+        default=settings.MAIL_TRANSLATION_DEFAULT_TARGET_LANGUAGE,
+        choices=supported_target_languages(),
+    )
+
+    def validate_folder(self, value):
+        folder = str(value or "").strip()
+        if not folder:
+            raise serializers.ValidationError("This field may not be blank.")
+        return folder
+
+
+class MessageTranslationResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folder = serializers.CharField()
+    uid = serializers.CharField()
+    message_id = serializers.CharField(allow_blank=True)
+    target_language = serializers.CharField()
+    source_language = serializers.CharField(allow_blank=True)
+    translated_subject = serializers.CharField(allow_blank=True)
+    translated_text = serializers.CharField(allow_blank=True)
+    cached = serializers.BooleanField()
+    truncated = serializers.BooleanField()
+    model = serializers.CharField()
 
 
 class ForwardSourceMessageSerializer(serializers.Serializer):

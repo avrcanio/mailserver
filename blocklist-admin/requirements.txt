@@ -8,5 +8,6 @@ google-api-python-client==2.166.0
 google-auth==2.38.0
 google-auth-oauthlib==1.2.1
 gunicorn==23.0.0
+openai==2.2.0
 psycopg[binary]==3.2.6
 whitenoise==6.9.0

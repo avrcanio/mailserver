@@ -214,6 +214,55 @@ class AddressBookContact(models.Model):
         return self.email
 
 
+class MailMessageTranslation(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="mail_message_translations")
+    account_email = models.EmailField(db_index=True)
+    folder = models.CharField(max_length=255)
+    uid = models.CharField(max_length=64)
+    message_id = models.CharField(max_length=512, blank=True, default="")
+    target_language = models.CharField(max_length=16, db_index=True)
+    source_hash = models.CharField(max_length=64)
+    source_language = models.CharField(max_length=32, blank=True, default="")
+    translated_subject = models.TextField(blank=True, default="")
+    translated_text = models.TextField(blank=True, default="")
+    model = models.CharField(max_length=128, blank=True, default="")
+    truncated = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "account_email", "folder", "uid", "target_language", "source_hash"],
+                name="uniq_mail_translation_user_message_language_hash",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "account_email"], name="mailtrans_user_account_idx"),
+            models.Index(fields=["account_email", "folder", "uid"], name="mailtrans_message_idx"),
+        ]
+        verbose_name = "Mail message translation"
+        verbose_name_plural = "Mail message translations"
+
+    def clean(self):
+        self.account_email = (self.account_email or "").strip().lower()
+        self.folder = (self.folder or "").strip()
+        self.uid = str(self.uid or "").strip()
+        self.message_id = str(self.message_id or "").strip()
+        self.target_language = (self.target_language or "").strip()
+        self.source_hash = (self.source_hash or "").strip().lower()
+        self.source_language = (self.source_language or "").strip().lower()
+        self.model = (self.model or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.account_email} {self.folder}/{self.uid} [{self.target_language}]"
+
+
 class MailboxTokenCredential(models.Model):
     token = models.OneToOneField(
         "authtoken.Token",

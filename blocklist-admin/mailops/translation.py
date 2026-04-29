@@ -1,0 +1,279 @@
+import hashlib
+import json
+import logging
+import re
+from dataclasses import dataclass
+from html import unescape
+
+from django.conf import settings
+from django.utils.html import strip_tags
+
+from mail_integration.mailbox_service import MailboxService
+
+from .models import MailMessageTranslation
+
+
+logger = logging.getLogger("mailops.translation")
+_WHITESPACE_RE = re.compile(r"\s+")
+_TRANSLATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["source_language", "translated_subject", "translated_text"],
+    "properties": {
+        "source_language": {"type": "string"},
+        "translated_subject": {"type": "string"},
+        "translated_text": {"type": "string"},
+    },
+}
+LANGUAGE_LABELS = {
+    "hr": "Croatian",
+    "en": "English",
+    "es": "Spanish",
+    "de": "German",
+    "fr": "French",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "zh": "Mandarin Chinese",
+}
+
+
+class MailTranslationError(Exception):
+    pass
+
+
+class MailTranslationUnavailableError(MailTranslationError):
+    pass
+
+
+class MailTranslationFailedError(MailTranslationError):
+    pass
+
+
+class MailTranslationEmptyError(MailTranslationError):
+    pass
+
+
+@dataclass(frozen=True)
+class PreparedTranslationSource:
+    subject: str
+    body: str
+    source_hash: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class MailTranslationResult:
+    account_email: str
+    folder: str
+    uid: str
+    message_id: str
+    target_language: str
+    source_language: str
+    translated_subject: str
+    translated_text: str
+    cached: bool
+    truncated: bool
+    model: str
+
+
+def supported_target_languages():
+    return tuple(settings.MAIL_TRANSLATION_SUPPORTED_LANGUAGES)
+
+
+def normalize_target_language(value):
+    language = str(value or settings.MAIL_TRANSLATION_DEFAULT_TARGET_LANGUAGE).strip()
+    if language not in supported_target_languages():
+        raise ValueError("invalid_target_language")
+    return language
+
+
+def normalize_translation_text(value):
+    return _WHITESPACE_RE.sub(" ", str(value or "").strip())
+
+
+def html_to_translation_text(html):
+    text = unescape(strip_tags(str(html or "")))
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def build_translation_source_hash(subject, body):
+    digest = hashlib.sha256()
+    digest.update(normalize_translation_text(subject).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(normalize_translation_text(body).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def prepare_translation_source(detail, max_chars):
+    subject = str(detail.subject or "").strip()
+    body = str(detail.text_body or "").strip()
+    if not body:
+        body = html_to_translation_text(detail.html_body)
+    if not subject and not body:
+        raise MailTranslationEmptyError("empty_message_body")
+
+    truncated = False
+    if max_chars > 0:
+        if len(subject) > max_chars:
+            subject = subject[:max_chars].rstrip()
+            body = ""
+            truncated = True
+        elif len(subject) + len(body) > max_chars:
+            remaining = max_chars - len(subject)
+            body = body[: max(remaining, 0)].rstrip()
+            truncated = True
+    return PreparedTranslationSource(
+        subject=subject,
+        body=body,
+        source_hash=build_translation_source_hash(subject, body),
+        truncated=truncated,
+    )
+
+
+class MailTranslationService:
+    def __init__(self, mailbox_service=None, openai_client=None):
+        self.mailbox_service = mailbox_service or MailboxService()
+        self.openai_client = openai_client
+
+    def translate_message(self, *, user, credentials, folder, uid, target_language=None):
+        target_language = normalize_target_language(target_language)
+        detail = self.mailbox_service.get_message_detail(credentials, folder=folder, uid=uid)
+        source = prepare_translation_source(detail, settings.MAIL_TRANSLATION_MAX_INPUT_CHARS)
+        cache_row = MailMessageTranslation.objects.filter(
+            user=user,
+            account_email=credentials.email,
+            folder=folder,
+            uid=str(uid),
+            target_language=target_language,
+            source_hash=source.source_hash,
+        ).first()
+        if cache_row is not None:
+            logger.info(
+                "Mail translation cache hit user=%s account=%s folder=%s uid=%s target=%s model=%s",
+                user.pk,
+                credentials.email,
+                folder,
+                uid,
+                target_language,
+                cache_row.model,
+            )
+            return self._result_from_row(cache_row, cached=True)
+
+        logger.info(
+            "Mail translation cache miss user=%s account=%s folder=%s uid=%s target=%s",
+            user.pk,
+            credentials.email,
+            folder,
+            uid,
+            target_language,
+        )
+        translated = self._translate_with_openai(source, target_language)
+        row, created = MailMessageTranslation.objects.get_or_create(
+            user=user,
+            account_email=credentials.email,
+            folder=folder,
+            uid=str(uid),
+            target_language=target_language,
+            source_hash=source.source_hash,
+            defaults={
+                "message_id": str(detail.message_id or "").strip(),
+                "source_language": translated["source_language"],
+                "translated_subject": translated["translated_subject"],
+                "translated_text": translated["translated_text"],
+                "model": settings.OPENAI_TRANSLATION_MODEL,
+                "truncated": source.truncated,
+            },
+        )
+        if not created:
+            logger.info(
+                "Mail translation cache filled concurrently user=%s account=%s folder=%s uid=%s target=%s model=%s",
+                user.pk,
+                credentials.email,
+                folder,
+                uid,
+                target_language,
+                row.model,
+            )
+            return self._result_from_row(row, cached=True)
+        return self._result_from_row(row, cached=False)
+
+    def _result_from_row(self, row, cached):
+        return MailTranslationResult(
+            account_email=row.account_email,
+            folder=row.folder,
+            uid=row.uid,
+            message_id=row.message_id,
+            target_language=row.target_language,
+            source_language=row.source_language,
+            translated_subject=row.translated_subject,
+            translated_text=row.translated_text,
+            cached=cached,
+            truncated=row.truncated,
+            model=row.model,
+        )
+
+    def _translate_with_openai(self, source, target_language):
+        client = self.openai_client or self._build_openai_client()
+        language_label = LANGUAGE_LABELS.get(target_language, target_language)
+        try:
+            response = client.responses.create(
+                model=settings.OPENAI_TRANSLATION_MODEL,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You translate email content. Translate only the provided subject and body into the "
+                            f"requested target language ({language_label}). Preserve names, numbers, formatting, "
+                            "and business tone. Do not add commentary. Return empty strings when the source field is empty."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "target_language": target_language,
+                                "subject": source.subject,
+                                "body": source.body,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "mail_translation",
+                        "strict": True,
+                        "schema": _TRANSLATION_SCHEMA,
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.warning("Mail translation failed target=%s model=%s error=%s", target_language, settings.OPENAI_TRANSLATION_MODEL, exc)
+            raise MailTranslationFailedError("translation_failed") from exc
+        parsed = self._parse_response_json(response)
+        return {
+            "source_language": str(parsed.get("source_language") or "").strip().lower(),
+            "translated_subject": str(parsed.get("translated_subject") or "").strip(),
+            "translated_text": str(parsed.get("translated_text") or "").strip(),
+        }
+
+    def _build_openai_client(self):
+        if not settings.OPENAI_API_KEY:
+            raise MailTranslationUnavailableError("translation_unavailable")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise MailTranslationUnavailableError("translation_unavailable") from exc
+        return OpenAI(api_key=settings.OPENAI_API_KEY, timeout=settings.OPENAI_TRANSLATION_TIMEOUT_SECONDS)
+
+    def _parse_response_json(self, response):
+        output_text = getattr(response, "output_text", "") or ""
+        if not output_text:
+            raise MailTranslationFailedError("translation_failed")
+        try:
+            return json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            raise MailTranslationFailedError("translation_failed") from exc

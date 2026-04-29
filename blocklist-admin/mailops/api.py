@@ -71,6 +71,8 @@ from .api_serializers import (
     MailIndexStatusQuerySerializer,
     MailIndexStatusResponseSerializer,
     MessageDetailResponseSerializer,
+    MessageTranslationRequestSerializer,
+    MessageTranslationResponseSerializer,
     MessageSummariesResponseSerializer,
     RestoreMessagesRequestSerializer,
     RestoreMessagesResponseSerializer,
@@ -90,6 +92,12 @@ from .gmail_import import GmailImportError, GmailImportService
 from .gmail_send import GmailOutboundSendService
 from .models import AddressBookContact, DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
 from .services import send_mail_notification
+from .translation import (
+    MailTranslationEmptyError,
+    MailTranslationFailedError,
+    MailTranslationService,
+    MailTranslationUnavailableError,
+)
 
 
 MAILBOX_API_AUTHENTICATION_CLASSES = [TokenAuthentication]
@@ -331,6 +339,22 @@ def detail_payload(detail):
         }
     )
     return payload
+
+
+def translation_payload(result):
+    return {
+        "account_email": result.account_email,
+        "folder": result.folder,
+        "uid": result.uid,
+        "message_id": result.message_id,
+        "target_language": result.target_language,
+        "source_language": result.source_language,
+        "translated_subject": result.translated_subject,
+        "translated_text": result.translated_text,
+        "cached": result.cached,
+        "truncated": result.truncated,
+        "model": result.model,
+    }
 
 
 def conversation_payload(conversation):
@@ -1200,6 +1224,48 @@ class MessageDetailView(APIView):
         if error:
             return error
         return delete_messages_response(request, credentials, data["folder"], data["uids"])
+
+
+class MessageTranslationView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_translate",
+        request=MessageTranslationRequestSerializer,
+        responses={200: MessageTranslationResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 503: ErrorSerializer},
+    )
+    def post(self, request, uid):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        serializer = MessageTranslationRequestSerializer(data=request.data or {})
+        if not serializer.is_valid():
+            if "folder" in serializer.errors:
+                return Response({"error": "invalid_folder"}, status=status.HTTP_400_BAD_REQUEST)
+            if "target_language" in serializer.errors:
+                return Response({"error": "invalid_target_language"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "invalid_translation_request"}, status=status.HTTP_400_BAD_REQUEST)
+        data = serializer.validated_data
+        try:
+            result = MailTranslationService().translate_message(
+                user=request.user,
+                credentials=credentials,
+                folder=data["folder"],
+                uid=uid,
+                target_language=data["target_language"],
+            )
+        except MailTranslationEmptyError:
+            return Response({"error": "empty_message_body"}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            return Response({"error": "invalid_target_language"}, status=status.HTTP_400_BAD_REQUEST)
+        except MailTranslationUnavailableError:
+            return Response({"error": "translation_unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except MailTranslationFailedError:
+            return Response({"error": "translation_failed"}, status=status.HTTP_502_BAD_GATEWAY)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        return Response(translation_payload(result))
 
 
 class AttachmentDownloadView(APIView):

@@ -186,6 +186,59 @@ Response:
 }
 ```
 
+## Message Translation
+
+`POST /api/mail/messages/<uid>/translate`
+
+Translate a single message on demand. The backend fetches the message from IMAP, sends only subject/body text to OpenAI, and caches the translated result in Postgres for the same message content and target language.
+
+Request:
+
+```json
+{
+  "folder": "INBOX",
+  "target_language": "hr"
+}
+```
+
+Rules:
+
+- `folder` defaults to `INBOX`
+- supported target languages for v1: `hr`, `en`, `es`, `de`, `fr`, `it`, `pt`, `zh`
+- if only subject exists, only subject is translated
+- if only body exists, only body is translated
+- if both subject and body are empty, the API returns `400 {"error": "empty_message_body"}`
+- large message text is truncated before the OpenAI call and the response includes `truncated: true`
+- attachments and raw MIME content are never sent to OpenAI in v1
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "uid": "42",
+  "message_id": "<m1@example.com>",
+  "target_language": "hr",
+  "source_language": "en",
+  "translated_subject": "Pozdrav",
+  "translated_text": "Prevedeni tekst poruke...",
+  "cached": true,
+  "truncated": false,
+  "model": "gpt-5.4-mini"
+}
+```
+
+Errors:
+
+- `400 {"error": "invalid_folder"}`
+- `400 {"error": "invalid_target_language"}`
+- `400 {"error": "empty_message_body"}`
+- `503 {"error": "translation_unavailable"}`
+- `502 {"error": "translation_failed"}`
+
+Known limitation: when a message is moved and gets a different `folder` or `uid`, the backend may create a new cached translation row for that moved copy.
+
 ## Conversations
 
 `GET /api/mail/conversations?folder=INBOX&limit=50`
