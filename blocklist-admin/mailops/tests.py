@@ -1,6 +1,7 @@
 import importlib
 import io
 import json
+from dataclasses import replace
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
@@ -66,24 +67,42 @@ from .models import (
     GmailImportRun,
     MailAccountIndex,
     MailConversationIndex,
+    MailMessageTranslation,
     MailMessageIndex,
     MailboxTokenCredential,
     PushNotificationLog,
 )
 from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
+from .translation import (
+    MailTranslationEmptyError,
+    MailTranslationFailedError,
+    MailTranslationService,
+    MailTranslationUnavailableError,
+    build_translation_source_hash,
+)
 
 
 TEST_ENCRYPTION_KEY = "DhbKZLv4bil01DI7X2u09Q69vebV7py6A9m9q0gOCfg="
 
 
 class FakeGmailClient:
-    def __init__(self, refs=(), raw_messages=None, history_pages=None, events=None, delete_error=None, history_error=None):
+    def __init__(
+        self,
+        refs=(),
+        raw_messages=None,
+        history_pages=None,
+        events=None,
+        delete_error=None,
+        history_error=None,
+        fetch_errors=None,
+    ):
         self.refs = tuple(refs)
         self.raw_messages = raw_messages or {}
         self.history_pages = list(history_pages or [])
         self.events = events if events is not None else []
         self.delete_error = delete_error
         self.history_error = history_error
+        self.fetch_errors = fetch_errors or {}
         self.deleted = []
         self.list_calls = []
         self.history_calls = []
@@ -94,6 +113,8 @@ class FakeGmailClient:
 
     def fetch_raw_message(self, gmail_message_id):
         self.events.append(f"fetch:{gmail_message_id}")
+        if gmail_message_id in self.fetch_errors:
+            raise self.fetch_errors[gmail_message_id]
         return self.raw_messages[gmail_message_id]
 
     def list_history_page(self, start_history_id, page_token=""):
@@ -1530,6 +1551,72 @@ class MailApiTests(TestCase):
         account.refresh_from_db()
         self.assertEqual(account.last_history_id, "21")
 
+    def test_gmail_incremental_import_treats_missing_gmail_message_as_skipped(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, last_history_id="10")
+        account.set_refresh_token("refresh-secret")
+        account.historical_import_completed_at = timezone.now()
+        account.save()
+        gmail_client = FakeGmailClient(
+            history_pages=(
+                GmailHistoryPage(
+                    history_id="12",
+                    messages_added=(GmailHistoryMessage(gmail_message_id="missing-1", gmail_thread_id="thread-1", history_id="11"),),
+                ),
+            ),
+            fetch_errors={"missing-1": MailConnectionError("Gmail message fetch failed: Gmail API returned HTTP 404")},
+        )
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(),
+        ).run_incremental_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(result.skipped, 1)
+        self.assertEqual(result.committed, 0)
+        account.refresh_from_db()
+        self.assertEqual(account.last_history_id, "12")
+        self.assertEqual(account.consecutive_failures, 0)
+        run = GmailImportRun.objects.get()
+        self.assertEqual(run.status, GmailImportRun.STATUS_SUCCESS)
+        message = GmailImportMessage.objects.get(import_account=account, gmail_message_id="missing-1")
+        self.assertEqual(message.append_status, GmailImportMessage.STATUS_SKIPPED)
+
+    @override_settings(GMAIL_IMPORT_OAUTH_SCOPES=("https://mail.google.com/",))
+    def test_gmail_incremental_import_cleans_stale_committed_pending_records(self):
+        create_mailbox_token(self.account_email, self.password)
+        account = GmailImportAccount(
+            gmail_email="source@gmail.com",
+            target_mailbox_email=self.account_email,
+            last_history_id="10",
+            delete_after_import=True,
+        )
+        account.set_refresh_token("refresh-secret")
+        account.historical_import_completed_at = timezone.now()
+        account.save()
+        stale = GmailImportMessage.objects.create(
+            import_account=account,
+            gmail_message_id="stale-1",
+            state=GmailImportMessage.STATE_COMMITTED,
+            append_status=GmailImportMessage.STATUS_SUCCESS,
+            cleanup_status=GmailImportMessage.STATUS_PENDING,
+            committed_at=timezone.now(),
+        )
+        gmail_client = FakeGmailClient(history_pages=(GmailHistoryPage(history_id="10"),))
+
+        result = GmailImportService(
+            gmail_client_factory=lambda refresh_token: gmail_client,
+            imap_client_factory=lambda: FakeImapClient(),
+        ).run_incremental_import("source@gmail.com", self.account_email, limit=10)
+
+        self.assertEqual(result.cleaned, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(gmail_client.deleted, ["stale-1"])
+        stale.refresh_from_db()
+        self.assertEqual(stale.state, GmailImportMessage.STATE_CLEANED)
+        self.assertEqual(stale.cleanup_status, GmailImportMessage.STATUS_SUCCESS)
+
     def test_gmail_incremental_cycle_selects_completed_historical_accounts(self):
         create_mailbox_token(self.account_email, self.password)
         ready = GmailImportAccount(gmail_email="source@gmail.com", target_mailbox_email=self.account_email, last_history_id="10")
@@ -2475,6 +2562,122 @@ class MailApiTests(TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"], "mail_connection_failed")
 
+    @patch("mailops.api.MailTranslationService")
+    def test_mail_message_translate_returns_translation_payload(self, translation_service_class):
+        headers = self.auth_headers()
+        translation_service_class.return_value.translate_message.return_value = Mock(
+            account_email=self.account_email,
+            folder="INBOX",
+            uid="42",
+            message_id="<m1@example.com>",
+            target_language="hr",
+            source_language="en",
+            translated_subject="Pozdrav",
+            translated_text="Prevedeni tekst",
+            cached=False,
+            truncated=False,
+            model="gpt-5.4-mini",
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX", "target_language": "hr"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "account_email": self.account_email,
+                "folder": "INBOX",
+                "uid": "42",
+                "message_id": "<m1@example.com>",
+                "target_language": "hr",
+                "source_language": "en",
+                "translated_subject": "Pozdrav",
+                "translated_text": "Prevedeni tekst",
+                "cached": False,
+                "truncated": False,
+                "model": "gpt-5.4-mini",
+            },
+        )
+        call = translation_service_class.return_value.translate_message.call_args
+        self.assertEqual(call.kwargs["folder"], "INBOX")
+        self.assertEqual(call.kwargs["uid"], "42")
+        self.assertEqual(call.kwargs["target_language"], "hr")
+        self.assertEqual(call.kwargs["credentials"].email, self.account_email)
+
+    def test_mail_message_translate_requires_auth_and_validates_payload(self):
+        missing_token = self.client.post(reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}), data={}, content_type="application/json")
+        headers = self.auth_headers()
+        invalid_folder = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": " ", "target_language": "hr"},
+            content_type="application/json",
+            **headers,
+        )
+        invalid_target = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX", "target_language": "sr"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(missing_token.json()["error"], "not_authenticated")
+        self.assertEqual(invalid_folder.status_code, 400)
+        self.assertEqual(invalid_folder.json()["error"], "invalid_folder")
+        self.assertEqual(invalid_target.status_code, 400)
+        self.assertEqual(invalid_target.json()["error"], "invalid_target_language")
+
+    @patch("mailops.api.MailTranslationService")
+    def test_mail_message_translate_maps_translation_errors(self, translation_service_class):
+        headers = self.auth_headers()
+        translation_service = translation_service_class.return_value
+
+        translation_service.translate_message.side_effect = MailTranslationEmptyError("empty")
+        empty_response = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX"},
+            content_type="application/json",
+            **headers,
+        )
+
+        translation_service.translate_message.side_effect = MailTranslationFailedError("failed")
+        failed_response = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX"},
+            content_type="application/json",
+            **headers,
+        )
+
+        translation_service.translate_message.side_effect = MailConnectionError("down")
+        mail_error_response = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX"},
+            content_type="application/json",
+            **headers,
+        )
+
+        translation_service.translate_message.side_effect = MailTranslationUnavailableError("missing")
+        unavailable_response = self.client.post(
+            reverse("mailops:api_mail_message_translate", kwargs={"uid": "42"}),
+            data={"folder": "INBOX"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(empty_response.status_code, 400)
+        self.assertEqual(empty_response.json()["error"], "empty_message_body")
+        self.assertEqual(failed_response.status_code, 502)
+        self.assertEqual(failed_response.json()["error"], "translation_failed")
+        self.assertEqual(mail_error_response.status_code, 502)
+        self.assertEqual(mail_error_response.json()["error"], "mail_connection_failed")
+        self.assertEqual(unavailable_response.status_code, 503)
+        self.assertEqual(unavailable_response.json()["error"], "translation_unavailable")
+
     @patch("mailops.api.MailboxService")
     def test_mail_attachment_download_returns_binary_response(self, service_class):
         headers = self.auth_headers()
@@ -3233,6 +3436,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/mail/messages/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/restore")
         self.assertContains(schema, "/api/mail/messages/{uid}/attachments/{attachment_id}")
+        self.assertContains(schema, "/api/mail/messages/{uid}/translate")
         self.assertContains(schema, "/api/mail/conversations")
         self.assertContains(schema, "/api/mail/unified-conversations")
         self.assertContains(schema, "/api/mail/index-status")
@@ -3247,6 +3451,147 @@ class MailApiTests(TestCase):
 
     def test_spectacular_schema_generation_command_runs(self):
         call_command("spectacular", file="/tmp/test-mailadmin-schema.yaml", validate=True)
+
+
+@override_settings(
+    MAILBOX_CREDENTIAL_ENCRYPTION_KEY=TEST_ENCRYPTION_KEY,
+    OPENAI_API_KEY="test-key",
+    OPENAI_TRANSLATION_MODEL="gpt-5.4-mini",
+    MAIL_TRANSLATION_MAX_INPUT_CHARS=12,
+)
+class MailTranslationServiceTests(TestCase):
+    def setUp(self):
+        self.account_email = "user@example.com"
+        self.password = "mail-secret"
+        self.token = create_mailbox_token(self.account_email, self.password)
+        self.credentials = mailbox_credentials_from_request(Mock(auth=self.token))
+        self.detail = MailMessageDetail(
+            uid="42",
+            folder="INBOX",
+            subject="Hello",
+            sender="Sender <sender@example.com>",
+            to=(self.account_email,),
+            message_id="<m1@example.com>",
+            text_body="This is the body",
+        )
+
+    def test_build_translation_source_hash_depends_only_on_source_content(self):
+        first = build_translation_source_hash(" Hello ", "Body")
+        second = build_translation_source_hash("Hello", "Body")
+        third = build_translation_source_hash("Hello", "Other body")
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, third)
+
+    def test_translate_message_caches_by_source_hash_and_ignores_message_id_in_unique_key(self):
+        mailbox_service = Mock()
+        mailbox_service.get_message_detail.return_value = self.detail
+        openai_client = Mock()
+        openai_client.responses.create.return_value = Mock(
+            output_text=json.dumps(
+                {
+                    "source_language": "en",
+                    "translated_subject": "Pozdrav",
+                    "translated_text": "Prijevod",
+                }
+            )
+        )
+        service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
+
+        first = service.translate_message(
+            user=self.token.user,
+            credentials=self.credentials,
+            folder="INBOX",
+            uid="42",
+            target_language="hr",
+        )
+
+        mailbox_service.get_message_detail.return_value = replace(self.detail, message_id="<changed@example.com>")
+        second = service.translate_message(
+            user=self.token.user,
+            credentials=self.credentials,
+            folder="INBOX",
+            uid="42",
+            target_language="hr",
+        )
+
+        self.assertFalse(first.cached)
+        self.assertTrue(second.cached)
+        self.assertEqual(MailMessageTranslation.objects.count(), 1)
+        self.assertEqual(openai_client.responses.create.call_count, 1)
+
+    def test_translate_message_creates_new_cache_row_for_different_target_language(self):
+        mailbox_service = Mock()
+        mailbox_service.get_message_detail.return_value = self.detail
+        openai_client = Mock()
+        openai_client.responses.create.side_effect = [
+            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Pozdrav", "translated_text": "Prijevod"})),
+            Mock(output_text=json.dumps({"source_language": "en", "translated_subject": "Hello", "translated_text": "Translation"})),
+        ]
+        service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
+
+        service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="hr")
+        service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="en")
+
+        self.assertEqual(MailMessageTranslation.objects.count(), 2)
+
+    def test_translate_message_handles_body_only_and_truncation(self):
+        detail = MailMessageDetail(
+            uid="42",
+            folder="INBOX",
+            subject="",
+            sender="Sender <sender@example.com>",
+            to=(self.account_email,),
+            message_id="<m1@example.com>",
+            text_body="12345678901234567890",
+        )
+        mailbox_service = Mock()
+        mailbox_service.get_message_detail.return_value = detail
+        openai_client = Mock()
+        openai_client.responses.create.return_value = Mock(
+            output_text=json.dumps({"source_language": "en", "translated_subject": "", "translated_text": "Sazetak"})
+        )
+        service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
+
+        result = service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="hr")
+
+        self.assertTrue(result.truncated)
+        call_kwargs = openai_client.responses.create.call_args.kwargs
+        self.assertIn("123456789012", call_kwargs["input"][1]["content"])
+        self.assertNotIn("1234567890123", call_kwargs["input"][1]["content"])
+
+    def test_translate_message_rejects_empty_subject_and_body(self):
+        detail = MailMessageDetail(uid="42", folder="INBOX", subject="", sender="Sender", to=(self.account_email,), text_body="", html_body="")
+        mailbox_service = Mock()
+        mailbox_service.get_message_detail.return_value = detail
+        service = MailTranslationService(mailbox_service=mailbox_service, openai_client=Mock())
+
+        with self.assertRaises(MailTranslationEmptyError):
+            service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="hr")
+
+    def test_translate_message_logs_cache_without_message_content(self):
+        mailbox_service = Mock()
+        mailbox_service.get_message_detail.return_value = self.detail
+        openai_client = Mock()
+        openai_client.responses.create.return_value = Mock(
+            output_text=json.dumps(
+                {
+                    "source_language": "en",
+                    "translated_subject": "Pozdrav",
+                    "translated_text": "Prijevod",
+                }
+            )
+        )
+        service = MailTranslationService(mailbox_service=mailbox_service, openai_client=openai_client)
+        service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="hr")
+
+        with self.assertLogs("mailops.translation", level="INFO") as captured:
+            service.translate_message(user=self.token.user, credentials=self.credentials, folder="INBOX", uid="42", target_language="hr")
+
+        joined = "\n".join(captured.output)
+        self.assertIn("cache hit", joined)
+        self.assertNotIn("This is the body", joined)
+        self.assertNotIn("Prijevod", joined)
 
 
 @override_settings(

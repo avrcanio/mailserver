@@ -290,19 +290,35 @@ class GmailImportService:
             refs=refs,
             no_delete=no_delete,
             gmail_client=gmail_client,
+            skip_missing_messages=True,
+        )
+        stale_cleanup = self._cleanup_stale_committed_messages(
+            import_account=import_account,
+            gmail_client=gmail_client,
+            no_delete=no_delete,
+            limit=limit,
         )
         return GmailImportResult(
             run=run,
             scanned=result.scanned,
             appended=result.appended,
             committed=result.committed,
-            cleaned=result.cleaned,
+            cleaned=result.cleaned + stale_cleanup.cleaned,
             skipped=result.skipped,
-            failed=result.failed,
+            failed=result.failed + stale_cleanup.failed,
             history_id=history_id or result.history_id,
         )
 
-    def _import_refs(self, import_account, target_mailbox_email, run, refs, no_delete, gmail_client=None):
+    def _import_refs(
+        self,
+        import_account,
+        target_mailbox_email,
+        run,
+        refs,
+        no_delete,
+        gmail_client=None,
+        skip_missing_messages=False,
+    ):
         gmail_client = gmail_client or self.gmail_client_factory(import_account.get_refresh_token())
         scanned = len(refs)
         target_credentials = self._target_credentials(target_mailbox_email, owner=import_account.user)
@@ -357,6 +373,10 @@ class GmailImportService:
                         else:
                             failed += 1
                 except Exception as exc:
+                    if skip_missing_messages and _is_gmail_message_not_found(exc):
+                        skipped += 1
+                        self._mark_skipped_missing(message_record, exc)
+                        continue
                     failed += 1
                     self._mark_failed(message_record, exc)
 
@@ -466,6 +486,14 @@ class GmailImportService:
             record.append_status = GmailImportMessage.STATUS_FAILED
         record.save(update_fields=["state", "append_status", "error", "updated_at"])
 
+    def _mark_skipped_missing(self, record, exc):
+        # Incremental Gmail history can reference messages that are no longer fetchable.
+        # Keep them out of failed counts to avoid noisy retries and false red cycles.
+        record.state = GmailImportMessage.STATE_FAILED
+        record.append_status = GmailImportMessage.STATUS_SKIPPED
+        record.error = str(exc)[:2000]
+        record.save(update_fields=["state", "append_status", "error", "updated_at"])
+
     def _mark_cleanup_failed(self, record, exc):
         record.state = GmailImportMessage.STATE_COMMITTED
         record.cleanup_status = GmailImportMessage.STATUS_FAILED
@@ -474,6 +502,28 @@ class GmailImportService:
 
     def _mark_index_stale(self, target_mailbox_email):
         MailAccountIndex.objects.filter(account_email=target_mailbox_email).update(last_indexed_at=None)
+
+    def _cleanup_stale_committed_messages(self, import_account, gmail_client, no_delete, limit):
+        cleanup_enabled = bool(import_account.delete_after_import and not no_delete)
+        if not cleanup_enabled:
+            return GmailImportResult(run=None, scanned=0, appended=0, committed=0, cleaned=0, skipped=0, failed=0)
+        _require_permanent_delete_scope()
+        stale_records = (
+            GmailImportMessage.objects.filter(
+                import_account=import_account,
+                state=GmailImportMessage.STATE_COMMITTED,
+                cleanup_status=GmailImportMessage.STATUS_PENDING,
+            )
+            .order_by("updated_at")[:limit]
+        )
+        cleaned = 0
+        failed = 0
+        for record in stale_records:
+            if self._try_clean_gmail_source(gmail_client, record):
+                cleaned += 1
+            else:
+                failed += 1
+        return GmailImportResult(run=None, scanned=0, appended=0, committed=0, cleaned=cleaned, skipped=0, failed=failed)
 
 
 def _bounded_refs(gmail_client, query, limit):
@@ -558,3 +608,7 @@ def _max_history_id(current, candidate):
         return str(max(int(current), int(candidate)))
     except ValueError:
         return candidate
+
+
+def _is_gmail_message_not_found(exc):
+    return isinstance(exc, MailConnectionError) and "HTTP 404" in str(exc)
