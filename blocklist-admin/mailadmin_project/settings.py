@@ -108,6 +108,9 @@ _paddleocr_allowed_ct = os.environ.get(
 PADDLEOCR_ALLOWED_CONTENT_TYPES = tuple(
     part.strip().lower() for part in _paddleocr_allowed_ct.split(",") if part.strip()
 )
+PADDLEOCR_PDF_ENABLED = env_bool("PADDLEOCR_PDF_ENABLED", True)
+PADDLEOCR_OCRMYPDF_LANG = (os.environ.get("PADDLEOCR_OCRMYPDF_LANG") or "").strip() or "hrv+eng"
+PADDLEOCR_OCRMYPDF_ARGS = (os.environ.get("PADDLEOCR_OCRMYPDF_ARGS") or "").strip()
 MAILBOX_AUTO_CREATE_FROM_USER_ADMIN = env_bool("MAILBOX_AUTO_CREATE_FROM_USER_ADMIN", False)
 MAILBOX_AUTO_CREATE_SKIP_STAFF = env_bool("MAILBOX_AUTO_CREATE_SKIP_STAFF", True)
 BLOCKLIST_REJECT_MESSAGE = os.environ.get("BLOCKLIST_REJECT_MESSAGE", "Blocked by local policy")

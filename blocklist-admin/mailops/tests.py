@@ -1,6 +1,7 @@
 import importlib
 import io
 import json
+import tarfile
 from dataclasses import replace
 from datetime import datetime, timezone as dt_timezone
 from unittest.mock import Mock, patch
@@ -3454,14 +3455,26 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    @override_settings(PADDLEOCR_CONTAINER_NAME="paddle", PADDLEOCR_PDF_ENABLED=False)
+    def test_receipt_ocr_returns_503_when_pdf_disabled(self):
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"x", content_type="image/png")
+        response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"], "receipt_pdf_unavailable")
+
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     def test_receipt_ocr_success_returns_cli_json(self, docker_cls):
         container = Mock()
         container.put_archive.return_value = True
+        container.get_archive.return_value = (iter(()), {"size": 0})
 
         def exec_side_effect(cmd, demux=False, **kwargs):
             if cmd and cmd[0] == "rm":
                 return 0, b""
+            if cmd and cmd[0] == "ocrmypdf":
+                return 0, (b"", b"")
             return 0, (b'{"total": "1.00"}', b"")
 
         container.exec_run.side_effect = exec_side_effect
@@ -3472,14 +3485,34 @@ class MailApiTests(TestCase):
         with override_settings(
             PADDLEOCR_CONTAINER_NAME="paddleocr",
             PADDLEOCR_IMAGE_TO_R1_JSON="/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py",
+            PADDLEOCR_OCRMYPDF_LANG="hrv+eng",
         ):
-            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+            with patch("mailops.paddleocr_receipt.uuid.uuid4", return_value=Mock(hex="u1")):
+                pdf_stream = io.BytesIO()
+                with tarfile.open(fileobj=pdf_stream, mode="w") as archive:
+                    info = tarfile.TarInfo(name="mailadmin_receipt_u1.pdf")
+                    pdf_bytes = b"%PDF-1.4\nfake\n%%EOF\n"
+                    info.size = len(pdf_bytes)
+                    archive.addfile(info, io.BytesIO(pdf_bytes))
+                pdf_stream.seek(0)
+                container.get_archive.return_value = (iter([pdf_stream.read()]), {"size": pdf_stream.tell()})
+                response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"total": "1.00"})
+        self.assertTrue(response["Content-Type"].startswith("multipart/mixed; boundary="))
+        body = response.content
+        content_type = response["Content-Type"]
+        boundary = content_type.split("boundary=", 1)[1]
+        self.assertIn(b'Content-Type: application/json', body)
+        self.assertIn(b'{"total": "1.00"}', body)
+        self.assertIn(b"Content-Type: application/pdf", body)
+        self.assertIn(b"%PDF-1.4", body)
+        self.assertIn(("--" + boundary + "--").encode("ascii"), body)
         container.put_archive.assert_called_once()
         ocr_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "python3"]
         self.assertEqual(len(ocr_calls), 1)
+        pdf_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "ocrmypdf"]
+        self.assertEqual(len(pdf_calls), 1)
 
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     def test_receipt_ocr_nonzero_exit_returns_502(self, docker_cls):

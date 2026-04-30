@@ -1,4 +1,5 @@
 import logging
+import json
 import secrets
 import time
 from email.utils import getaddresses
@@ -97,8 +98,9 @@ from .paddleocr_receipt import (
     ReceiptOCRDockerError,
     ReceiptOCRInputError,
     ReceiptOCRInvalidOutputError,
+    ReceiptOCRPdfUnavailableError,
     ReceiptOCRTimeoutError,
-    run_receipt_ocr_from_image_bytes,
+    run_receipt_ocr_json_and_pdf_from_image_bytes,
 )
 from .services import send_mail_notification
 from .translation import (
@@ -1729,13 +1731,14 @@ class ReceiptOcrView(APIView):
     @extend_schema(
         request={"multipart/form-data": ReceiptOcrUploadSerializer},
         responses={
-            200: OpenApiTypes.OBJECT,
+            200: OpenApiTypes.BINARY,
             400: ErrorSerializer,
             401: ErrorSerializer,
             502: ErrorSerializer,
             503: ErrorSerializer,
             504: ErrorSerializer,
         },
+        description="Returns a multipart/mixed response with two parts: application/json (R-1 payload) and application/pdf (searchable receipt PDF).",
     )
     def post(self, request):
         _, error = require_mailbox_credentials(request)
@@ -1747,7 +1750,7 @@ class ReceiptOcrView(APIView):
         raw = upload.read()
         declared_type = (getattr(upload, "content_type", None) or "").split(";")[0].strip().lower()
         try:
-            payload = run_receipt_ocr_from_image_bytes(raw, declared_type)
+            payload, pdf_bytes = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
         except ReceiptOCRDisabledError as exc:
             return Response({"error": "receipt_ocr_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ReceiptOCRInputError as exc:
@@ -1756,12 +1759,32 @@ class ReceiptOcrView(APIView):
             return Response({"error": "receipt_ocr_timeout", "detail": str(exc)}, status=status.HTTP_504_GATEWAY_TIMEOUT)
         except ReceiptOCRInvalidOutputError as exc:
             return Response({"error": "receipt_ocr_bad_output", "detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        except ReceiptOCRPdfUnavailableError as exc:
+            return Response({"error": "receipt_pdf_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ReceiptOCRDockerError as exc:
             body = {"error": "receipt_ocr_failed", "detail": str(exc)}
             if exc.exec_exit_code is not None:
                 body["exit_code"] = exc.exec_exit_code
             return Response(body, status=status.HTTP_502_BAD_GATEWAY)
-        return Response(payload)
+
+        boundary = f"receipt_ocr_{secrets.token_urlsafe(18)}"
+        json_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        parts = [
+            b"--" + boundary.encode("ascii") + b"\r\n"
+            + b"Content-Type: application/json; charset=utf-8\r\n"
+            + b"Content-Disposition: inline; name=\"receipt\"\r\n\r\n"
+            + json_bytes
+            + b"\r\n",
+            b"--" + boundary.encode("ascii") + b"\r\n"
+            + b"Content-Type: application/pdf\r\n"
+            + b"Content-Disposition: attachment; name=\"receipt_pdf\"; filename=\"receipt.pdf\"\r\n\r\n"
+            + pdf_bytes
+            + b"\r\n",
+            b"--" + boundary.encode("ascii") + b"--\r\n",
+        ]
+        body = b"".join(parts)
+        response = HttpResponse(body, content_type=f"multipart/mixed; boundary={boundary}", status=200)
+        return response
 
 
 class NewMailHookView(APIView):
