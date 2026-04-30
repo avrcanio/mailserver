@@ -7,7 +7,7 @@ from django.conf import settings
 logger = logging.getLogger("mailops.receipt_draft")
 
 
-_RECEIPT_DRAFT_SCHEMA = {
+_DRAFT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -15,6 +15,74 @@ _RECEIPT_DRAFT_SCHEMA = {
         "body": {"type": "string"},
     },
     "required": ["subject", "body"],
+}
+
+_R1_RECEIPT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "invoice": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "document_type": {"type": "string"},
+                "number": {"type": "string"},
+                "number_display": {"type": "string"},
+                "issue_date": {"type": "string"},
+                "currency": {"type": "string"},
+            },
+            "required": ["document_type", "number", "number_display", "issue_date", "currency"],
+        },
+        "seller": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "name": {"type": "string"},
+                "oib": {"type": "string"},
+            },
+            "required": ["name", "oib"],
+        },
+        "buyer": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "name": {"type": "string"},
+                "street": {"type": "string"},
+                "postal_code": {"type": "string"},
+                "city": {"type": "string"},
+                "country": {"type": "string"},
+                "country_name": {"type": "string"},
+                "address_single_line": {"type": "string"},
+                "oib": {"type": "string"},
+            },
+            "required": ["name", "street", "postal_code", "city", "country", "country_name", "address_single_line", "oib"],
+        },
+        "lines": {"type": "array"},
+        "totals": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "net": {"type": ["number", "null"]},
+                "tax": {"type": ["number", "null"]},
+                "gross": {"type": ["number", "null"]},
+            },
+            "required": ["net", "tax", "gross"],
+        },
+        "tax_summary": {"type": "object"},
+        "payment": {"type": "object"},
+        "validation": {"type": "object"},
+    },
+    "required": ["invoice", "seller", "buyer", "lines", "totals"],
+}
+
+_RECEIPT_AND_DRAFT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "receipt": _R1_RECEIPT_SCHEMA,
+        "draft": _DRAFT_SCHEMA,
+    },
+    "required": ["receipt", "draft"],
 }
 
 
@@ -37,12 +105,11 @@ class ReceiptDraftService:
     def __init__(self, openai_client=None):
         self.openai_client = openai_client
 
-    def create_draft(self, *, receipt: dict, ocr_text: str) -> dict:
+    def create_receipt_and_draft(self, *, ocr_text: str) -> dict:
         client = self.openai_client or self._build_openai_client()
         model = settings.OPENAI_RECEIPT_DRAFT_MODEL or settings.OPENAI_TRANSLATION_MODEL
         max_chars = int(getattr(settings, "OPENAI_RECEIPT_DRAFT_MAX_INPUT_CHARS", 12000) or 12000)
         payload = {
-            "receipt": receipt or {},
             "ocr_text": _clamp_text(ocr_text or "", max_chars),
         }
         start = time.monotonic()
@@ -53,10 +120,10 @@ class ReceiptDraftService:
                     {
                         "role": "system",
                         "content": (
-                            "You draft an email (Croatian) for forwarding a receipt for bookkeeping. "
-                            "Return ONLY JSON with keys subject and body. "
-                            "Be concise and professional. Prefer OCR text when it conflicts with receipt fields. "
-                            "If a value is missing, omit the line rather than hallucinating."
+                            "You extract Croatian receipt data and draft an email for bookkeeping. "
+                            "Return ONLY JSON matching the provided schema: {receipt, draft}. "
+                            "The receipt object must follow the R-1 schema. Use empty strings/nulls when values are missing. "
+                            "Prefer OCR text as the primary source and do not hallucinate."
                         ),
                     },
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -64,9 +131,9 @@ class ReceiptDraftService:
                 text={
                     "format": {
                         "type": "json_schema",
-                        "name": "receipt_email_draft",
+                        "name": "receipt_and_email_draft",
                         "strict": True,
-                        "schema": _RECEIPT_DRAFT_SCHEMA,
+                        "schema": _RECEIPT_AND_DRAFT_SCHEMA,
                     }
                 },
             )
@@ -75,9 +142,18 @@ class ReceiptDraftService:
             raise ReceiptDraftFailedError("openai_failed") from exc
         duration_ms = int((time.monotonic() - start) * 1000)
         parsed = self._parse_response_json(response)
-        subject = str(parsed.get("subject") or "").strip()
-        body = str(parsed.get("body") or "").strip()
-        return {"subject": subject, "body": body, "model": model, "duration_ms": duration_ms}
+        receipt = parsed.get("receipt") if isinstance(parsed, dict) else None
+        draft = parsed.get("draft") if isinstance(parsed, dict) else None
+        if not isinstance(receipt, dict) or not isinstance(draft, dict):
+            raise ReceiptDraftFailedError("openai_failed")
+        subject = str(draft.get("subject") or "").strip()
+        body = str(draft.get("body") or "").strip()
+        return {
+            "receipt": receipt,
+            "draft": {"subject": subject, "body": body},
+            "model": model,
+            "duration_ms": duration_ms,
+        }
 
     def _build_openai_client(self):
         if not settings.OPENAI_API_KEY:

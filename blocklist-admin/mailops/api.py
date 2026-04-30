@@ -100,7 +100,7 @@ from .paddleocr_receipt import (
     ReceiptOCRInvalidOutputError,
     ReceiptOCRPdfUnavailableError,
     ReceiptOCRTimeoutError,
-    run_receipt_ocr_json_and_pdf_from_image_bytes,
+    run_receipt_ocr_pdf_and_text_from_image_bytes,
 )
 from .receipt_draft import ReceiptDraftService
 from .services import send_mail_notification
@@ -118,25 +118,13 @@ GMAIL_OAUTH_STATE_SALT = "mailops.gmail-oauth-state"
 logger = logging.getLogger("mailops.api")
 
 
-def _guess_seller_name_from_ocr(ocr_text: str) -> str:
-    text = (ocr_text or "").strip()
+def _ocr_excerpt(value: str, max_chars: int = 1000) -> str:
+    text = (value or "").strip()
     if not text:
         return ""
-    for raw_line in text.splitlines()[:12]:
-        line = " ".join((raw_line or "").strip().split())
-        if not line:
-            continue
-        lower = line.lower()
-        if "racun" in lower or "račun" in lower:
-            break
-        if lower.startswith("podaci o kupcu"):
-            break
-        if len(line) < 3:
-            continue
-        if not any(ch.isalpha() for ch in line):
-            continue
-        return line
-    return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
 
 
 def create_mailbox_token(email, password):
@@ -1774,7 +1762,7 @@ class ReceiptOcrView(APIView):
         warnings = []
         openai_meta = {}
         try:
-            receipt_payload, pdf_bytes, artifacts_dir, ocr_text = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
+            pdf_bytes, ocr_text, artifacts_dir = run_receipt_ocr_pdf_and_text_from_image_bytes(raw, declared_type)
         except ReceiptOCRDisabledError as exc:
             return Response({"error": "receipt_ocr_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ReceiptOCRInputError as exc:
@@ -1791,25 +1779,13 @@ class ReceiptOcrView(APIView):
                 body["exit_code"] = exc.exec_exit_code
             return Response(body, status=status.HTTP_502_BAD_GATEWAY)
 
-        # Heuristic fix: if parsed seller conflicts with OCR header, prefer OCR.
-        seller_guess = _guess_seller_name_from_ocr(ocr_text)
-        try:
-            seller = (receipt_payload or {}).get("seller") or {}
-            parsed_seller_name = str(seller.get("name") or "").strip()
-            if parsed_seller_name and seller_guess and seller_guess.lower() not in parsed_seller_name.lower():
-                receipt_payload = dict(receipt_payload or {})
-                seller = dict(receipt_payload.get("seller") or {})
-                seller["name"] = seller_guess
-                receipt_payload["seller"] = seller
-                warnings.append("seller_overridden_from_ocr")
-        except Exception:
-            logger.debug("Unable to apply seller OCR override heuristic.", exc_info=True)
-
+        receipt_payload = {}
         draft = {"subject": "", "body": ""}
         try:
-            draft_result = ReceiptDraftService().create_draft(receipt=receipt_payload, ocr_text=ocr_text)
-            draft = {"subject": draft_result.get("subject", ""), "body": draft_result.get("body", "")}
-            openai_meta = {"model": draft_result.get("model", ""), "duration_ms": draft_result.get("duration_ms", 0)}
+            result = ReceiptDraftService().create_receipt_and_draft(ocr_text=ocr_text)
+            receipt_payload = result.get("receipt") or {}
+            draft = result.get("draft") or {"subject": "", "body": ""}
+            openai_meta = {"model": result.get("model", ""), "duration_ms": result.get("duration_ms", 0)}
         except Exception as exc:
             warnings.append("openai_failed")
             logger.warning("Receipt draft OpenAI failed error=%s", exc)
@@ -1825,6 +1801,7 @@ class ReceiptOcrView(APIView):
                     openai_model=str(openai_meta.get("model") or ""),
                     openai_duration_ms=int(openai_meta.get("duration_ms") or 0),
                     warnings=json.dumps(warnings, ensure_ascii=False),
+                    ocr_text_excerpt=_ocr_excerpt(ocr_text, 1000),
                 )
             except Exception:
                 logger.warning("Failed to persist ReceiptOcrLog for artifacts_dir=%r", artifacts_dir, exc_info=True)
@@ -1835,6 +1812,7 @@ class ReceiptOcrView(APIView):
             "artifacts_dir": artifacts_dir or "",
             "warnings": warnings,
             "openai": openai_meta,
+            **({"ocr_text": ocr_text} if warnings else {}),
         }
 
         boundary = f"receipt_ocr_{secrets.token_urlsafe(18)}"

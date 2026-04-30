@@ -3471,9 +3471,9 @@ class MailApiTests(TestCase):
         container = Mock()
         container.put_archive.return_value = True
         container.get_archive.return_value = (iter(()), {"size": 0})
-        draft_service_cls.return_value.create_draft.return_value = {
-            "subject": "Petrol – račun 29298-3800-2",
-            "body": "Pozdrav,\n\nMolim knjiženje računa.\n",
+        draft_service_cls.return_value.create_receipt_and_draft.return_value = {
+            "receipt": {"seller": {"name": "Müller", "oib": "84698789700"}, "invoice": {}, "buyer": {}, "lines": [], "totals": {}},
+            "draft": {"subject": "Müller – račun", "body": "Pozdrav,\n"},
             "model": "gpt-test",
             "duration_ms": 12,
         }
@@ -3496,14 +3496,6 @@ class MailApiTests(TestCase):
             PADDLEOCR_ARTIFACT_ROOT="/workspace/PaddleOCR/train_data/hr_r1_tuning",
         ):
             with patch("mailops.paddleocr_receipt.uuid.uuid4", return_value=Mock(hex="u1")):
-                json_stream = io.BytesIO()
-                with tarfile.open(fileobj=json_stream, mode="w") as archive:
-                    info = tarfile.TarInfo(name="parsed.json")
-                    json_bytes = b'{"total": "1.00"}\n'
-                    info.size = len(json_bytes)
-                    archive.addfile(info, io.BytesIO(json_bytes))
-                json_stream.seek(0)
-
                 pdf_stream = io.BytesIO()
                 with tarfile.open(fileobj=pdf_stream, mode="w") as archive:
                     info = tarfile.TarInfo(name="out.pdf")
@@ -3513,9 +3505,6 @@ class MailApiTests(TestCase):
                 pdf_stream.seek(0)
 
                 def get_archive_side_effect(path):
-                    if str(path).endswith("/parsed.json"):
-                        data = json_stream.getvalue()
-                        return iter([data]), {"size": len(data)}
                     if str(path).endswith("/ocr.txt"):
                         data = b"PETROL\nRACUN 29298-3800-2\n"
                         ocr_tar = io.BytesIO()
@@ -3541,7 +3530,7 @@ class MailApiTests(TestCase):
         self.assertIn(b'Content-Type: application/json', body)
         self.assertIn(b"\"receipt\"", body)
         self.assertIn(b"\"draft\"", body)
-        self.assertIn(b"Petrol \xe2\x80\x93 ra\xc4\x8dun", body)
+        self.assertIn(b"M\xc3\xbcller", body)
         self.assertIn(b"\"artifacts_dir\": \"/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1\"", body)
         self.assertIn(b"Content-Type: application/pdf", body)
         self.assertIn(b"%PDF-1.4", body)
@@ -3553,7 +3542,7 @@ class MailApiTests(TestCase):
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     @patch("mailops.api.ReceiptDraftService")
     def test_receipt_ocr_openai_failure_soft_succeeds(self, draft_service_cls, docker_cls):
-        draft_service_cls.return_value.create_draft.side_effect = ReceiptDraftFailedError("openai_failed")
+        draft_service_cls.return_value.create_receipt_and_draft.side_effect = ReceiptDraftFailedError("openai_failed")
         container = Mock()
         container.put_archive.return_value = True
 
@@ -3564,13 +3553,6 @@ class MailApiTests(TestCase):
 
         container.exec_run.side_effect = exec_side_effect
 
-        json_stream = io.BytesIO()
-        with tarfile.open(fileobj=json_stream, mode="w") as archive:
-            info = tarfile.TarInfo(name="parsed.json")
-            json_bytes = b'{"total": "1.00"}\n'
-            info.size = len(json_bytes)
-            archive.addfile(info, io.BytesIO(json_bytes))
-
         pdf_stream = io.BytesIO()
         with tarfile.open(fileobj=pdf_stream, mode="w") as archive:
             info = tarfile.TarInfo(name="out.pdf")
@@ -3579,9 +3561,6 @@ class MailApiTests(TestCase):
             archive.addfile(info, io.BytesIO(pdf_bytes))
 
         def get_archive_side_effect(path):
-            if str(path).endswith("/parsed.json"):
-                data = json_stream.getvalue()
-                return iter([data]), {"size": len(data)}
             if str(path).endswith("/ocr.txt"):
                 data = b"TEXT\n"
                 ocr_tar = io.BytesIO()
@@ -3613,6 +3592,7 @@ class MailApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response["Content-Type"].startswith("multipart/mixed; boundary="))
         self.assertIn(b"openai_failed", response.content)
+        self.assertIn(b"ocr_text", response.content)
 
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     def test_receipt_ocr_nonzero_exit_returns_502(self, docker_cls):

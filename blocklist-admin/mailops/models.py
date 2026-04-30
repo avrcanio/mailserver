@@ -223,6 +223,7 @@ class ReceiptOcrLog(models.Model):
     openai_model = models.CharField(max_length=128, blank=True, default="")
     openai_duration_ms = models.PositiveIntegerField(default=0)
     warnings = models.TextField(blank=True, default="")
+    ocr_text_excerpt = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -237,6 +238,7 @@ class ReceiptOcrLog(models.Model):
         self.draft_body = (self.draft_body or "").strip()
         self.openai_model = (self.openai_model or "").strip()
         self.warnings = (self.warnings or "").strip()
+        self.ocr_text_excerpt = (self.ocr_text_excerpt or "").strip()
 
     def save(self, *args, **kwargs):
         self.full_clean()
