@@ -72,6 +72,7 @@ from .models import (
     MailboxTokenCredential,
     PushNotificationLog,
 )
+from .paddleocr_receipt import ReceiptOCRTimeoutError
 from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
 from .translation import (
     MailTranslationEmptyError,
@@ -3425,6 +3426,120 @@ class MailApiTests(TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"], "mail_send_failed")
 
+    @override_settings(PADDLEOCR_CONTAINER_NAME="")
+    def test_receipt_ocr_returns_503_when_disabled(self):
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"x", content_type="image/png")
+        response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"], "receipt_ocr_unavailable")
+
+    def test_receipt_ocr_requires_authentication(self):
+        response = self.client.post(reverse("mailops:api_receipt_ocr"), {})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_receipt_ocr_rejects_missing_image(self):
+        headers = self.auth_headers()
+        response = self.client.post(reverse("mailops:api_receipt_ocr"), {}, **headers)
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_receipt_ocr_rejects_bad_content_type(self):
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.bin", b"x", content_type="application/octet-stream")
+        with override_settings(PADDLEOCR_CONTAINER_NAME="paddle"):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch("mailops.paddleocr_receipt.docker.DockerClient")
+    def test_receipt_ocr_success_returns_cli_json(self, docker_cls):
+        container = Mock()
+        container.put_archive.return_value = True
+
+        def exec_side_effect(cmd, demux=False, **kwargs):
+            if cmd and cmd[0] == "rm":
+                return 0, b""
+            return 0, (b'{"total": "1.00"}', b"")
+
+        container.exec_run.side_effect = exec_side_effect
+        docker_cls.return_value.containers.get.return_value = container
+
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"fakepng", content_type="image/png")
+        with override_settings(
+            PADDLEOCR_CONTAINER_NAME="paddleocr",
+            PADDLEOCR_IMAGE_TO_R1_JSON="/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py",
+        ):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"total": "1.00"})
+        container.put_archive.assert_called_once()
+        ocr_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "python3"]
+        self.assertEqual(len(ocr_calls), 1)
+
+    @patch("mailops.paddleocr_receipt.docker.DockerClient")
+    def test_receipt_ocr_nonzero_exit_returns_502(self, docker_cls):
+        container = Mock()
+        container.put_archive.return_value = True
+
+        def exec_side_effect(cmd, demux=False, **kwargs):
+            if cmd and cmd[0] == "rm":
+                return 0, b""
+            return 1, (b"", b"trace")
+
+        container.exec_run.side_effect = exec_side_effect
+        docker_cls.return_value.containers.get.return_value = container
+
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"x", content_type="image/png")
+        with override_settings(PADDLEOCR_CONTAINER_NAME="paddle", PADDLEOCR_IMAGE_TO_R1_JSON="/script.py"):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json().get("exit_code"), 1)
+
+    @patch("mailops.paddleocr_receipt.docker.DockerClient")
+    def test_receipt_ocr_invalid_json_returns_502(self, docker_cls):
+        container = Mock()
+        container.put_archive.return_value = True
+
+        def exec_side_effect(cmd, demux=False, **kwargs):
+            if cmd and cmd[0] == "rm":
+                return 0, b""
+            return 0, (b"NOT JSON", b"")
+
+        container.exec_run.side_effect = exec_side_effect
+        docker_cls.return_value.containers.get.return_value = container
+
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"x", content_type="image/png")
+        with override_settings(PADDLEOCR_CONTAINER_NAME="paddle", PADDLEOCR_IMAGE_TO_R1_JSON="/script.py"):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "receipt_ocr_bad_output")
+
+    @patch("mailops.paddleocr_receipt.docker.DockerClient")
+    @patch("mailops.paddleocr_receipt._exec_run_timed")
+    def test_receipt_ocr_timeout_returns_504(self, exec_mock, docker_cls):
+        exec_mock.side_effect = ReceiptOCRTimeoutError("timeout")
+        container = Mock()
+        container.put_archive.return_value = True
+        container.exec_run.return_value = (0, b"")
+        docker_cls.return_value.containers.get.return_value = container
+
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"x", content_type="image/png")
+        with override_settings(PADDLEOCR_CONTAINER_NAME="paddle", PADDLEOCR_IMAGE_TO_R1_JSON="/script.py"):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()["error"], "receipt_ocr_timeout")
+
     def test_schema_and_docs_endpoints_load(self):
         schema = self.client.get(reverse("schema"))
         docs = self.client.get(reverse("swagger-ui"))
@@ -3445,6 +3560,7 @@ class MailApiTests(TestCase):
         self.assertContains(schema, "/api/contacts")
         self.assertContains(schema, "/api/contacts/suggest")
         self.assertContains(schema, "/api/mail/send")
+        self.assertContains(schema, "/api/receipts/ocr")
         self.assertContains(schema, "/api/devices/")
         self.assertContains(schema, "/api/accounts/summaries")
         self.assertContains(schema, "/api/mail/new/")

@@ -143,6 +143,21 @@ class ErrorSerializer(serializers.Serializer):
     detail = serializers.CharField(required=False, allow_blank=True)
 
 
+class ReceiptOcrUploadSerializer(serializers.Serializer):
+    image = serializers.FileField()
+
+    def validate_image(self, value):
+        max_bytes = int(getattr(settings, "PADDLEOCR_MAX_IMAGE_BYTES", 12 * 1024 * 1024))
+        size = getattr(value, "size", None)
+        if size is not None and size > max_bytes:
+            raise serializers.ValidationError(f"Image must be at most {max_bytes} bytes.")
+        declared = (getattr(value, "content_type", None) or "").split(";")[0].strip().lower()
+        allowed = getattr(settings, "PADDLEOCR_ALLOWED_CONTENT_TYPES", ())
+        if declared not in allowed:
+            raise serializers.ValidationError("Unsupported or missing image content type.")
+        return value
+
+
 class ContactListQuerySerializer(serializers.Serializer):
     search = serializers.CharField(required=False, allow_blank=True, default="")
     limit = serializers.IntegerField(required=False, default=50)

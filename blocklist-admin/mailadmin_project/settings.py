@@ -97,6 +97,17 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 MAILADMIN_HOST = os.environ.get("MAILADMIN_HOST", "mailadmin.example.com")
 BLOCKLIST_CONFIG_PATH = Path(os.environ.get("BLOCKLIST_CONFIG_PATH", "/app/shared-config/postfix-sender-blocklist"))
 MAILSERVER_CONTAINER_NAME = os.environ.get("MAILSERVER_CONTAINER_NAME", "mailserver")
+PADDLEOCR_CONTAINER_NAME = (os.environ.get("PADDLEOCR_CONTAINER_NAME") or "").strip()
+PADDLEOCR_IMAGE_TO_R1_JSON = (os.environ.get("PADDLEOCR_IMAGE_TO_R1_JSON") or "").strip() or "/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py"
+PADDLEOCR_EXEC_TIMEOUT_SECONDS = int(os.environ.get("PADDLEOCR_EXEC_TIMEOUT_SECONDS", "120"))
+PADDLEOCR_MAX_IMAGE_BYTES = int(os.environ.get("PADDLEOCR_MAX_IMAGE_BYTES", str(12 * 1024 * 1024)))
+_paddleocr_allowed_ct = os.environ.get(
+    "PADDLEOCR_ALLOWED_CONTENT_TYPES",
+    "image/jpeg,image/png,image/webp",
+)
+PADDLEOCR_ALLOWED_CONTENT_TYPES = tuple(
+    part.strip().lower() for part in _paddleocr_allowed_ct.split(",") if part.strip()
+)
 MAILBOX_AUTO_CREATE_FROM_USER_ADMIN = env_bool("MAILBOX_AUTO_CREATE_FROM_USER_ADMIN", False)
 MAILBOX_AUTO_CREATE_SKIP_STAFF = env_bool("MAILBOX_AUTO_CREATE_SKIP_STAFF", True)
 BLOCKLIST_REJECT_MESSAGE = os.environ.get("BLOCKLIST_REJECT_MESSAGE", "Blocked by local policy")
