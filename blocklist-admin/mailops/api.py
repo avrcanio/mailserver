@@ -127,6 +127,61 @@ def _ocr_excerpt(value: str, max_chars: int = 1000) -> str:
     return text[:max_chars]
 
 
+def _format_eur(amount):
+    if amount is None:
+        return ""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return ""
+    s = f"{value:.2f}".replace(".", ",")
+    return f"{s} €"
+
+
+def _posting_block(posting: dict) -> str:
+    entries = (posting or {}).get("entries")
+    if not isinstance(entries, list) or not entries:
+        return ""
+    lines = ["Prijedlog knjiženja:", ""]
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        side = str(e.get("side") or "").strip().lower()
+        account = str(e.get("account") or "").strip()
+        label = str(e.get("label") or "").strip()
+        amount = _format_eur(e.get("amount_eur"))
+        if not (side in {"debit", "credit"} and account and label and amount):
+            continue
+        prefix = "Duguje" if side == "debit" else "Potražuje"
+        lines.append(f"{prefix}: {account} – {label} → {amount}")
+    if len(lines) <= 2:
+        return ""
+    return "\n".join(lines)
+
+
+def _normalize_draft_body(body: str) -> str:
+    text = str(body or "")
+    text = text.replace("Molim knjiženje i pohranu računa.", "")
+    text = text.replace("Molim knjiženje.", "")
+    text = text.replace("Molim knjiženje", "")
+    # Remove any existing sign-offs, then add exactly one at the end.
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # Remove any existing "Lijep pozdrav" variants (e.g. with comma/period).
+        if s.lower().startswith("lijep pozdrav"):
+            continue
+        cleaned.append(ln)
+    lines = cleaned
+    text = "\n".join(lines).strip()
+    if not text:
+        return "Lijep pozdrav"
+    return text + "\n\nLijep pozdrav"
+
+
 def create_mailbox_token(email, password):
     normalized_email = email.strip().lower()
     user = get_or_create_mailbox_user(normalized_email)
@@ -1781,14 +1836,26 @@ class ReceiptOcrView(APIView):
 
         receipt_payload = {}
         draft = {"subject": "", "body": ""}
+        posting = {"entries": []}
         try:
             result = ReceiptDraftService().create_receipt_and_draft(ocr_text=ocr_text)
             receipt_payload = result.get("receipt") or {}
             draft = result.get("draft") or {"subject": "", "body": ""}
+            posting = result.get("posting") or {"entries": []}
             openai_meta = {"model": result.get("model", ""), "duration_ms": result.get("duration_ms", 0)}
         except Exception as exc:
             warnings.append("openai_failed")
             logger.warning("Receipt draft OpenAI failed error=%s", exc)
+
+        posting_text = _posting_block(posting)
+        if posting_text:
+            body = str(draft.get("body") or "").rstrip()
+            if body:
+                body = body + "\n\n" + posting_text + "\n"
+            else:
+                body = posting_text + "\n"
+            draft = {**draft, "body": body}
+        draft = {**draft, "body": _normalize_draft_body(draft.get("body", ""))}
 
         if artifacts_dir:
             try:
@@ -1809,6 +1876,7 @@ class ReceiptOcrView(APIView):
         payload = {
             "receipt": receipt_payload,
             "draft": draft,
+            "posting": posting,
             "artifacts_dir": artifacts_dir or "",
             "warnings": warnings,
             "openai": openai_meta,

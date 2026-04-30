@@ -3474,6 +3474,13 @@ class MailApiTests(TestCase):
         draft_service_cls.return_value.create_receipt_and_draft.return_value = {
             "receipt": {"seller": {"name": "Müller", "oib": "84698789700"}, "invoice": {}, "buyer": {}, "lines": [], "totals": {}},
             "draft": {"subject": "Müller – račun", "body": "Pozdrav,\n"},
+            "posting": {
+                "entries": [
+                    {"side": "debit", "account": "022", "label": "Računalna oprema", "amount_eur": 20.11},
+                    {"side": "debit", "account": "140", "label": "Pretporez (PDV 25%)", "amount_eur": 5.03},
+                    {"side": "credit", "account": "239", "label": "Obveza prema dobavljaču", "amount_eur": 25.14},
+                ]
+            },
             "model": "gpt-test",
             "duration_ms": 12,
         }
@@ -3530,7 +3537,12 @@ class MailApiTests(TestCase):
         self.assertIn(b'Content-Type: application/json', body)
         self.assertIn(b"\"receipt\"", body)
         self.assertIn(b"\"draft\"", body)
+        self.assertIn(b"\"posting\"", body)
         self.assertIn(b"M\xc3\xbcller", body)
+        self.assertIn("Prijedlog knjiženja:".encode("utf-8"), body)
+        self.assertIn("Duguje: 022 – Računalna oprema → 20,11 €".encode("utf-8"), body)
+        self.assertNotIn("Molim knjiženje i pohranu računa.".encode("utf-8"), body)
+        self.assertIn("Lijep pozdrav".encode("utf-8"), body)
         self.assertIn(b"\"artifacts_dir\": \"/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1\"", body)
         self.assertIn(b"Content-Type: application/pdf", body)
         self.assertIn(b"%PDF-1.4", body)
