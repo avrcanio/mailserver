@@ -211,7 +211,7 @@ def run_receipt_ocr_from_image_bytes(image_bytes: bytes, content_type: str) -> d
         raise ReceiptOCRInvalidOutputError("Receipt OCR output is not valid JSON.") from exc
 
 
-def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_type: str) -> tuple[dict, bytes, str | None]:
+def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_type: str) -> tuple[dict, bytes, str | None, str]:
     """
     Upload image bytes into the PaddleOCR container, run JSON OCR CLI and generate searchable PDF via ocrmypdf.
 
@@ -291,7 +291,7 @@ def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_ty
                 raise ReceiptOCRInvalidOutputError("Receipt OCR output is not valid JSON.") from exc
             raise ReceiptOCRPdfUnavailableError("Receipt PDF generation requires artifacts_dir output.")
 
-        # When artifacts are enabled, the CLI writes parsed.json and out.pdf into artifacts_dir.
+        # When artifacts are enabled, the CLI writes ocr.txt, parsed.json and out.pdf into artifacts_dir.
         try:
             json_stream, _ = container.get_archive(f"{artifacts_dir}/parsed.json")
             json_tar = _read_tar_stream(json_stream)
@@ -313,7 +313,17 @@ def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_ty
 
         if not pdf_bytes:
             raise ReceiptOCRPdfUnavailableError("Generated PDF is empty.")
-        return payload, pdf_bytes, artifacts_dir
+        ocr_text = ""
+        try:
+            ocr_stream, _ = container.get_archive(f"{artifacts_dir}/ocr.txt")
+            ocr_tar = _read_tar_stream(ocr_stream)
+            _, ocr_bytes = _extract_first_regular_file_from_tar(ocr_tar)
+            ocr_text = (ocr_bytes or b"").decode("utf-8", errors="replace")
+        except Exception:
+            # Non-fatal: draft service can still try with receipt-only context.
+            logger.debug("Unable to fetch ocr.txt from artifacts_dir=%s", artifacts_dir, exc_info=True)
+
+        return payload, pdf_bytes, artifacts_dir, ocr_text
     finally:
         try:
             container.exec_run(["rm", "-f", image_path, pdf_path])

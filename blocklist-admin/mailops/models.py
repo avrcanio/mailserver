@@ -218,6 +218,11 @@ class ReceiptOcrLog(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="receipt_ocr_logs")
     account_email = models.EmailField(db_index=True)
     artifacts_dir = models.TextField(blank=True, default="")
+    draft_subject = models.TextField(blank=True, default="")
+    draft_body = models.TextField(blank=True, default="")
+    openai_model = models.CharField(max_length=128, blank=True, default="")
+    openai_duration_ms = models.PositiveIntegerField(default=0)
+    warnings = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -228,6 +233,10 @@ class ReceiptOcrLog(models.Model):
     def clean(self):
         self.account_email = (self.account_email or "").strip().lower()
         self.artifacts_dir = (self.artifacts_dir or "").strip()
+        self.draft_subject = (self.draft_subject or "").strip()
+        self.draft_body = (self.draft_body or "").strip()
+        self.openai_model = (self.openai_model or "").strip()
+        self.warnings = (self.warnings or "").strip()
 
     def save(self, *args, **kwargs):
         self.full_clean()

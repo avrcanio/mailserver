@@ -102,6 +102,7 @@ from .paddleocr_receipt import (
     ReceiptOCRTimeoutError,
     run_receipt_ocr_json_and_pdf_from_image_bytes,
 )
+from .receipt_draft import ReceiptDraftService
 from .services import send_mail_notification
 from .translation import (
     MailTranslationEmptyError,
@@ -1749,8 +1750,10 @@ class ReceiptOcrView(APIView):
         upload = serializer.validated_data["image"]
         raw = upload.read()
         declared_type = (getattr(upload, "content_type", None) or "").split(";")[0].strip().lower()
+        warnings = []
+        openai_meta = {}
         try:
-            payload, pdf_bytes, artifacts_dir = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
+            receipt_payload, pdf_bytes, artifacts_dir, ocr_text = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
         except ReceiptOCRDisabledError as exc:
             return Response({"error": "receipt_ocr_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ReceiptOCRInputError as exc:
@@ -1767,14 +1770,37 @@ class ReceiptOcrView(APIView):
                 body["exit_code"] = exc.exec_exit_code
             return Response(body, status=status.HTTP_502_BAD_GATEWAY)
 
+        draft = {"subject": "", "body": ""}
+        try:
+            draft_result = ReceiptDraftService().create_draft(receipt=receipt_payload, ocr_text=ocr_text)
+            draft = {"subject": draft_result.get("subject", ""), "body": draft_result.get("body", "")}
+            openai_meta = {"model": draft_result.get("model", ""), "duration_ms": draft_result.get("duration_ms", 0)}
+        except Exception as exc:
+            warnings.append("openai_failed")
+            logger.warning("Receipt draft OpenAI failed error=%s", exc)
+
         if artifacts_dir:
             try:
-                ReceiptOcrLog.objects.create(user=request.user, account_email=credentials.email, artifacts_dir=artifacts_dir)
+                ReceiptOcrLog.objects.create(
+                    user=request.user,
+                    account_email=credentials.email,
+                    artifacts_dir=artifacts_dir,
+                    draft_subject=draft.get("subject", ""),
+                    draft_body=draft.get("body", ""),
+                    openai_model=str(openai_meta.get("model") or ""),
+                    openai_duration_ms=int(openai_meta.get("duration_ms") or 0),
+                    warnings=json.dumps(warnings, ensure_ascii=False),
+                )
             except Exception:
                 logger.warning("Failed to persist ReceiptOcrLog for artifacts_dir=%r", artifacts_dir, exc_info=True)
-            # Also include it in JSON for debugging / client-side association
-            if isinstance(payload, dict):
-                payload.setdefault("artifacts_dir", artifacts_dir)
+
+        payload = {
+            "receipt": receipt_payload,
+            "draft": draft,
+            "artifacts_dir": artifacts_dir or "",
+            "warnings": warnings,
+            "openai": openai_meta,
+        }
 
         boundary = f"receipt_ocr_{secrets.token_urlsafe(18)}"
         json_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")

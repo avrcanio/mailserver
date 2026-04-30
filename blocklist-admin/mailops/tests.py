@@ -74,6 +74,7 @@ from .models import (
     PushNotificationLog,
 )
 from .paddleocr_receipt import ReceiptOCRTimeoutError
+from .receipt_draft import ReceiptDraftFailedError
 from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
 from .translation import (
     MailTranslationEmptyError,
@@ -3465,10 +3466,17 @@ class MailApiTests(TestCase):
         self.assertEqual(response.json()["error"], "receipt_pdf_unavailable")
 
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
-    def test_receipt_ocr_success_returns_cli_json(self, docker_cls):
+    @patch("mailops.api.ReceiptDraftService")
+    def test_receipt_ocr_success_returns_cli_json(self, draft_service_cls, docker_cls):
         container = Mock()
         container.put_archive.return_value = True
         container.get_archive.return_value = (iter(()), {"size": 0})
+        draft_service_cls.return_value.create_draft.return_value = {
+            "subject": "Petrol – račun 29298-3800-2",
+            "body": "Pozdrav,\n\nMolim knjiženje računa.\n",
+            "model": "gpt-test",
+            "duration_ms": 12,
+        }
 
         def exec_side_effect(cmd, demux=False, **kwargs):
             if cmd and cmd[0] == "rm":
@@ -3508,6 +3516,15 @@ class MailApiTests(TestCase):
                     if str(path).endswith("/parsed.json"):
                         data = json_stream.getvalue()
                         return iter([data]), {"size": len(data)}
+                    if str(path).endswith("/ocr.txt"):
+                        data = b"PETROL\nRACUN 29298-3800-2\n"
+                        ocr_tar = io.BytesIO()
+                        with tarfile.open(fileobj=ocr_tar, mode="w") as archive:
+                            info = tarfile.TarInfo(name="ocr.txt")
+                            info.size = len(data)
+                            archive.addfile(info, io.BytesIO(data))
+                        raw = ocr_tar.getvalue()
+                        return iter([raw]), {"size": len(raw)}
                     if str(path).endswith("/out.pdf"):
                         data = pdf_stream.getvalue()
                         return iter([data]), {"size": len(data)}
@@ -3522,14 +3539,80 @@ class MailApiTests(TestCase):
         content_type = response["Content-Type"]
         boundary = content_type.split("boundary=", 1)[1]
         self.assertIn(b'Content-Type: application/json', body)
-        self.assertIn(b'"total": "1.00"', body)
-        self.assertIn(b'"artifacts_dir": "/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1"', body)
+        self.assertIn(b"\"receipt\"", body)
+        self.assertIn(b"\"draft\"", body)
+        self.assertIn(b"Petrol \xe2\x80\x93 ra\xc4\x8dun", body)
+        self.assertIn(b"\"artifacts_dir\": \"/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1\"", body)
         self.assertIn(b"Content-Type: application/pdf", body)
         self.assertIn(b"%PDF-1.4", body)
         self.assertIn(("--" + boundary + "--").encode("ascii"), body)
         container.put_archive.assert_called_once()
         ocr_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "python3"]
         self.assertEqual(len(ocr_calls), 1)
+
+    @patch("mailops.paddleocr_receipt.docker.DockerClient")
+    @patch("mailops.api.ReceiptDraftService")
+    def test_receipt_ocr_openai_failure_soft_succeeds(self, draft_service_cls, docker_cls):
+        draft_service_cls.return_value.create_draft.side_effect = ReceiptDraftFailedError("openai_failed")
+        container = Mock()
+        container.put_archive.return_value = True
+
+        def exec_side_effect(cmd, demux=False, **kwargs):
+            if cmd and cmd[0] == "rm":
+                return 0, b""
+            return 0, (b"", b"artifacts_dir=/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1\n")
+
+        container.exec_run.side_effect = exec_side_effect
+
+        json_stream = io.BytesIO()
+        with tarfile.open(fileobj=json_stream, mode="w") as archive:
+            info = tarfile.TarInfo(name="parsed.json")
+            json_bytes = b'{"total": "1.00"}\n'
+            info.size = len(json_bytes)
+            archive.addfile(info, io.BytesIO(json_bytes))
+
+        pdf_stream = io.BytesIO()
+        with tarfile.open(fileobj=pdf_stream, mode="w") as archive:
+            info = tarfile.TarInfo(name="out.pdf")
+            pdf_bytes = b"%PDF-1.4\nfake\n%%EOF\n"
+            info.size = len(pdf_bytes)
+            archive.addfile(info, io.BytesIO(pdf_bytes))
+
+        def get_archive_side_effect(path):
+            if str(path).endswith("/parsed.json"):
+                data = json_stream.getvalue()
+                return iter([data]), {"size": len(data)}
+            if str(path).endswith("/ocr.txt"):
+                data = b"TEXT\n"
+                ocr_tar = io.BytesIO()
+                with tarfile.open(fileobj=ocr_tar, mode="w") as archive:
+                    info = tarfile.TarInfo(name="ocr.txt")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                raw = ocr_tar.getvalue()
+                return iter([raw]), {"size": len(raw)}
+            if str(path).endswith("/out.pdf"):
+                data = pdf_stream.getvalue()
+                return iter([data]), {"size": len(data)}
+            return iter(()), {"size": 0}
+
+        container.get_archive.side_effect = get_archive_side_effect
+        docker_cls.return_value.containers.get.return_value = container
+
+        headers = self.auth_headers()
+        img = SimpleUploadedFile("r.png", b"fakepng", content_type="image/png")
+        with override_settings(
+            PADDLEOCR_CONTAINER_NAME="paddleocr",
+            PADDLEOCR_IMAGE_TO_R1_JSON="/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py",
+            PADDLEOCR_OCRMYPDF_LANG="hrv+eng",
+            PADDLEOCR_ARTIFACT_ROOT="/workspace/PaddleOCR/train_data/hr_r1_tuning",
+            OPENAI_API_KEY="test-key",
+        ):
+            response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response["Content-Type"].startswith("multipart/mixed; boundary="))
+        self.assertIn(b"openai_failed", response.content)
 
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     def test_receipt_ocr_nonzero_exit_returns_502(self, docker_cls):
