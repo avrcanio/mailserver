@@ -55,7 +55,7 @@ class ReceiptDraftService:
                         "content": (
                             "You draft an email (Croatian) for forwarding a receipt for bookkeeping. "
                             "Return ONLY JSON with keys subject and body. "
-                            "Be concise and professional. Use receipt fields if present; otherwise infer from OCR text. "
+                            "Be concise and professional. Prefer OCR text when it conflicts with receipt fields. "
                             "If a value is missing, omit the line rather than hallucinating."
                         ),
                     },

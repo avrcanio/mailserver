@@ -118,6 +118,27 @@ GMAIL_OAUTH_STATE_SALT = "mailops.gmail-oauth-state"
 logger = logging.getLogger("mailops.api")
 
 
+def _guess_seller_name_from_ocr(ocr_text: str) -> str:
+    text = (ocr_text or "").strip()
+    if not text:
+        return ""
+    for raw_line in text.splitlines()[:12]:
+        line = " ".join((raw_line or "").strip().split())
+        if not line:
+            continue
+        lower = line.lower()
+        if "racun" in lower or "račun" in lower:
+            break
+        if lower.startswith("podaci o kupcu"):
+            break
+        if len(line) < 3:
+            continue
+        if not any(ch.isalpha() for ch in line):
+            continue
+        return line
+    return ""
+
+
 def create_mailbox_token(email, password):
     normalized_email = email.strip().lower()
     user = get_or_create_mailbox_user(normalized_email)
@@ -1769,6 +1790,20 @@ class ReceiptOcrView(APIView):
             if exc.exec_exit_code is not None:
                 body["exit_code"] = exc.exec_exit_code
             return Response(body, status=status.HTTP_502_BAD_GATEWAY)
+
+        # Heuristic fix: if parsed seller conflicts with OCR header, prefer OCR.
+        seller_guess = _guess_seller_name_from_ocr(ocr_text)
+        try:
+            seller = (receipt_payload or {}).get("seller") or {}
+            parsed_seller_name = str(seller.get("name") or "").strip()
+            if parsed_seller_name and seller_guess and seller_guess.lower() not in parsed_seller_name.lower():
+                receipt_payload = dict(receipt_payload or {})
+                seller = dict(receipt_payload.get("seller") or {})
+                seller["name"] = seller_guess
+                receipt_payload["seller"] = seller
+                warnings.append("seller_overridden_from_ocr")
+        except Exception:
+            logger.debug("Unable to apply seller OCR override heuristic.", exc_info=True)
 
         draft = {"subject": "", "body": ""}
         try:
