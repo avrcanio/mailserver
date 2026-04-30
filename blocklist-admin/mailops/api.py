@@ -92,7 +92,7 @@ from mail_integration.gmail_client import (
 
 from .gmail_import import GmailImportError, GmailImportService
 from .gmail_send import GmailOutboundSendService
-from .models import AddressBookContact, DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential
+from .models import AddressBookContact, DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential, ReceiptOcrLog
 from .paddleocr_receipt import (
     ReceiptOCRDisabledError,
     ReceiptOCRDockerError,
@@ -1741,7 +1741,7 @@ class ReceiptOcrView(APIView):
         description="Returns a multipart/mixed response with two parts: application/json (R-1 payload) and application/pdf (searchable receipt PDF).",
     )
     def post(self, request):
-        _, error = require_mailbox_credentials(request)
+        credentials, error = require_mailbox_credentials(request)
         if error:
             return error
         serializer = ReceiptOcrUploadSerializer(data=request.data)
@@ -1750,7 +1750,7 @@ class ReceiptOcrView(APIView):
         raw = upload.read()
         declared_type = (getattr(upload, "content_type", None) or "").split(";")[0].strip().lower()
         try:
-            payload, pdf_bytes = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
+            payload, pdf_bytes, artifacts_dir = run_receipt_ocr_json_and_pdf_from_image_bytes(raw, declared_type)
         except ReceiptOCRDisabledError as exc:
             return Response({"error": "receipt_ocr_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except ReceiptOCRInputError as exc:
@@ -1766,6 +1766,15 @@ class ReceiptOcrView(APIView):
             if exc.exec_exit_code is not None:
                 body["exit_code"] = exc.exec_exit_code
             return Response(body, status=status.HTTP_502_BAD_GATEWAY)
+
+        if artifacts_dir:
+            try:
+                ReceiptOcrLog.objects.create(user=request.user, account_email=credentials.email, artifacts_dir=artifacts_dir)
+            except Exception:
+                logger.warning("Failed to persist ReceiptOcrLog for artifacts_dir=%r", artifacts_dir, exc_info=True)
+            # Also include it in JSON for debugging / client-side association
+            if isinstance(payload, dict):
+                payload.setdefault("artifacts_dir", artifacts_dir)
 
         boundary = f"receipt_ocr_{secrets.token_urlsafe(18)}"
         json_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")

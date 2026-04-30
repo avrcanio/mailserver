@@ -2,6 +2,7 @@ import concurrent.futures
 import io
 import json
 import logging
+import re
 import tarfile
 import uuid
 
@@ -37,6 +38,9 @@ class ReceiptOCRTimeoutError(Exception):
 
 class ReceiptOCRPdfUnavailableError(Exception):
     """PDF generation is disabled or unavailable."""
+
+
+_ARTIFACTS_DIR_RE = re.compile(r"(?m)^artifacts_dir=(.+)$")
 
 
 def _extension_for_content_type(content_type: str) -> str:
@@ -96,6 +100,41 @@ def _extract_single_file_from_tar(tar_bytes: bytes, expected_name: str) -> bytes
         if fileobj is None:
             raise ReceiptOCRPdfUnavailableError("Unable to read generated PDF from container archive.")
         return fileobj.read()
+
+def _extract_first_regular_file_from_tar(tar_bytes: bytes) -> tuple[str, bytes]:
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            fileobj = archive.extractfile(member)
+            if fileobj is None:
+                continue
+            return member.name, fileobj.read()
+    raise ReceiptOCRPdfUnavailableError("Unable to read file from container archive.")
+
+
+def _extract_artifacts_dir(stderr_bytes: bytes) -> str | None:
+    if not stderr_bytes:
+        return None
+    value = stderr_bytes.decode("utf-8", errors="replace")
+    match = _ARTIFACTS_DIR_RE.search(value)
+    if not match:
+        return None
+    return (match.group(1) or "").strip() or None
+
+_IMAGE_DPI_RE = re.compile(r"(?:^|\\s)--image-dpi\\s+(\\d+)(?:\\s|$)")
+
+
+def _extract_image_dpi(extra_args: str) -> int | None:
+    if not extra_args:
+        return None
+    match = _IMAGE_DPI_RE.search(str(extra_args))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def run_receipt_ocr_from_image_bytes(image_bytes: bytes, content_type: str) -> dict:
@@ -172,7 +211,7 @@ def run_receipt_ocr_from_image_bytes(image_bytes: bytes, content_type: str) -> d
         raise ReceiptOCRInvalidOutputError("Receipt OCR output is not valid JSON.") from exc
 
 
-def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_type: str) -> tuple[dict, bytes]:
+def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_type: str) -> tuple[dict, bytes, str | None]:
     """
     Upload image bytes into the PaddleOCR container, run JSON OCR CLI and generate searchable PDF via ocrmypdf.
 
@@ -220,57 +259,61 @@ def run_receipt_ocr_json_and_pdf_from_image_bytes(image_bytes: bytes, content_ty
         if not uploaded:
             raise ReceiptOCRDockerError("Failed to upload image into the PaddleOCR container.")
 
-        exit_code, output = _exec_run_timed(container, ["python3", script, image_path], timeout)
+        artifact_root = (getattr(settings, "PADDLEOCR_ARTIFACT_ROOT", "") or "").strip()
+        script_cmd = ["python3", script, image_path]
+        if artifact_root:
+            script_cmd.extend(["--artifact-root", artifact_root])
+        # Let the script generate out.pdf in artifacts dir by default.
+        lang = (getattr(settings, "PADDLEOCR_OCRMYPDF_LANG", "") or "").strip()
+        if lang:
+            script_cmd.extend(["--pdf-lang", lang])
+        extra_args = (getattr(settings, "PADDLEOCR_OCRMYPDF_ARGS", "") or "").strip()
+        dpi = _extract_image_dpi(extra_args)
+        if dpi:
+            script_cmd.extend(["--pdf-image-dpi", str(dpi)])
+
+        exit_code, output = _exec_run_timed(container, script_cmd, timeout)
         stdout, stderr = output if isinstance(output, tuple) else (output, b"")
+        artifacts_dir = _extract_artifacts_dir(stderr)
         if exit_code != 0:
             err_preview = (stderr or b"").decode("utf-8", errors="replace")[:500]
             logger.warning("image_to_r1_json failed exit_code=%s stderr_preview=%r", exit_code, err_preview)
             raise ReceiptOCRDockerError("Receipt OCR command failed.", exec_exit_code=exit_code)
 
-        raw = (stdout or b"").decode("utf-8", errors="replace").strip()
-        if not raw:
-            raise ReceiptOCRInvalidOutputError("Empty output from receipt OCR command.")
+        if not artifacts_dir:
+            raw = (stdout or b"").decode("utf-8", errors="replace").strip()
+            if not raw:
+                raise ReceiptOCRInvalidOutputError("Empty output from receipt OCR command.")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                logger.warning("OCR stdout is not valid JSON (prefix): %r", raw[:200])
+                raise ReceiptOCRInvalidOutputError("Receipt OCR output is not valid JSON.") from exc
+            raise ReceiptOCRPdfUnavailableError("Receipt PDF generation requires artifacts_dir output.")
+
+        # When artifacts are enabled, the CLI writes parsed.json and out.pdf into artifacts_dir.
         try:
-            payload = json.loads(raw)
+            json_stream, _ = container.get_archive(f"{artifacts_dir}/parsed.json")
+            json_tar = _read_tar_stream(json_stream)
+            _, json_bytes = _extract_first_regular_file_from_tar(json_tar)
+            payload = json.loads(json_bytes.decode("utf-8", errors="replace"))
         except json.JSONDecodeError as exc:
-            logger.warning("OCR stdout is not valid JSON (prefix): %r", raw[:200])
             raise ReceiptOCRInvalidOutputError("Receipt OCR output is not valid JSON.") from exc
-
-        lang = (getattr(settings, "PADDLEOCR_OCRMYPDF_LANG", "") or "").strip()
-        extra_args = (getattr(settings, "PADDLEOCR_OCRMYPDF_ARGS", "") or "").strip()
-        cmd = [
-            "ocrmypdf",
-            "--skip-text",
-            "--rotate-pages",
-            "--deskew",
-            "--output-type",
-            "pdf",
-        ]
-        if lang:
-            cmd.extend(["-l", lang])
-        if extra_args:
-            cmd.extend([arg for arg in extra_args.split(" ") if arg.strip()])
-        cmd.extend([image_path, pdf_path])
-
-        pdf_exit_code, pdf_output = _exec_run_timed(container, cmd, timeout)
-        pdf_stdout, pdf_stderr = pdf_output if isinstance(pdf_output, tuple) else (pdf_output, b"")
-        if pdf_exit_code != 0:
-            err_preview = (pdf_stderr or b"").decode("utf-8", errors="replace")[:500]
-            logger.warning("ocrmypdf failed exit_code=%s stderr_preview=%r", pdf_exit_code, err_preview)
-            raise ReceiptOCRPdfUnavailableError("Receipt PDF generation failed.")
+        except ReceiptOCRInvalidOutputError:
+            raise
+        except Exception as exc:
+            raise ReceiptOCRInvalidOutputError(f"Unable to fetch parsed.json: {exc}") from exc
 
         try:
-            stream, _ = container.get_archive(pdf_path)
-            tar_bytes = _read_tar_stream(stream)
-            pdf_bytes = _extract_single_file_from_tar(tar_bytes, pdf_name)
-        except ReceiptOCRPdfUnavailableError:
-            raise
+            pdf_stream, _ = container.get_archive(f"{artifacts_dir}/out.pdf")
+            pdf_tar = _read_tar_stream(pdf_stream)
+            _, pdf_bytes = _extract_first_regular_file_from_tar(pdf_tar)
         except Exception as exc:
             raise ReceiptOCRPdfUnavailableError(f"Unable to fetch generated PDF: {exc}") from exc
 
         if not pdf_bytes:
             raise ReceiptOCRPdfUnavailableError("Generated PDF is empty.")
-        return payload, pdf_bytes
+        return payload, pdf_bytes, artifacts_dir
     finally:
         try:
             container.exec_run(["rm", "-f", image_path, pdf_path])

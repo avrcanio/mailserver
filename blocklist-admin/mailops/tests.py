@@ -3473,9 +3473,8 @@ class MailApiTests(TestCase):
         def exec_side_effect(cmd, demux=False, **kwargs):
             if cmd and cmd[0] == "rm":
                 return 0, b""
-            if cmd and cmd[0] == "ocrmypdf":
-                return 0, (b"", b"")
-            return 0, (b'{"total": "1.00"}', b"")
+            # Single CLI call; JSON is written to artifacts, not stdout.
+            return 0, (b"", b"artifacts_dir=/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1\n")
 
         container.exec_run.side_effect = exec_side_effect
         docker_cls.return_value.containers.get.return_value = container
@@ -3486,16 +3485,35 @@ class MailApiTests(TestCase):
             PADDLEOCR_CONTAINER_NAME="paddleocr",
             PADDLEOCR_IMAGE_TO_R1_JSON="/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py",
             PADDLEOCR_OCRMYPDF_LANG="hrv+eng",
+            PADDLEOCR_ARTIFACT_ROOT="/workspace/PaddleOCR/train_data/hr_r1_tuning",
         ):
             with patch("mailops.paddleocr_receipt.uuid.uuid4", return_value=Mock(hex="u1")):
+                json_stream = io.BytesIO()
+                with tarfile.open(fileobj=json_stream, mode="w") as archive:
+                    info = tarfile.TarInfo(name="parsed.json")
+                    json_bytes = b'{"total": "1.00"}\n'
+                    info.size = len(json_bytes)
+                    archive.addfile(info, io.BytesIO(json_bytes))
+                json_stream.seek(0)
+
                 pdf_stream = io.BytesIO()
                 with tarfile.open(fileobj=pdf_stream, mode="w") as archive:
-                    info = tarfile.TarInfo(name="mailadmin_receipt_u1.pdf")
-                    pdf_bytes = b"%PDF-1.4\nfake\n%%EOF\n"
+                    info = tarfile.TarInfo(name="out.pdf")
+                    pdf_bytes = b"%PDF-1.4\\nfake\\n%%EOF\\n"
                     info.size = len(pdf_bytes)
                     archive.addfile(info, io.BytesIO(pdf_bytes))
                 pdf_stream.seek(0)
-                container.get_archive.return_value = (iter([pdf_stream.read()]), {"size": pdf_stream.tell()})
+
+                def get_archive_side_effect(path):
+                    if str(path).endswith("/parsed.json"):
+                        data = json_stream.getvalue()
+                        return iter([data]), {"size": len(data)}
+                    if str(path).endswith("/out.pdf"):
+                        data = pdf_stream.getvalue()
+                        return iter([data]), {"size": len(data)}
+                    return iter(()), {"size": 0}
+
+                container.get_archive.side_effect = get_archive_side_effect
                 response = self.client.post(reverse("mailops:api_receipt_ocr"), {"image": img}, **headers)
 
         self.assertEqual(response.status_code, 200)
@@ -3504,15 +3522,14 @@ class MailApiTests(TestCase):
         content_type = response["Content-Type"]
         boundary = content_type.split("boundary=", 1)[1]
         self.assertIn(b'Content-Type: application/json', body)
-        self.assertIn(b'{"total": "1.00"}', body)
+        self.assertIn(b'"total": "1.00"', body)
+        self.assertIn(b'"artifacts_dir": "/workspace/PaddleOCR/train_data/hr_r1_tuning/case_u1"', body)
         self.assertIn(b"Content-Type: application/pdf", body)
         self.assertIn(b"%PDF-1.4", body)
         self.assertIn(("--" + boundary + "--").encode("ascii"), body)
         container.put_archive.assert_called_once()
         ocr_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "python3"]
         self.assertEqual(len(ocr_calls), 1)
-        pdf_calls = [c for c in container.exec_run.call_args_list if c[0][0][0] == "ocrmypdf"]
-        self.assertEqual(len(pdf_calls), 1)
 
     @patch("mailops.paddleocr_receipt.docker.DockerClient")
     def test_receipt_ocr_nonzero_exit_returns_502(self, docker_cls):

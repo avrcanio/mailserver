@@ -214,6 +214,29 @@ class AddressBookContact(models.Model):
         return self.email
 
 
+class ReceiptOcrLog(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="receipt_ocr_logs")
+    account_email = models.EmailField(db_index=True)
+    artifacts_dir = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Receipt OCR log"
+        verbose_name_plural = "Receipt OCR logs"
+
+    def clean(self):
+        self.account_email = (self.account_email or "").strip().lower()
+        self.artifacts_dir = (self.artifacts_dir or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.account_email} @ {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
 class MailMessageTranslation(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="mail_message_translations")
     account_email = models.EmailField(db_index=True)
