@@ -128,6 +128,10 @@ DNS zapis predlozak za konkretnu domenu:
 ./scripts/render-dns-records.sh example.com
 ```
 
+Detaljan checklist za onboarding nove domene (DNS + cert + Postfix + DKIM/DMARC):
+
+- [docs/domain-onboarding.md](/opt/stacks/mailserver/docs/domain-onboarding.md)
+
 ## DNS Checklist po domeni
 
 Za svaku domenu postavi:
