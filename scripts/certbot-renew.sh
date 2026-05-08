@@ -17,8 +17,18 @@ set -a
 source "${ENV_FILE}"
 set +a
 
+# Prefer reading the token from a secret file when provided.
+if [[ -n "${CLOUDFLARE_DNS_API_TOKEN_FILE:-}" ]]; then
+  if [[ -r "${CLOUDFLARE_DNS_API_TOKEN_FILE}" ]]; then
+    CLOUDFLARE_DNS_API_TOKEN="$(head -n 1 "${CLOUDFLARE_DNS_API_TOKEN_FILE}")"
+  else
+    echo "CLOUDFLARE_DNS_API_TOKEN_FILE is set but not readable: ${CLOUDFLARE_DNS_API_TOKEN_FILE}" >&2
+    exit 1
+  fi
+fi
+
 if [[ -z "${MAIL_HOSTNAME:-}" || -z "${LETSENCRYPT_EMAIL:-}" || -z "${CLOUDFLARE_DNS_API_TOKEN:-}" ]]; then
-  echo "MAIL_HOSTNAME, LETSENCRYPT_EMAIL and CLOUDFLARE_DNS_API_TOKEN must be set in .env." >&2
+  echo "MAIL_HOSTNAME, LETSENCRYPT_EMAIL and CLOUDFLARE_DNS_API_TOKEN (or CLOUDFLARE_DNS_API_TOKEN_FILE) must be set in .env." >&2
   exit 1
 fi
 
@@ -48,6 +58,14 @@ if [[ "${CERTBOT_STAGING:-0}" == "1" ]]; then
   STAGING_ARGS+=(--staging)
 fi
 
+PROPAGATION_ARGS=()
+# Cloudflare TXT propagation can take >10s; default to a safer value.
+if [[ -n "${CERTBOT_DNS_PROPAGATION_SECONDS:-}" ]]; then
+  PROPAGATION_ARGS+=(--dns-cloudflare-propagation-seconds "${CERTBOT_DNS_PROPAGATION_SECONDS}")
+else
+  PROPAGATION_ARGS+=(--dns-cloudflare-propagation-seconds "60")
+fi
+
 docker run --rm \
   --name mailserver-certbot-run \
   -v "${CERT_DIR}:/etc/letsencrypt" \
@@ -58,6 +76,7 @@ docker run --rm \
   --agree-tos \
   --dns-cloudflare \
   --dns-cloudflare-credentials /run/secrets/cloudflare.ini \
+  "${PROPAGATION_ARGS[@]}" \
   --preferred-challenges dns-01 \
   --keep-until-expiring \
   --expand \

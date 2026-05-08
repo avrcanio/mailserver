@@ -3,3 +3,5 @@ mail._domainkey.finestar.hr finestar.hr:mail:/etc/opendkim/keys/finestar.hr/mail
 mail._domainkey.dalekopro.hr dalekopro.hr:mail:/etc/opendkim/keys/dalekopro.hr/mail.private
 mail._domainkey.uzorita.hr uzorita.hr:mail:/etc/opendkim/keys/uzorita.hr/mail.private
 mail._domainkey.vitalgroupsa.com vitalgroupsa.com:mail:/etc/opendkim/keys/vitalgroupsa.com/mail.private
+mail._domainkey.gmail.com gmail.com:mail:/etc/opendkim/keys/gmail.com/mail.private
+mail._domainkey.sibenik1983.hr sibenik1983.hr:mail:/etc/opendkim/keys/sibenik1983.hr/mail.private
