@@ -336,6 +336,8 @@ class UnifiedConversationListResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folders = serializers.ListField(child=serializers.CharField())
     conversations = UnifiedConversationSerializer(many=True)
+    has_more = serializers.BooleanField()
+    next_offset = serializers.IntegerField()
 
 
 class MailIndexStatusQuerySerializer(serializers.Serializer):

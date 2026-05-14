@@ -13,21 +13,27 @@ from .sync import ordered_strings
 from .threading import summary_from_message_row
 
 
-def get_unified_conversation_page_from_index(user, account_email, limit=50):
+def get_unified_conversation_page_from_index(user, account_email, limit=50, offset=0):
     account = get_account_index(user, account_email)
     if not is_index_usable(account):
         return None
-    conversations = list(
+    safe_offset = max(0, int(offset or 0))
+    base_qs = (
         account.conversations.order_by(F("latest_message_at").desc(nulls_last=True), "-id")
         .prefetch_related("messages")
-        .select_related("account")[:limit]
+        .select_related("account")
     )
+    window = list(base_qs[safe_offset : safe_offset + limit + 1])
+    has_more = len(window) > limit
+    conversations = window[:limit]
     if not conversations:
         return None
     folders = ordered_strings(folder for conversation in conversations for folder in (conversation.folders_json or []))
     return MailUnifiedConversationSummaryPage(
         folders=tuple(folders),
         conversations=tuple(conversation_from_index(conversation) for conversation in conversations),
+        has_more=has_more,
+        next_offset=safe_offset + len(conversations),
     )
 
 

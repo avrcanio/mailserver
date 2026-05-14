@@ -136,6 +136,8 @@ class MailUnifiedConversationSummary:
 class MailUnifiedConversationSummaryPage:
     folders: tuple[str, ...] = field(default_factory=tuple)
     conversations: tuple[MailUnifiedConversationSummary, ...] = field(default_factory=tuple)
+    has_more: bool = False
+    next_offset: int = 0
 
 
 @dataclass(frozen=True)

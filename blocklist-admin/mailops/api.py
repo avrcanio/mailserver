@@ -1363,6 +1363,7 @@ class UnifiedConversationListView(APIView):
         operation_id="mail_unified_conversations_list",
         parameters=[
             OpenApiParameter("limit", int, required=False, description="Maximum unified conversations to return. 1-200, defaults to 50."),
+            OpenApiParameter("offset", int, required=False, description="Skip this many newest conversations for paging (0-based)."),
         ],
         responses={200: UnifiedConversationListResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
     )
@@ -1377,7 +1378,15 @@ class UnifiedConversationListView(APIView):
         if limit < 1 or limit > 200:
             return Response({"error": "invalid_limit"}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            page = MailboxService().list_unified_conversations(credentials, limit=limit, user=request.user)
+            offset = int(request.query_params.get("offset", 0))
+        except (TypeError, ValueError):
+            return Response({"error": "invalid_offset"}, status=status.HTTP_400_BAD_REQUEST)
+        if offset < 0 or offset > 50000:
+            return Response({"error": "invalid_offset"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            page = MailboxService().list_unified_conversations(
+                credentials, limit=limit, offset=offset, user=request.user
+            )
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         return Response(
@@ -1385,6 +1394,8 @@ class UnifiedConversationListView(APIView):
                 "account_email": credentials.email,
                 "folders": list(page.folders),
                 "conversations": [unified_conversation_payload(conversation) for conversation in page.conversations],
+                "has_more": page.has_more,
+                "next_offset": page.next_offset,
             }
         )
 

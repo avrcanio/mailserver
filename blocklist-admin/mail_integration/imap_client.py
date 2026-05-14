@@ -213,7 +213,7 @@ class ImapClient:
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP conversation fetch failed for {folder}") from exc
 
-    def fetch_unified_conversation_page(self, account_email, limit=50):
+    def fetch_unified_conversation_page(self, account_email, limit=50, offset=0):
         if limit < 1:
             return MailUnifiedConversationSummaryPage(folders=("INBOX",))
         try:
@@ -228,6 +228,7 @@ class ImapClient:
                 account_email=account_email,
                 summaries_by_folder=summaries_by_folder,
                 limit=limit,
+                offset=offset,
             )
         except socket.timeout as exc:
             raise MailTimeoutError("Timed out fetching IMAP unified conversations") from exc
@@ -627,7 +628,7 @@ def _build_conversation_page(folder, summaries, limit):
     return MailConversationSummaryPage(conversations=tuple(conversations[:limit]))
 
 
-def _build_unified_conversation_page(folders, sent_folder, account_email, summaries_by_folder, limit):
+def _build_unified_conversation_page(folders, sent_folder, account_email, summaries_by_folder, limit, offset=0):
     items = []
     for folder in folders:
         for summary in summaries_by_folder.get(folder, ()):
@@ -664,7 +665,16 @@ def _build_unified_conversation_page(folders, sent_folder, account_email, summar
             )
         )
     conversations.sort(key=_unified_conversation_sort_key)
-    return MailUnifiedConversationSummaryPage(folders=tuple(folders), conversations=tuple(conversations[:limit]))
+    safe_offset = max(0, int(offset or 0))
+    window = conversations[safe_offset : safe_offset + limit]
+    has_more = len(conversations) > safe_offset + len(window)
+    next_offset = safe_offset + len(window)
+    return MailUnifiedConversationSummaryPage(
+        folders=tuple(folders),
+        conversations=tuple(window),
+        has_more=has_more,
+        next_offset=next_offset,
+    )
 
 
 def _dedupe_unified_items(items, account_email, sent_folder):

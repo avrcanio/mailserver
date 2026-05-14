@@ -38,5 +38,5 @@ class MailIndexService:
             folder_results=folder_results,
         )
 
-    def get_unified_conversation_page(self, user, account_email, limit=50):
-        return get_unified_conversation_page_from_index(user=user, account_email=account_email, limit=limit)
+    def get_unified_conversation_page(self, user, account_email, limit=50, offset=0):
+        return get_unified_conversation_page_from_index(user=user, account_email=account_email, limit=limit, offset=offset)

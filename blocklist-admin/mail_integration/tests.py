@@ -1514,7 +1514,9 @@ class MailboxServiceTests(SimpleTestCase):
         entered.fetch_account_summary.assert_called_once_with()
         entered.fetch_message_summary_page.assert_called_once_with(folder="Archive", limit=10, before_uid="99")
         entered.fetch_conversation_page.assert_called_once_with(folder="Archive", limit=5)
-        entered.fetch_unified_conversation_page.assert_called_once_with(account_email="user@example.com", limit=6)
+        entered.fetch_unified_conversation_page.assert_called_once_with(
+            account_email="user@example.com", limit=6, offset=0
+        )
         entered.fetch_message_detail.assert_called_once_with(folder="Archive", uid="99")
         entered.fetch_attachment.assert_called_once_with(folder="Archive", uid="99", attachment_id="att_1")
         entered.fetch_attachments.assert_called_once_with(folder="Archive", uid="99")

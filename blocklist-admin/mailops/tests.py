@@ -2149,7 +2149,14 @@ class MailApiTests(TestCase):
         self.assertEqual([message["folder"] for message in conversation["messages"]], ["INBOX", "Sent"])
         self.assertEqual([message["uid"] for message in conversation["messages"]], ["42", "7"])
         self.assertEqual([message["direction"] for message in conversation["messages"]], ["inbound", "outbound"])
-        self.assertEqual(service.list_unified_conversations.call_args.kwargs, {"limit": 25, "user": token.user})
+        self.assertIn("has_more", payload)
+        self.assertIn("next_offset", payload)
+        self.assertFalse(payload["has_more"])
+        self.assertEqual(payload["next_offset"], 0)
+        self.assertEqual(
+            service.list_unified_conversations.call_args.kwargs,
+            {"limit": 25, "offset": 0, "user": token.user},
+        )
 
     def test_mail_unified_conversations_requires_token_and_validates_limit(self):
         missing_token = self.client.get(reverse("mailops:api_mail_unified_conversations"))
@@ -2237,7 +2244,9 @@ class MailApiTests(TestCase):
 
         self.assertEqual(page.folders, ("INBOX",))
         entered.login.assert_called_once_with(credentials)
-        entered.fetch_unified_conversation_page.assert_called_once_with(account_email=self.account_email, limit=6)
+        entered.fetch_unified_conversation_page.assert_called_once_with(
+            account_email=self.account_email, limit=6, offset=0
+        )
 
     def test_mail_index_upsert_is_idempotent_and_dedupes_duplicate_message_ids(self):
         token = create_mailbox_token(self.account_email, self.password)
