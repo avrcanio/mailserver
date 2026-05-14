@@ -107,13 +107,21 @@ Operativni tok:
 2. Idi na `Authentication and Authorization` -> `Users` -> `Add user`.
 3. Upisi `username`, `email`, `password` i `password confirmation`.
 4. Spremi usera bez `staff` ili `superuser` oznake.
-5. `mailadmin` ce pozvati `setup email add <email> <password>` u `mailserver` kontejneru.
+5. `mailadmin` ce pozvati `setup email add <email> <password>` u `mailserver` kontejneru, zatim `doveadm mailbox create` da postoji IMAP mapa `Archive`.
 6. Provjeri mailbox:
 
 ```bash
 docker exec mailserver setup email list
 ./scripts/mail.sh debug login user@example.com 'PasswordFromAdmin'
 ```
+
+Za postojece virtualne mailboxe (prije ovog deploya) jednokratno pokreni u `mailadmin` kontejneru:
+
+```bash
+docker compose exec mailadmin python manage.py ensure_archive_mailboxes
+```
+
+(`--dry-run` prikazuje popis bez izmjena.)
 
 Napomene:
 

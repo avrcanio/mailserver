@@ -78,7 +78,15 @@ from .models import (
 )
 from .paddleocr_receipt import ReceiptOCRTimeoutError
 from .receipt_draft import ReceiptDraftFailedError
-from .services import MailboxCleanupError, MailboxProvisioningError, create_mailbox_account, delete_mailbox_account, sanitize_mailbox_command_output
+from .services import (
+    MailboxCleanupError,
+    MailboxProvisioningError,
+    create_mailbox_account,
+    delete_mailbox_account,
+    ensure_archive_mailbox,
+    parse_setup_email_list_output,
+    sanitize_mailbox_command_output,
+)
 from .translation import (
     MailTranslationEmptyError,
     MailTranslationFailedError,
@@ -166,13 +174,65 @@ class MailboxProvisioningServiceTests(TestCase):
     @patch("mailops.services.docker.DockerClient")
     def test_create_mailbox_account_executes_setup_add(self, docker_client_class):
         container = Mock()
-        container.exec_run.return_value = Mock(exit_code=0, output=b"created\n")
+        container.exec_run.side_effect = [
+            Mock(exit_code=0, output=b"created\n"),
+            Mock(exit_code=0, output=b""),
+        ]
         docker_client_class.return_value.containers.get.return_value = container
 
         output = create_mailbox_account(" USER@Example.COM ", "secret-password")
 
         self.assertEqual(output, "created")
-        container.exec_run.assert_called_once_with(["setup", "email", "add", "user@example.com", "secret-password"])
+        self.assertEqual(container.exec_run.call_count, 2)
+        container.exec_run.assert_any_call(["setup", "email", "add", "user@example.com", "secret-password"])
+        container.exec_run.assert_any_call(["doveadm", "mailbox", "create", "-u", "user@example.com", "Archive"])
+
+    def test_parse_setup_email_list_output(self):
+        sample = (
+            "* postmaster@qubitmdm.online ( 0 / ~ ) [0%]\n\n"
+            "* avrcan@finestar.hr ( 137M / ~ ) [0%]\n"
+            "    [ aliases -> abuse@finestar.hr ]\n\n"
+            "* app-test-1@finestar.hr ( 7.0K / ~ ) [0%]\n"
+        )
+        self.assertEqual(
+            parse_setup_email_list_output(sample),
+            ["postmaster@qubitmdm.online", "avrcan@finestar.hr", "app-test-1@finestar.hr"],
+        )
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_ensure_archive_mailbox_returns_exists_when_already_present(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=65, output=b"Error: Mailbox already exists\n")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        self.assertEqual(ensure_archive_mailbox("U@Example.COM"), "exists")
+        container.exec_run.assert_called_once_with(
+            ["doveadm", "mailbox", "create", "-u", "u@example.com", "Archive"]
+        )
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_ensure_archive_mailbox_returns_created_on_success(self, docker_client_class):
+        container = Mock()
+        container.exec_run.return_value = Mock(exit_code=0, output=b"")
+        docker_client_class.return_value.containers.get.return_value = container
+
+        self.assertEqual(ensure_archive_mailbox("a@b.co"), "created")
+
+    @patch("mailops.services.docker.DockerClient")
+    def test_create_mailbox_account_deletes_mailbox_when_archive_fails(self, docker_client_class):
+        container = Mock()
+        container.exec_run.side_effect = [
+            Mock(exit_code=0, output=b"ok\n"),
+            Mock(exit_code=75, output=b"doveadm failed\n"),
+            Mock(exit_code=0, output=b"deleted\n"),
+        ]
+        docker_client_class.return_value.containers.get.return_value = container
+
+        with self.assertRaises(MailboxProvisioningError):
+            create_mailbox_account("user@example.com", "secret-password")
+
+        self.assertEqual(container.exec_run.call_count, 3)
+        container.exec_run.assert_any_call(["setup", "email", "del", "-y", "user@example.com"])
 
     @patch("mailops.services.docker.DockerClient")
     def test_create_mailbox_account_sanitizes_failure_output(self, docker_client_class):
@@ -214,6 +274,52 @@ class MailboxProvisioningServiceTests(TestCase):
             sanitize_mailbox_command_output("before secret-password after", password="secret-password"),
             "before [redacted-password] after",
         )
+
+
+class EnsureArchiveMailboxesCommandTests(TestCase):
+    @patch("mailops.management.commands.ensure_archive_mailboxes.list_mailserver_mailbox_emails")
+    @patch("mailops.management.commands.ensure_archive_mailboxes.ensure_archive_mailbox")
+    def test_command_dry_run(self, ensure_fn, list_fn):
+        list_fn.return_value = ["a@x.com", "b@y.com"]
+        out = io.StringIO()
+        call_command("ensure_archive_mailboxes", "--dry-run", stdout=out)
+        ensure_fn.assert_not_called()
+        body = out.getvalue()
+        self.assertIn("a@x.com", body)
+        self.assertIn("dry-run", body.lower())
+
+    @patch("mailops.management.commands.ensure_archive_mailboxes.list_mailserver_mailbox_emails")
+    @patch("mailops.management.commands.ensure_archive_mailboxes.ensure_archive_mailbox")
+    def test_command_calls_ensure_per_mailbox(self, ensure_fn, list_fn):
+        list_fn.return_value = ["a@x.com", "b@y.com"]
+        ensure_fn.side_effect = ["created", "exists"]
+        out = io.StringIO()
+        call_command("ensure_archive_mailboxes", stdout=out)
+        self.assertEqual(ensure_fn.call_count, 2)
+        self.assertIn("created=1", out.getvalue())
+        self.assertIn("skipped=1", out.getvalue())
+
+    @patch("mailops.management.commands.ensure_archive_mailboxes.list_mailserver_mailbox_emails")
+    @patch("mailops.management.commands.ensure_archive_mailboxes.ensure_archive_mailbox")
+    def test_command_exits_on_ensure_failure(self, ensure_fn, list_fn):
+        list_fn.return_value = ["a@x.com"]
+        ensure_fn.side_effect = MailboxProvisioningError("boom")
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            call_command("ensure_archive_mailboxes", stdout=out)
+        self.assertEqual(ctx.exception.code, 1)
+
+    @patch("mailops.management.commands.ensure_archive_mailboxes.list_mailserver_mailbox_emails", side_effect=MailboxProvisioningError("no list"))
+    def test_command_exits_when_list_fails(self, list_fn):
+        with self.assertRaises(SystemExit) as ctx:
+            call_command("ensure_archive_mailboxes")
+        self.assertIn("no list", str(ctx.exception))
+
+    @patch("mailops.management.commands.ensure_archive_mailboxes.list_mailserver_mailbox_emails", return_value=[])
+    def test_command_warns_when_no_mailboxes(self, list_fn):
+        out = io.StringIO()
+        call_command("ensure_archive_mailboxes", stdout=out)
+        self.assertIn("No mailboxes", out.getvalue())
 
 
 @override_settings(MAILBOX_AUTO_CREATE_FROM_USER_ADMIN=True, MAILBOX_AUTO_CREATE_SKIP_STAFF=True)

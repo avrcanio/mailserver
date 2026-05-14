@@ -1,3 +1,5 @@
+import re
+
 import docker
 from django.conf import settings
 from firebase_admin import credentials, get_app, initialize_app, messaging
@@ -25,15 +27,62 @@ def _mailserver_container():
     return client.containers.get(settings.MAILSERVER_CONTAINER_NAME)
 
 
-def _exec_mailserver_setup(args, password=""):
+def _exec_mailserver_cmd(cmd, password=""):
     try:
         container = _mailserver_container()
-        result = container.exec_run(["setup", *args])
+        result = container.exec_run(cmd)
     except Exception as exc:
         message = sanitize_mailbox_command_output(str(exc), password=password)
-        raise MailboxProvisioningError(message or "Unable to execute mailserver setup command.") from exc
+        raise MailboxProvisioningError(message or "Unable to execute mailserver command.") from exc
     output = sanitize_mailbox_command_output(result.output, password=password)
     return result.exit_code, output
+
+
+def _exec_mailserver_setup(args, password=""):
+    return _exec_mailserver_cmd(["setup", *args], password=password)
+
+
+SETUP_EMAIL_LIST_LINE_RE = re.compile(r"^\*\s+(\S+@\S+)\s+\(")
+
+
+def parse_setup_email_list_output(text):
+    """Parse `setup email list` output; returns normalized mailbox emails."""
+    emails = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        match = SETUP_EMAIL_LIST_LINE_RE.match(line)
+        if match:
+            emails.append(match.group(1).strip().lower())
+    return emails
+
+
+def list_mailserver_mailbox_emails():
+    exit_code, output = _exec_mailserver_setup(["email", "list"])
+    if exit_code != 0:
+        raise MailboxProvisioningError(output or "setup email list failed.")
+    return parse_setup_email_list_output(output)
+
+
+ARCHIVE_MAILBOX_NAME = "Archive"
+
+
+def ensure_archive_mailbox(email):
+    """Create top-level IMAP folder Archive via doveadm (idempotent).
+
+    Returns ``"created"`` if a new mailbox was created, ``"exists"`` if it was already present.
+    """
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        raise MailboxProvisioningError("Mailbox email is required to create Archive.")
+    exit_code, output = _exec_mailserver_cmd(
+        ["doveadm", "mailbox", "create", "-u", normalized_email, ARCHIVE_MAILBOX_NAME]
+    )
+    if exit_code == 0:
+        return "created"
+    lowered = (output or "").lower()
+    if exit_code == 65 and "already exists" in lowered:
+        return "exists"
+    raise MailboxProvisioningError(output or f"Failed to create {ARCHIVE_MAILBOX_NAME} for {normalized_email}.")
 
 
 def create_mailbox_account(email, password):
@@ -41,6 +90,14 @@ def create_mailbox_account(email, password):
     exit_code, output = _exec_mailserver_setup(["email", "add", normalized_email, password], password=password)
     if exit_code != 0:
         raise MailboxProvisioningError(output or f"Mailbox provisioning failed for {normalized_email}.")
+    try:
+        ensure_archive_mailbox(normalized_email)
+    except MailboxProvisioningError:
+        try:
+            delete_mailbox_account(normalized_email, password=password)
+        except MailboxCleanupError:
+            pass
+        raise
     return output
 
 
