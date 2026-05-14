@@ -35,6 +35,13 @@ services:
       - NET_ADMIN
     restart: unless-stopped
     stop_grace_period: 1m
+    # Allow app stacks on hetzner_net (e.g. mozzart) to reach SMTP/IMAP by the
+    # public hostname that matches the TLS certificate (see ADDITIONAL_CERT_DOMAINS).
+    networks:
+      default:
+      hetzner_net:
+        aliases:
+          - mail.sibenik1983.hr
 
   mailadmin:
     build:
@@ -211,4 +218,6 @@ networks:
   postgis:
     external: true
   proxy:
+    external: true
+  hetzner_net:
     external: true
