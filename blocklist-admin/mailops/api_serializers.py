@@ -276,6 +276,12 @@ class MessageDetailSerializer(MessageSummarySerializer):
 class FoldersResponseSerializer(serializers.Serializer):
     account_email = serializers.EmailField()
     folders = FolderSerializer(many=True)
+    recent_move_destinations = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text="Recently used move destination folder paths (still present and selectable), MRU order.",
+    )
 
 
 class MessageSummariesResponseSerializer(serializers.Serializer):

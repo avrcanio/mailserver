@@ -122,6 +122,7 @@ Response:
 ```json
 {
   "account_email": "user@finestar.hr",
+  "recent_move_destinations": ["INBOX/Invoices/2026"],
   "folders": [
     {
       "name": "INBOX",
@@ -146,6 +147,8 @@ Response:
   ]
 }
 ```
+
+`recent_move_destinations` lists folder paths the authenticated user recently moved messages into for this mailbox (most recent first). Only paths that still appear in `folders` with `selectable: true` are included; the main `folders` array stays in IMAP `LIST` order for tree navigation.
 
 `name` remains a backwards-compatible alias for the full IMAP folder path. New clients should use `path` as the stable identifier when calling message APIs, `display_name` for the visible label, and `depth` / `parent_path` to render nested folders. Folders with `selectable: false` are visible hierarchy nodes but should not be opened.
 

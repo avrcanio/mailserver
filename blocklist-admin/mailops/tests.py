@@ -71,6 +71,7 @@ from .models import (
     MailConversationIndex,
     MailMessageTranslation,
     MailMessageIndex,
+    MailboxMoveDestinationHistory,
     MailboxTokenCredential,
     PushNotificationLog,
 )
@@ -1722,8 +1723,10 @@ class MailApiTests(TestCase):
         response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
 
         self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["recent_move_destinations"], [])
         self.assertEqual(
-            response.json()["folders"][0],
+            body["folders"][0],
             {
                 "name": "INBOX",
                 "path": "INBOX",
@@ -1753,6 +1756,7 @@ class MailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         folders = response.json()["folders"]
+        self.assertEqual(response.json()["recent_move_destinations"], [])
         self.assertEqual(folders[2]["name"], "INBOX/Invoices/2026")
         self.assertEqual(folders[2]["path"], "INBOX/Invoices/2026")
         self.assertEqual(folders[2]["display_name"], "2026")
@@ -1760,6 +1764,53 @@ class MailApiTests(TestCase):
         self.assertEqual(folders[2]["depth"], 2)
         self.assertTrue(folders[2]["selectable"])
         self.assertFalse(folders[3]["selectable"])
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_folders_recent_move_destinations_ordered_and_case_insensitive(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        now = timezone.now()
+        MailboxMoveDestinationHistory.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            target_folder="sent",
+            last_used_at=now - timezone.timedelta(hours=2),
+        )
+        MailboxMoveDestinationHistory.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            target_folder="archive",
+            last_used_at=now,
+        )
+        service_class.return_value.list_folders.return_value = [
+            MailFolderSummary(name="INBOX", delimiter="/", flags=("HasNoChildren",)),
+            MailFolderSummary(name="Sent", delimiter="/", flags=("HasNoChildren",)),
+            MailFolderSummary(name="Archive", delimiter="/", flags=("HasNoChildren",)),
+        ]
+
+        response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recent_move_destinations"], ["Archive", "Sent"])
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_folders_omits_stale_recent_move_destinations(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        MailboxMoveDestinationHistory.objects.create(
+            user=token.user,
+            account_email=self.account_email,
+            target_folder="Deleted/Old",
+            last_used_at=timezone.now(),
+        )
+        service_class.return_value.list_folders.return_value = [
+            MailFolderSummary(name="INBOX", delimiter="/", flags=("HasNoChildren",)),
+        ]
+
+        response = self.client.get(reverse("mailops:api_mail_folders"), **headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recent_move_destinations"], [])
 
     def test_legacy_mailbox_path_no_longer_accepts_post_password_payload(self):
         response = self.client.post(
@@ -2813,6 +2864,28 @@ class MailApiTests(TestCase):
             service.move_messages_to_folder.call_args.kwargs,
             {"folder": "INBOX", "target_folder": "Archive", "uids": ("123", "124")},
         )
+        token = Token.objects.get(user__email=self.account_email)
+        row = MailboxMoveDestinationHistory.objects.get(user=token.user, account_email=self.account_email)
+        self.assertEqual(row.target_folder, "Archive")
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_move_empty_moved_skips_destination_history(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_folder.return_value = MailMessageMoveResult(
+            target_folder="Archive",
+            moved=(),
+            failed=(),
+        )
+
+        self.client.post(
+            reverse("mailops:api_mail_messages_move"),
+            data={"folder": "INBOX", "target_folder": "Archive", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        token = Token.objects.get(user__email=self.account_email)
+        self.assertFalse(MailboxMoveDestinationHistory.objects.filter(user=token.user, account_email=self.account_email).exists())
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_move_single_uses_query_folder_and_body(self, service_class):

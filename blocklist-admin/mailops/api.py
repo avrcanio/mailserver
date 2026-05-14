@@ -95,7 +95,15 @@ from mail_integration.gmail_client import (
 
 from .gmail_import import GmailImportError, GmailImportService
 from .gmail_send import GmailOutboundSendService
-from .models import AddressBookContact, DeviceRegistration, GmailImportAccount, MailAccountIndex, MailboxTokenCredential, ReceiptOcrLog
+from .models import (
+    AddressBookContact,
+    DeviceRegistration,
+    GmailImportAccount,
+    MailAccountIndex,
+    MailboxMoveDestinationHistory,
+    MailboxTokenCredential,
+    ReceiptOcrLog,
+)
 from .paddleocr_receipt import (
     ReceiptOCRDisabledError,
     ReceiptOCRDockerError,
@@ -376,6 +384,70 @@ def folder_payload(folder):
         "flags": list(folder.flags),
         "selectable": folder.selectable,
     }
+
+
+def _same_imap_folder(left, right):
+    return str(left or "").strip().lower() == str(right or "").strip().lower()
+
+
+def _folder_summary_matches_target(summary, target_folder):
+    if not summary.selectable:
+        return False
+    t = (target_folder or "").strip()
+    if not t:
+        return False
+    return _same_imap_folder(summary.name, t) or _same_imap_folder(summary.path, t)
+
+
+def record_mail_move_destination(user, account_email, move_result):
+    if not move_result.moved:
+        return
+    if user is None or not getattr(user, "is_authenticated", False):
+        return
+    normalized = (account_email or "").strip().lower()
+    tf = (move_result.target_folder or "").strip()
+    if not normalized or not tf:
+        return
+    try:
+        MailboxMoveDestinationHistory.objects.update_or_create(
+            user=user,
+            account_email=normalized,
+            target_folder=tf,
+            defaults={"last_used_at": timezone.now()},
+        )
+    except Exception as exc:
+        logger.warning("Could not record move destination for %s: %s", normalized, exc)
+
+
+def recent_move_destinations_for_list(user, account_email, folder_summaries, limit=15):
+    if user is None or not getattr(user, "is_authenticated", False):
+        return []
+    normalized = (account_email or "").strip().lower()
+    if not normalized or not folder_summaries:
+        return []
+    fetch_cap = max(limit * 3, limit + 10)
+    try:
+        rows = list(
+            MailboxMoveDestinationHistory.objects.filter(user=user, account_email=normalized).order_by("-last_used_at")[:fetch_cap]
+        )
+    except Exception as exc:
+        logger.warning("Could not load move destination history for %s: %s", normalized, exc)
+        return []
+    out = []
+    seen_lower = set()
+    for row in rows:
+        if len(out) >= limit:
+            break
+        for summary in folder_summaries:
+            if _folder_summary_matches_target(summary, row.target_folder):
+                canonical = (summary.path or summary.name or "").strip()
+                key = canonical.lower()
+                if key in seen_lower:
+                    break
+                seen_lower.add(key)
+                out.append(canonical)
+                break
+    return out
 
 
 def summary_payload(summary):
@@ -760,6 +832,7 @@ def move_messages_response(request, credentials, folder, target_folder, uids):
     except MailIntegrationError as exc:
         return mail_error_response(exc)
     remove_indexed_messages_after_delete(request.user, credentials.email, folder, result.moved)
+    record_mail_move_destination(request.user, credentials.email, result)
     return Response(move_result_payload(credentials, folder, result))
 
 
@@ -1188,7 +1261,14 @@ class FolderListView(APIView):
             folders = MailboxService().list_folders(credentials)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
-        return Response({"account_email": credentials.email, "folders": [folder_payload(folder) for folder in folders]})
+        recent = recent_move_destinations_for_list(request.user, credentials.email, folders, limit=15)
+        return Response(
+            {
+                "account_email": credentials.email,
+                "folders": [folder_payload(folder) for folder in folders],
+                "recent_move_destinations": recent,
+            }
+        )
 
 
 class MessageListView(APIView):

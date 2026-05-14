@@ -672,3 +672,42 @@ class MailFolderIndexState(models.Model):
 
     def __str__(self):
         return f"{self.account.account_email} {self.folder}"
+
+
+class MailboxMoveDestinationHistory(models.Model):
+    """Per-user MRU of IMAP folders used as move destinations for a mailbox account."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="mailbox_move_destinations",
+    )
+    account_email = models.EmailField(db_index=True)
+    target_folder = models.CharField(max_length=255)
+    last_used_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-last_used_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "account_email", "target_folder"],
+                name="uniq_mailbox_move_dest_user_account_folder",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "account_email", "last_used_at"], name="mailmove_dest_user_acc_used_idx"),
+        ]
+        verbose_name = "Mailbox move destination history"
+        verbose_name_plural = "Mailbox move destination histories"
+
+    def clean(self):
+        self.account_email = (self.account_email or "").strip().lower()
+        self.target_folder = (self.target_folder or "").strip()
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.account_email} -> {self.target_folder}"
