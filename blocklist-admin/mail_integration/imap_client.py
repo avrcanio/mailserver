@@ -16,7 +16,15 @@ from urllib.parse import unquote
 
 from django.conf import settings
 
-from .exceptions import MailAttachmentNotFoundError, MailAuthError, MailConnectionError, MailInvalidOperationError, MailProtocolError, MailTimeoutError
+from .exceptions import (
+    MailAttachmentNotFoundError,
+    MailAuthError,
+    MailConnectionError,
+    MailInvalidOperationError,
+    MailMessageNotFoundError,
+    MailProtocolError,
+    MailTimeoutError,
+)
 from .schemas import (
     MailAttachmentContent,
     MailAttachmentSummary,
@@ -350,9 +358,26 @@ class ImapClient:
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP message fetch failed for UID {uid}") from exc
         self._expect_ok(status, data, f"IMAP message fetch failed for UID {uid}")
-        metadata, payload = _first_fetch_tuple(data)
         try:
-            return metadata, BytesParser(policy=policy.default).parsebytes(payload or b"")
+            metadata, payload = _first_fetch_tuple(data)
+        except MailProtocolError as exc:
+            if "did not include message data" in str(exc):
+                raise MailMessageNotFoundError(
+                    f"No message data for UID {uid} in folder {folder} (it may have been moved or deleted)."
+                ) from exc
+            raise
+        if payload is None:
+            raw = b""
+        elif isinstance(payload, bytes):
+            raw = payload
+        else:
+            raw = str(payload).encode("utf-8", errors="surrogateescape")
+        if not raw.strip():
+            raise MailMessageNotFoundError(
+                f"Empty message body for UID {uid} in folder {folder} (it may have been moved or deleted)."
+            )
+        try:
+            return metadata, BytesParser(policy=policy.default).parsebytes(raw)
         except Exception as exc:
             raise MailProtocolError(f"Could not parse IMAP message response: {exc}") from exc
 

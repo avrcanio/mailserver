@@ -484,6 +484,8 @@ Response:
 }
 ```
 
+If the message no longer exists at that folder/UID (for example moved or deleted in another IMAP client), the API returns `404 {"error": "message_not_found", "detail": "..."}` and clears `last_indexed_at` on the account index so the next unified inbox request is more likely to use live IMAP until sync catches up.
+
 ## Attachments
 
 Message detail includes attachment metadata with stable per-message IDs such as `att_1`, `att_2`, in MIME traversal order. Inline HTML body resources are included when they have MIME attachment-like metadata, so clients can fetch bytes for `cid:` image rendering.

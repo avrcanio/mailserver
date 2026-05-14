@@ -33,6 +33,7 @@ from mail_integration.exceptions import (
     MailForwardAttachmentNotVisibleError,
     MailIntegrationError,
     MailInvalidOperationError,
+    MailMessageNotFoundError,
     MailProtocolError,
     MailSendError,
     MailTimeoutError,
@@ -275,6 +276,7 @@ def mail_error_response(exc):
         MailConnectionError: ("mail_connection_failed", status.HTTP_502_BAD_GATEWAY),
         MailProtocolError: ("mail_protocol_failed", status.HTTP_502_BAD_GATEWAY),
         MailSendError: ("mail_send_failed", status.HTTP_502_BAD_GATEWAY),
+        MailMessageNotFoundError: ("message_not_found", status.HTTP_404_NOT_FOUND),
     }
     for error_type, (code, response_status) in error_map.items():
         if isinstance(exc, error_type):
@@ -1421,7 +1423,7 @@ class MessageDetailView(APIView):
     @extend_schema(
         operation_id="mail_messages_detail",
         parameters=[OpenApiParameter("folder", str, required=False, description="Mailbox folder name. Defaults to INBOX.")],
-        responses={200: MessageDetailResponseSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+        responses={200: MessageDetailResponseSerializer, 401: ErrorSerializer, 404: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
     )
     def get(self, request, uid):
         credentials, error = require_mailbox_credentials(request)
@@ -1430,6 +1432,9 @@ class MessageDetailView(APIView):
         folder = (request.query_params.get("folder") or "INBOX").strip() or "INBOX"
         try:
             detail = MailboxService().get_message_detail(credentials, folder=folder, uid=uid)
+        except MailMessageNotFoundError as exc:
+            mark_mail_index_stale_after_send(request.user, credentials.email)
+            return mail_error_response(exc)
         except MailIntegrationError as exc:
             return mail_error_response(exc)
         mark_index_message_read(request.user, credentials.email, folder, uid)

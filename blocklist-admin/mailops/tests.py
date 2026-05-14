@@ -25,6 +25,7 @@ from mail_integration.exceptions import (
     MailForwardAttachmentNotFoundError,
     MailForwardAttachmentNotVisibleError,
     MailInvalidOperationError,
+    MailMessageNotFoundError,
     MailSendError,
 )
 from mail_integration.gmail_client import GmailHistoryMessage, GmailHistoryPage, GmailMessageRef, GmailRawMessage
@@ -2564,6 +2565,27 @@ class MailApiTests(TestCase):
         credentials = service.get_message_detail.call_args.args[0]
         self.assertEqual(credentials.email, self.account_email)
         self.assertEqual(service.get_message_detail.call_args.kwargs, {"folder": "INBOX", "uid": "42"})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_detail_message_not_found_returns_404_and_marks_index_stale(self, service_class):
+        headers = self.auth_headers()
+        token = Token.objects.get(user__email=self.account_email)
+        MailAccountIndex.objects.update_or_create(
+            user=token.user,
+            account_email=self.account_email,
+            defaults={
+                "last_indexed_at": timezone.now(),
+                "index_status": MailAccountIndex.STATUS_READY,
+            },
+        )
+        service_class.return_value.get_message_detail.side_effect = MailMessageNotFoundError("missing")
+
+        response = self.client.get(reverse("mailops:api_mail_message_detail", kwargs={"uid": "99"}), {"folder": "INBOX"}, **headers)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"], "message_not_found")
+        idx = MailAccountIndex.objects.get(user=token.user, account_email=self.account_email)
+        self.assertIsNone(idx.last_indexed_at)
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_detail_marks_indexed_message_read(self, service_class):

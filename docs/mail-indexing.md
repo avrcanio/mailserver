@@ -240,6 +240,30 @@ MAIL_INDEX_RECONCILE_DELETIONS=true
 When enabled, only indexed rows inside the checked recent UID range can be
 removed, and their conversations are rebuilt.
 
+## FS Mail and other IMAP clients (Thunderbird, Outlook, …)
+
+Users often change mail **directly on the IMAP server** with a desktop or mobile
+client that is **not** wired into mailadmin. The unified inbox API prefers the
+stored index when it is “usable”, so ghosts can appear until the index matches
+IMAP again.
+
+**Recommended production settings**
+
+1. Set **`MAIL_INDEX_RECONCILE_DELETIONS=true`** so incremental sync can remove
+   indexed rows that disappear from the scanned UID window (see *Deletion
+   reconciliation* above). Only enable when you trust your IMAP server’s UID
+   listing for that window.
+2. Run **`mailindex-sync`** (or equivalent) on a **steady schedule** so each
+   account’s index is refreshed regularly.
+3. Optionally set **`MAIL_INDEX_MAX_AGE_SECONDS`** to a positive value so an
+   overly old index is skipped and **`GET /api/mail/unified-conversations`**
+   falls back to live IMAP until sync catches up (see *Serving Unified
+   Conversations* above).
+
+When a mobile client opens a message that no longer exists at the stored
+folder/UID, mailadmin returns **`404` `message_not_found`** and marks the account
+index stale so the next unified request is more likely to use fresh IMAP data.
+
 ## Threading
 
 Threading is ID-first.

@@ -26,6 +26,10 @@ class MailAttachmentNotFoundError(MailIntegrationError):
     """Raised when a requested message attachment cannot be found."""
 
 
+class MailMessageNotFoundError(MailIntegrationError):
+    """Raised when the requested folder/UID has no fetchable message on IMAP (moved/deleted)."""
+
+
 class MailForwardAttachmentNotFoundError(MailIntegrationError):
     """Raised when a requested forwarded attachment ID is not on the source message."""
 
