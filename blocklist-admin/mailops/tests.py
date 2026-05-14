@@ -42,6 +42,7 @@ from mail_integration.schemas import (
     MailUnifiedMessageSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
+    MailMessageMoveResult,
     MailMessageMoveToTrashResult,
     MailMessageRestoreResult,
     MailMessageSummary,
@@ -2774,6 +2775,83 @@ class MailApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["moved_to_trash"], ["42"])
         self.assertEqual(service_class.return_value.move_messages_to_trash.call_args.kwargs, {"folder": "Archive", "uids": ("42",)})
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_move_batch_returns_move_result(self, service_class):
+        headers = self.auth_headers()
+        service = service_class.return_value
+        service.move_messages_to_folder.return_value = MailMessageMoveResult(
+            target_folder="Archive",
+            moved=("123", "124"),
+            failed=(),
+        )
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_move"),
+            data={"folder": "INBOX", "target_folder": "Archive", "uids": [123, "124"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "account_email": self.account_email,
+                "folder": "INBOX",
+                "target_folder": "Archive",
+                "success": True,
+                "partial": False,
+                "moved": ["123", "124"],
+                "failed": [],
+            },
+        )
+        credentials = service.move_messages_to_folder.call_args.args[0]
+        self.assertEqual(credentials.email, self.account_email)
+        self.assertEqual(credentials.password, self.password)
+        self.assertEqual(
+            service.move_messages_to_folder.call_args.kwargs,
+            {"folder": "INBOX", "target_folder": "Archive", "uids": ("123", "124")},
+        )
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_message_move_single_uses_query_folder_and_body(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_folder.return_value = MailMessageMoveResult(
+            target_folder="Custom",
+            moved=("42",),
+            failed=(),
+        )
+
+        url = f'{reverse("mailops:api_mail_message_move", kwargs={"uid": "42"})}?folder=INBOX'
+        response = self.client.post(
+            url,
+            data={"target_folder": "Custom"},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["moved"], ["42"])
+        self.assertEqual(
+            service_class.return_value.move_messages_to_folder.call_args.kwargs,
+            {"folder": "INBOX", "target_folder": "Custom", "uids": ("42",)},
+        )
+
+    @patch("mailops.api.MailboxService")
+    def test_mail_messages_move_returns_400_for_invalid_target_folder_error(self, service_class):
+        headers = self.auth_headers()
+        service_class.return_value.move_messages_to_folder.side_effect = MailInvalidOperationError("invalid_target_folder")
+
+        response = self.client.post(
+            reverse("mailops:api_mail_messages_move"),
+            data={"folder": "INBOX", "target_folder": "NoSuchFolder", "uids": ["1"]},
+            content_type="application/json",
+            **headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_target_folder")
 
     @patch("mailops.api.MailboxService")
     def test_mail_message_delete_detail_endpoint_defaults_to_inbox_and_removes_index_row(self, service_class):

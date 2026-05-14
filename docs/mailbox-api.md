@@ -553,6 +553,59 @@ For a single message, use the same behavior through:
 POST /api/mail/messages/123/delete?folder=INBOX
 ```
 
+## Move
+
+Move relocates messages from a source folder to another selectable mailbox folder using IMAP `MOVE` (with copy+delete fallback when needed). The client should use folder paths from `GET /api/mail/folders` (`path` / `name`). After a successful move, the message no longer exists at the original `(folder, uid)` pair; the app should refresh lists and drop local cache for that message id.
+
+`POST /api/mail/messages/move`
+
+Request:
+
+```json
+{
+  "folder": "INBOX",
+  "target_folder": "Archive",
+  "uids": ["123", "124"]
+}
+```
+
+Response:
+
+```json
+{
+  "account_email": "user@finestar.hr",
+  "folder": "INBOX",
+  "target_folder": "Archive",
+  "success": true,
+  "partial": false,
+  "moved": ["123", "124"],
+  "failed": []
+}
+```
+
+Partial failures return HTTP 200 with `success: false`, `partial: true`, and `failed` entries shaped like the delete API.
+
+For a single message:
+
+```http
+POST /api/mail/messages/123/move?folder=INBOX
+```
+
+Request body:
+
+```json
+{
+  "target_folder": "Archive"
+}
+```
+
+Errors:
+
+- `400 {"error": "invalid_folder"}` — missing or blank source folder
+- `400 {"error": "invalid_target_folder"}` — missing target, unknown folder, or folder not selectable
+- `400 {"error": "move_source_equals_target"}` — source and target are the same mailbox
+- `400 {"error": "empty_uid_list"}` / `400 {"error": "invalid_uid"}` — batch validation
+
 ## Restore
 
 Restore moves messages from Trash into an explicit non-Trash target folder. The backend does not infer the original folder.

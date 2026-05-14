@@ -28,6 +28,7 @@ from .schemas import (
     MailFolderSummary,
     MailMessageDetail,
     MailMessageMoveFailure,
+    MailMessageMoveResult,
     MailMessageMoveToTrashResult,
     MailMessageRestoreResult,
     MailMessageSummary,
@@ -372,6 +373,31 @@ class ImapClient:
             else:
                 moved.append(uid)
         return MailMessageMoveToTrashResult(trash_folder=trash_folder, moved_to_trash=tuple(moved), failed=tuple(failed))
+
+    def move_messages_to_folder(self, folder, uids, target_folder):
+        if _same_folder(folder, target_folder):
+            raise MailInvalidOperationError("move_source_equals_target")
+        folders = self.list_folders()
+        resolved = None
+        for summary in folders:
+            if _same_folder(summary.name, target_folder) or _same_folder(summary.path, target_folder):
+                resolved = summary
+                break
+        if resolved is None or not resolved.selectable:
+            raise MailInvalidOperationError("invalid_target_folder")
+        canonical_target = resolved.name
+        normalized_uids = tuple(str(uid) for uid in uids)
+        self.select_folder(folder, readonly=False)
+        moved = []
+        failed = []
+        for uid in normalized_uids:
+            try:
+                self._move_message(uid, canonical_target, "move")
+            except MailProtocolError as exc:
+                failed.append(MailMessageMoveFailure(uid=uid, error="move_failed", detail=str(exc)))
+            else:
+                moved.append(uid)
+        return MailMessageMoveResult(target_folder=canonical_target, moved=tuple(moved), failed=tuple(failed))
 
     def restore_messages_from_trash(self, folder, target_folder, uids):
         connection = self._require_connection()
