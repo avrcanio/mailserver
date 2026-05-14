@@ -36,7 +36,7 @@ class Migration(migrations.Migration):
         ),
         migrations.AddIndex(
             model_name="mailboxmovedestinationhistory",
-            index=models.Index(fields=["user", "account_email", "last_used_at"], name="mailmove_dest_user_acc_used_idx"),
+            index=models.Index(fields=["user", "account_email", "last_used_at"], name="mailmove_dst_usr_acc_used_idx"),
         ),
         migrations.AddConstraint(
             model_name="mailboxmovedestinationhistory",

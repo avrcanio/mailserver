@@ -696,7 +696,7 @@ class MailboxMoveDestinationHistory(models.Model):
             ),
         ]
         indexes = [
-            models.Index(fields=["user", "account_email", "last_used_at"], name="mailmove_dest_user_acc_used_idx"),
+            models.Index(fields=["user", "account_email", "last_used_at"], name="mailmove_dst_usr_acc_used_idx"),
         ]
         verbose_name = "Mailbox move destination history"
         verbose_name_plural = "Mailbox move destination histories"
