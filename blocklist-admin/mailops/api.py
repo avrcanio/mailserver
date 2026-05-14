@@ -73,6 +73,8 @@ from .api_serializers import (
     MailIndexStatusQuerySerializer,
     MailIndexStatusResponseSerializer,
     MessageDetailResponseSerializer,
+    MessageReadStateRequestSerializer,
+    MessageReadStateResponseSerializer,
     MessageTranslationRequestSerializer,
     MessageTranslationResponseSerializer,
     MessageSummariesResponseSerializer,
@@ -788,6 +790,29 @@ def mark_index_message_read(user, account_email, folder, uid):
         logger.warning("Could not mark indexed message read for %s %s/%s: %s", account_email, folder, uid, exc)
 
 
+def mark_index_message_unread(user, account_email, folder, uid):
+    try:
+        from mailops.mail_indexing.sync import rebuild_conversation
+        from mailops.mail_indexing.threading import uid_int
+
+        account = MailAccountIndex.objects.filter(user=user, account_email=account_email.strip().lower()).first()
+        if account is None:
+            return
+        message = account.messages.filter(folder=folder, uid=uid_int(uid)).first()
+        if message is None:
+            return
+        flags_list = list(message.flags_json or [])
+        if not message.is_read and not any(str(flag).lower() == "seen" for flag in flags_list):
+            return
+        flags = [flag for flag in flags_list if str(flag).lower() != "seen"]
+        message.flags_json = flags
+        message.is_read = False
+        message.save(update_fields=["flags_json", "is_read", "updated_at"])
+        rebuild_conversation(account, message.thread_key)
+    except Exception as exc:
+        logger.warning("Could not mark indexed message unread for %s %s/%s: %s", account_email, folder, uid, exc)
+
+
 def remove_indexed_messages_after_delete(user, account_email, folder, moved_uids):
     if not moved_uids:
         return
@@ -1465,6 +1490,39 @@ class MessageDetailView(APIView):
         if error:
             return error
         return delete_messages_response(request, credentials, data["folder"], data["uids"])
+
+
+class MessageReadStateView(APIView):
+    authentication_classes = MAILBOX_API_AUTHENTICATION_CLASSES
+    permission_classes = MAILBOX_API_PERMISSION_CLASSES
+
+    @extend_schema(
+        operation_id="mail_messages_read_state",
+        parameters=[OpenApiParameter("folder", str, required=False, description="Mailbox folder name. Defaults to INBOX.")],
+        request=MessageReadStateRequestSerializer,
+        responses={200: MessageReadStateResponseSerializer, 400: ErrorSerializer, 401: ErrorSerializer, 502: ErrorSerializer, 504: ErrorSerializer},
+    )
+    def post(self, request, uid):
+        credentials, error = require_mailbox_credentials(request)
+        if error:
+            return error
+        folder = (request.query_params.get("folder") or "INBOX").strip() or "INBOX"
+        serializer = MessageReadStateRequestSerializer(data=request.data or {})
+        if not serializer.is_valid():
+            return Response({"error": "invalid_read_state"}, status=status.HTTP_400_BAD_REQUEST)
+        read = serializer.validated_data["read"]
+        try:
+            MailboxService().set_message_read_state(credentials, folder=folder, uid=uid, read=read)
+        except MailIntegrationError as exc:
+            return mail_error_response(exc)
+        if read:
+            mark_index_message_read(request.user, credentials.email, folder, uid)
+        else:
+            mark_index_message_unread(request.user, credentials.email, folder, uid)
+        return Response(
+            {"account_email": credentials.email, "folder": folder, "uid": str(uid), "read": read},
+            status=status.HTTP_200_OK,
+        )
 
 
 class MessageTranslationView(APIView):

@@ -62,6 +62,14 @@ class MailboxService:
             client.login(credentials)
             return client.fetch_message_detail(folder=folder, uid=uid)
 
+    def set_message_read_state(self, credentials, folder, uid, read):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            if read:
+                client.mark_message_seen(folder=folder, uid=uid)
+            else:
+                client.mark_message_unseen(folder=folder, uid=uid)
+
     def get_attachment(self, credentials, folder, uid, attachment_id):
         with self.imap_client_factory() as client:
             client.login(credentials)

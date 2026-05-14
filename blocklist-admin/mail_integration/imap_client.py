@@ -347,6 +347,20 @@ class ImapClient:
             raise MailProtocolError(f"IMAP mark seen failed for UID {uid}") from exc
         self._expect_ok(status, data, f"IMAP mark seen failed for UID {uid}")
 
+    def mark_message_unseen(self, folder, uid, select_folder=True):
+        connection = self._require_connection()
+        if select_folder:
+            self.select_folder(folder, readonly=False)
+        try:
+            status, data = connection.uid("STORE", str(uid), "-FLAGS.SILENT", r"(\Seen)")
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out marking IMAP message {uid} as unseen") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP mark unseen connection failure for UID {uid}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP mark unseen failed for UID {uid}") from exc
+        self._expect_ok(status, data, f"IMAP mark unseen failed for UID {uid}")
+
     def _fetch_full_message(self, folder, uid, readonly=True):
         connection = self._require_connection()
         self.select_folder(folder, readonly=readonly)

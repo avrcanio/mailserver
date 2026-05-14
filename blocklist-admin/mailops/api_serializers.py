@@ -367,6 +367,17 @@ class MessageDetailResponseSerializer(serializers.Serializer):
     message = MessageDetailSerializer()
 
 
+class MessageReadStateRequestSerializer(serializers.Serializer):
+    read = serializers.BooleanField(required=True)
+
+
+class MessageReadStateResponseSerializer(serializers.Serializer):
+    account_email = serializers.EmailField()
+    folder = serializers.CharField()
+    uid = serializers.CharField()
+    read = serializers.BooleanField()
+
+
 class MessageTranslationRequestSerializer(serializers.Serializer):
     folder = serializers.CharField(required=False, allow_blank=False, default="INBOX")
     target_language = serializers.ChoiceField(
