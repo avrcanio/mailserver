@@ -1,2 +1,3 @@
 [DEFAULT]
-ignoreip = 127.0.0.1/8 192.168.48.0/20
+# mailserver_default + hetzner_net (SnappyMail, app stacks) — do not ban internal Docker mail clients
+ignoreip = 127.0.0.1/8 192.168.48.0/20 192.168.16.0/20
