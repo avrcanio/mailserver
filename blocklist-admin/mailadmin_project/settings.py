@@ -96,6 +96,9 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 MAILADMIN_HOST = os.environ.get("MAILADMIN_HOST", "mailadmin.example.com")
 BLOCKLIST_CONFIG_PATH = Path(os.environ.get("BLOCKLIST_CONFIG_PATH", "/app/shared-config/postfix-sender-blocklist"))
+POSTFIX_MAIN_CF_PATH = Path(
+    os.environ.get("POSTFIX_MAIN_CF_PATH", str(BLOCKLIST_CONFIG_PATH.parent / "postfix-main.cf"))
+)
 MAILSERVER_CONTAINER_NAME = os.environ.get("MAILSERVER_CONTAINER_NAME", "mailserver")
 PADDLEOCR_CONTAINER_NAME = (os.environ.get("PADDLEOCR_CONTAINER_NAME") or "").strip()
 PADDLEOCR_IMAGE_TO_R1_JSON = (os.environ.get("PADDLEOCR_IMAGE_TO_R1_JSON") or "").strip() or "/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py"

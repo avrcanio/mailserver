@@ -6,3 +6,4 @@ mail._domainkey.vitalgroupsa.com vitalgroupsa.com:mail:/etc/opendkim/keys/vitalg
 mail._domainkey.gmail.com gmail.com:mail:/etc/opendkim/keys/gmail.com/mail.private
 mail._domainkey.sibenik1983.hr sibenik1983.hr:mail:/etc/opendkim/keys/sibenik1983.hr/mail.private
 mail._domainkey.barakags.hr barakags.hr:mail:/etc/opendkim/keys/barakags.hr/mail.private
+mail._domainkey.stay.hr stay.hr:mail:/etc/opendkim/keys/stay.hr/mail.private

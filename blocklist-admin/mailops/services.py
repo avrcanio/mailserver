@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import docker
 from django.conf import settings
@@ -43,6 +44,39 @@ def _exec_mailserver_setup(args, password=""):
 
 
 SETUP_EMAIL_LIST_LINE_RE = re.compile(r"^\*\s+(\S+@\S+)\s+\(")
+VIRTUAL_MAILBOX_DOMAINS_RE = re.compile(r"^virtual_mailbox_domains\s*=\s*(.+)$", re.MULTILINE)
+DOMAIN_ONBOARDING_HINT = "See docs/domain-onboarding.md (DNS, cert SAN, virtual_mailbox_domains, DKIM)."
+
+
+def get_virtual_mailbox_domains():
+    """Domains accepted for local mailboxes on docker-mailserver."""
+    path = Path(getattr(settings, "POSTFIX_MAIN_CF_PATH", "/app/shared-config/postfix-main.cf"))
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        exit_code, output = _exec_mailserver_cmd(["postconf", "-h", "virtual_mailbox_domains"])
+        if exit_code != 0:
+            return set()
+        return {part.strip().lower() for part in output.split() if part.strip()}
+    match = VIRTUAL_MAILBOX_DOMAINS_RE.search(content)
+    if not match:
+        return set()
+    return {part.strip().lower() for part in match.group(1).split() if part.strip()}
+
+
+def assert_mail_domain_onboarded(email):
+    normalized = (email or "").strip().lower()
+    if normalized.count("@") != 1:
+        raise MailboxProvisioningError("Invalid mailbox email address.")
+    local, domain = normalized.split("@", 1)
+    if not local or not domain:
+        raise MailboxProvisioningError("Invalid mailbox email address.")
+    allowed = get_virtual_mailbox_domains()
+    if allowed and domain not in allowed:
+        raise MailboxProvisioningError(
+            f"Domain '{domain}' is not listed in mailserver virtual_mailbox_domains. "
+            f"Onboard the domain before creating mailadmin users. {DOMAIN_ONBOARDING_HINT}"
+        )
 
 
 def parse_setup_email_list_output(text):
@@ -87,17 +121,27 @@ def ensure_archive_mailbox(email):
 
 def create_mailbox_account(email, password):
     normalized_email = email.strip().lower()
+    assert_mail_domain_onboarded(normalized_email)
     exit_code, output = _exec_mailserver_setup(["email", "add", normalized_email, password], password=password)
     if exit_code != 0:
         raise MailboxProvisioningError(output or f"Mailbox provisioning failed for {normalized_email}.")
     try:
         ensure_archive_mailbox(normalized_email)
-    except MailboxProvisioningError:
+    except MailboxProvisioningError as exc:
         try:
             delete_mailbox_account(normalized_email, password=password)
         except MailboxCleanupError:
             pass
-        raise
+        message = str(exc)
+        if "user doesn't exist" in message.lower():
+            message = (
+                f"{message}\n"
+                "Dovecot could not find the mailbox user after setup email add. "
+                "Confirm the domain is in virtual_mailbox_domains and mailserver was recreated. "
+                f"setup email add output: {output or '(empty)'}\n"
+                f"{DOMAIN_ONBOARDING_HINT}"
+            )
+        raise MailboxProvisioningError(message) from exc
     return output
 
 

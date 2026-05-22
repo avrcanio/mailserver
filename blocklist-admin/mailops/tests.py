@@ -81,9 +81,11 @@ from .receipt_draft import ReceiptDraftFailedError
 from .services import (
     MailboxCleanupError,
     MailboxProvisioningError,
+    assert_mail_domain_onboarded,
     create_mailbox_account,
     delete_mailbox_account,
     ensure_archive_mailbox,
+    get_virtual_mailbox_domains,
     parse_setup_email_list_output,
     sanitize_mailbox_command_output,
 )
@@ -171,8 +173,12 @@ class FakeImapClient:
 
 
 class MailboxProvisioningServiceTests(TestCase):
+    @patch(
+        "mailops.services.get_virtual_mailbox_domains",
+        return_value={"example.com", "b.co", "stay.hr"},
+    )
     @patch("mailops.services.docker.DockerClient")
-    def test_create_mailbox_account_executes_setup_add(self, docker_client_class):
+    def test_create_mailbox_account_executes_setup_add(self, docker_client_class, _domains):
         container = Mock()
         container.exec_run.side_effect = [
             Mock(exit_code=0, output=b"created\n"),
@@ -218,8 +224,12 @@ class MailboxProvisioningServiceTests(TestCase):
 
         self.assertEqual(ensure_archive_mailbox("a@b.co"), "created")
 
+    @patch(
+        "mailops.services.get_virtual_mailbox_domains",
+        return_value={"example.com"},
+    )
     @patch("mailops.services.docker.DockerClient")
-    def test_create_mailbox_account_deletes_mailbox_when_archive_fails(self, docker_client_class):
+    def test_create_mailbox_account_deletes_mailbox_when_archive_fails(self, docker_client_class, _domains):
         container = Mock()
         container.exec_run.side_effect = [
             Mock(exit_code=0, output=b"ok\n"),
@@ -234,8 +244,12 @@ class MailboxProvisioningServiceTests(TestCase):
         self.assertEqual(container.exec_run.call_count, 3)
         container.exec_run.assert_any_call(["setup", "email", "del", "-y", "user@example.com"])
 
+    @patch(
+        "mailops.services.get_virtual_mailbox_domains",
+        return_value={"example.com"},
+    )
     @patch("mailops.services.docker.DockerClient")
-    def test_create_mailbox_account_sanitizes_failure_output(self, docker_client_class):
+    def test_create_mailbox_account_sanitizes_failure_output(self, docker_client_class, _domains):
         container = Mock()
         container.exec_run.return_value = Mock(exit_code=1, output=b"failed secret-password\n")
         docker_client_class.return_value.containers.get.return_value = container
@@ -245,6 +259,35 @@ class MailboxProvisioningServiceTests(TestCase):
 
         self.assertIn("[redacted-password]", str(context.exception))
         self.assertNotIn("secret-password", str(context.exception))
+
+    @patch("mailops.services.get_virtual_mailbox_domains", return_value={"finestar.hr"})
+    def test_assert_mail_domain_onboarded_rejects_unknown_domain(self, _domains):
+        with self.assertRaises(MailboxProvisioningError) as context:
+            assert_mail_domain_onboarded("user@stay.hr")
+        self.assertIn("virtual_mailbox_domains", str(context.exception))
+        self.assertIn("domain-onboarding", str(context.exception))
+
+    @patch(
+        "mailops.services.get_virtual_mailbox_domains",
+        return_value={"stay.hr", "example.com"},
+    )
+    @patch("mailops.services.docker.DockerClient")
+    def test_create_mailbox_account_archive_user_missing_includes_hint(self, docker_client_class, _domains):
+        container = Mock()
+        container.exec_run.side_effect = [
+            Mock(exit_code=0, output=b"added ok\n"),
+            Mock(exit_code=75, output=b"doveadm(stay@stay.hr): Error: User doesn't exist\n"),
+            Mock(exit_code=0, output=b"deleted\n"),
+        ]
+        docker_client_class.return_value.containers.get.return_value = container
+
+        with self.assertRaises(MailboxProvisioningError) as context:
+            create_mailbox_account("stay@stay.hr", "secret-password")
+
+        message = str(context.exception)
+        self.assertIn("User doesn't exist", message)
+        self.assertIn("setup email add output", message)
+        self.assertIn("domain-onboarding", message)
 
     @patch("mailops.services.docker.DockerClient")
     def test_delete_mailbox_account_executes_setup_del(self, docker_client_class):
