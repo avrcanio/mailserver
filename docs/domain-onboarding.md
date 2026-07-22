@@ -32,36 +32,38 @@ Pretpostavka: koristimo “vitalgroupsa style”, tj. `mail.<domena>` pokazuje n
 
 Mailserver koristi Let’s Encrypt cert za kanonski `MAIL_HOSTNAME` (CN) i SAN listu:
 
-- Dodaj `mail.<domena>` u `ADDITIONAL_CERT_DOMAINS` u [`.env`](/opt/stacks/mailserver/.env)
+- Dodaj `mail.<domena>` u `ADDITIONAL_CERT_DOMAINS` u lokalnom `.env` / `mailserver.env` (gitignored)
+- U `mailserver.env` (lokalni, gitignored) postavi `ADDITIONAL_CERT_DOMAINS` na **sve postojeće SAN-ove** + novi `mail.<domena>` (inače certbot `--expand` može ispustiti stare).
+- Token: `CLOUDFLARE_DNS_API_TOKEN` ili `CLOUDFLARE_DNS_API_TOKEN_FILE` (npr. Traefik allzones token).
 - Pokreni:
 
 ```bash
 cd /opt/stacks/mailserver
 ./scripts/certbot-renew.sh
-docker compose restart mailserver
+docker compose up -d --force-recreate mailserver
 ```
 
 Napomena:
-- DNS-01 preko Cloudflare zna trebati >10s. Skripta sada koristi sigurniji default (60s).
-- Ako cert pokriva više Cloudflare zona, koristi multi-zone token preko `CLOUDFLARE_DNS_API_TOKEN_FILE`.
+- DNS-01 preko Cloudflare zna trebati >10s. Skripta koristi default 60s.
+- Nakon DKIM generiranja koristi `--force-recreate` (ne samo `restart`), da `_setup_opendkim` synca KeyTable/SigningTable i ključeve u `/etc/opendkim`.
 
-### 3) Postfix: prihvati inbound domenu (virtual_mailbox_domains)
+### 3) Postfix: prihvati inbound domenu
 
-Ako domena nije u `virtual_mailbox_domains`, inbound prema toj domeni može završiti kao `Relay access denied`.
+DMS FILE provisioner automatski puni `/etc/postfix/vhost` iz mailbox accounta. Nakon prvog `email add` na novoj domeni, domena treba biti u:
 
-- Dodaj domenu u:
-  - [`docker-data/dms/config/postfix-main.cf`](/opt/stacks/mailserver/docker-data/dms/config/postfix-main.cf) → `virtual_mailbox_domains = ... <domena>`
-- Primijeni:
+```bash
+docker exec mailserver cat /etc/postfix/vhost
+```
+
+Ako domena nije na listi, inbound može završiti kao `Relay access denied` — reload/restart:
 
 ```bash
 docker exec mailserver postfix reload
-```
-
-Ako se ne reflektira odmah, restart mailserver:
-
-```bash
+# ili
 docker compose restart mailserver
 ```
+
+Napomena: ne koristimo više statički `postfix-main.cf` override za `virtual_mailbox_domains`; autoritativan je auto `vhost`.
 
 ### 4) Kreiraj mailbox(e)
 

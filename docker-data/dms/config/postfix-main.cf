@@ -1,3 +1,0 @@
-inet_protocols = ipv4
-virtual_mailbox_domains = barakags.hr dalekopro.hr finestar.hr qubitmdm.online stay.hr uzorita.hr vitalgroupsa.com sibenik1983.hr
-dms_smtpd_sender_restrictions = permit_sasl_authenticated, permit_mynetworks, check_sender_access texthash:/tmp/docker-mailserver/postfix-sender-blocklist, reject_unknown_sender_domain

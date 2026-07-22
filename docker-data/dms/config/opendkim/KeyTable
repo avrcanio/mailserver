@@ -7,3 +7,5 @@ mail._domainkey.gmail.com gmail.com:mail:/etc/opendkim/keys/gmail.com/mail.priva
 mail._domainkey.sibenik1983.hr sibenik1983.hr:mail:/etc/opendkim/keys/sibenik1983.hr/mail.private
 mail._domainkey.barakags.hr barakags.hr:mail:/etc/opendkim/keys/barakags.hr/mail.private
 mail._domainkey.stay.hr stay.hr:mail:/etc/opendkim/keys/stay.hr/mail.private
+mail._domainkey.predix.club predix.club:mail:/etc/opendkim/keys/predix.club/mail.private
+mail._domainkey.roamkit.net roamkit.net:mail:/etc/opendkim/keys/roamkit.net/mail.private

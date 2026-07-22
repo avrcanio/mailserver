@@ -3,3 +3,12 @@
 #   ./scripts/mail.sh relay add <source> <destination>
 abuse@finestar.hr avrcan@finestar.hr
 postmaster@finestar.hr avrcan@finestar.hr
+ured@barakags.hr office@barakags.hr
+dmarc@predix.club noreply@predix.club
+hello@finestar.hr avrcan@finestar.hr
+noreply@roamkit.net info@roamkit.net
+support@roamkit.net info@roamkit.net
+billing@roamkit.net info@roamkit.net
+security@roamkit.net info@roamkit.net
+hello@roamkit.net info@roamkit.net
+dmarc@roamkit.net info@roamkit.net

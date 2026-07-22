@@ -1,10 +1,17 @@
+# Local env / secrets (never commit)
 .env
 .env.local
+mailserver.env
 .codex
+.cursor/
 AGENTS.md
+
+# Firebase / Google credentials
 fs-mail-*-firebase-adminsdk-*.json
 *firebase-adminsdk*.json
 google-services*.json
+
+# Runtime secrets and cert material
 docker-data/secrets/*
 !docker-data/secrets/.gitkeep
 docker-data/certbot/secrets/*
@@ -13,29 +20,40 @@ docker-data/certbot/certs/*
 !docker-data/certbot/certs/.gitkeep
 docker-data/certbot/logs/*
 !docker-data/certbot/logs/.gitkeep
+
+# Mailbox data, state, logs
 docker-data/dms/mail-data/
 docker-data/dms/mail-state/
 docker-data/dms/mail-logs/
+
+# Account passwords / quotas / hook secrets
 docker-data/dms/config/postfix-accounts.cf
 docker-data/dms/config/postfix-accounts.cf.bak
 docker-data/dms/config/dovecot-quotas.cf
 docker-data/dms/config/fcm-hook-secret
 docker-data/dms/config/*.svbin
+
+# DKIM private keys (tables KeyTable/SigningTable are tracked)
 docker-data/dms/config/opendkim/keys/*
 !docker-data/dms/config/opendkim/keys/.gitkeep
-backups/*.tar.gz
-backups/*.sha256
-import/Todo el correo, con Spam y Papelera incluidos-002.mbox
-import/takeout-20241203T164817Z-001.zip
-uzorita.hr.txt
-mailserver.env
-dalekopro.hr.txt
-docker-data/dms/config/opendkim/KeyTable
-docker-data/dms/config/opendkim/SigningTable
+
+# DB volumes / OCR artifacts
 docker-data/blocklist-db/*
 !docker-data/blocklist-db/.gitkeep
 docker-data/blocklist-db-migration-backup/*
 !docker-data/blocklist-db-migration-backup/.gitkeep
+docker-data/receipt-artifacts/
+
+# Backups (may contain mail dumps and password files)
+backups/
+
+# Large / sensitive import dumps and CF zone exports with noise
+import/Todo el correo, con Spam y Papelera incluidos-002.mbox
+import/takeout-20241203T164817Z-001.zip
+uzorita.hr.txt
+dalekopro.hr.txt
+
+# Python / Django
 blocklist-admin/__pycache__/
 blocklist-admin/.pytest_cache/
 blocklist-admin/staticfiles/
