@@ -1,0 +1,4 @@
+# Extra deps for the mail-mcp sidecar image only.
+# Keep these out of requirements.txt so mailadmin / mailindex-sync stay unchanged.
+mcp==2.2.0
+uvicorn==0.53.0

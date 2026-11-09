@@ -46,12 +46,14 @@ class SmtpClient:
     def send_mail(self, credentials: MailboxCredentials, request: SendMailRequest):
         connection = self._require_connection()
         try:
-            message = build_email_message(credentials.email, request)
+            sender = _resolve_sender_email(credentials.email, request.from_email)
+            message = build_email_message(sender, request)
             recipients = list(request.to) + list(request.cc) + list(request.bcc)
         except (TypeError, ValueError, UnicodeError) as exc:
             raise MailProtocolError(f"Could not build SMTP message: {exc}") from exc
         try:
-            connection.send_message(message, from_addr=credentials.email, to_addrs=recipients)
+            # AUTH uses mailbox credentials; envelope/header From may be an allowed alias.
+            connection.send_message(message, from_addr=sender, to_addrs=recipients)
             self.last_sent_message = message
         except socket.timeout as exc:
             raise MailTimeoutError("Timed out sending SMTP message") from exc
@@ -83,6 +85,13 @@ class SmtpClient:
         if self.connection is None:
             raise MailConnectionError("SMTP client is not connected")
         return self.connection
+
+
+def _resolve_sender_email(credentials_email, from_email=""):
+    sender = (from_email or credentials_email or "").strip().lower()
+    if not sender:
+        raise ValueError("Sender email is required")
+    return sender
 
 
 def build_email_message(from_email, request: SendMailRequest, include_bcc=False):

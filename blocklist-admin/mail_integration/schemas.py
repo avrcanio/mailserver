@@ -194,6 +194,12 @@ class MailMessageMoveResult:
 
 
 @dataclass(frozen=True)
+class MailMessagePermanentDeleteResult:
+    deleted: tuple[str, ...] = field(default_factory=tuple)
+    failed: tuple[MailMessageMoveFailure, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class MailMessageRestoreResult:
     target_folder: str
     restored: tuple[str, ...] = field(default_factory=tuple)
@@ -225,6 +231,7 @@ class SendMailRequest:
     reply_to: str | None = None
     in_reply_to: str = ""
     references: tuple[str, ...] = field(default_factory=tuple)
+    from_email: str = ""
     from_display_name: str = ""
     attachments: tuple[SendMailAttachment, ...] = field(default_factory=tuple)
     forward_source_message: ForwardSourceMessage | None = None

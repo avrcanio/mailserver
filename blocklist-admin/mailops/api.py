@@ -116,7 +116,13 @@ from .paddleocr_receipt import (
     ReceiptOCRTimeoutError,
     run_receipt_ocr_pdf_and_text_from_image_bytes,
 )
-from .receipt_draft import ReceiptDraftService
+from .receipt_artifacts import (
+    ReceiptArtifactStorageError,
+    ReceiptImageInputError,
+    image_bytes_to_pdf,
+    persist_receipt_artifacts,
+)
+from .receipt_draft import ReceiptDraftFailedError, ReceiptDraftService, ReceiptDraftUnavailableError
 from .services import send_mail_notification
 from .translation import (
     MailTranslationEmptyError,
@@ -2097,6 +2103,70 @@ class ReceiptOcrView(APIView):
         upload = serializer.validated_data["image"]
         raw = upload.read()
         declared_type = (getattr(upload, "content_type", None) or "").split(";")[0].strip().lower()
+        backend = (getattr(settings, "RECEIPT_OCR_BACKEND", "openai") or "openai").strip().lower()
+        if backend == "paddleocr":
+            return self._process_paddleocr_receipt(request, credentials, raw, declared_type)
+        return self._process_openai_receipt(request, credentials, raw, declared_type)
+
+    def _process_openai_receipt(self, request, credentials, raw, declared_type):
+        warnings = []
+        try:
+            result = ReceiptDraftService().create_receipt_and_draft_from_image_bytes(
+                image_bytes=raw,
+                content_type=declared_type,
+            )
+        except ReceiptDraftUnavailableError as exc:
+            return Response({"error": "receipt_ocr_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except ReceiptImageInputError as exc:
+            return Response({"error": "receipt_ocr_bad_input", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ReceiptDraftFailedError as exc:
+            return Response(
+                {"error": exc.code, "detail": exc.detail},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        try:
+            pdf_bytes = image_bytes_to_pdf(raw, declared_type)
+        except ReceiptArtifactStorageError as exc:
+            return Response({"error": "receipt_pdf_unavailable", "detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        receipt_payload = result.get("receipt") or {}
+        draft = result.get("draft") or {"subject": "", "body": ""}
+        posting = result.get("posting") or {"entries": []}
+        openai_meta = {"model": result.get("model", ""), "duration_ms": result.get("duration_ms", 0)}
+
+        posting_text = _posting_block(posting)
+        if posting_text:
+            body = str(draft.get("body") or "").rstrip()
+            draft = {**draft, "body": (body + "\n\n" + posting_text + "\n") if body else posting_text + "\n"}
+        draft = {**draft, "body": _normalize_draft_body(draft.get("body", ""))}
+
+        payload = {
+            "receipt": receipt_payload,
+            "draft": draft,
+            "posting": posting,
+            "artifacts_dir": "",
+            "warnings": warnings,
+            "openai": openai_meta,
+            "backend": "openai",
+        }
+
+        try:
+            artifacts_dir = persist_receipt_artifacts(
+                account_email=credentials.email,
+                image_bytes=raw,
+                content_type=declared_type,
+                payload=payload,
+                pdf_bytes=pdf_bytes,
+            )
+            payload["artifacts_dir"] = artifacts_dir
+        except ReceiptArtifactStorageError as exc:
+            logger.warning("Receipt artifact persistence failed account=%s error=%s", credentials.email, exc)
+            warnings.append("artifact_storage_failed")
+
+        return self._receipt_multipart_response(request, credentials, payload, pdf_bytes, warnings, openai_meta, ocr_text="")
+
+    def _process_paddleocr_receipt(self, request, credentials, raw, declared_type):
         warnings = []
         openai_meta = {}
         try:
@@ -2140,22 +2210,6 @@ class ReceiptOcrView(APIView):
             draft = {**draft, "body": body}
         draft = {**draft, "body": _normalize_draft_body(draft.get("body", ""))}
 
-        if artifacts_dir:
-            try:
-                ReceiptOcrLog.objects.create(
-                    user=request.user,
-                    account_email=credentials.email,
-                    artifacts_dir=artifacts_dir,
-                    draft_subject=draft.get("subject", ""),
-                    draft_body=draft.get("body", ""),
-                    openai_model=str(openai_meta.get("model") or ""),
-                    openai_duration_ms=int(openai_meta.get("duration_ms") or 0),
-                    warnings=json.dumps(warnings, ensure_ascii=False),
-                    ocr_text_excerpt=_ocr_excerpt(ocr_text, 1000),
-                )
-            except Exception:
-                logger.warning("Failed to persist ReceiptOcrLog for artifacts_dir=%r", artifacts_dir, exc_info=True)
-
         payload = {
             "receipt": receipt_payload,
             "draft": draft,
@@ -2163,8 +2217,49 @@ class ReceiptOcrView(APIView):
             "artifacts_dir": artifacts_dir or "",
             "warnings": warnings,
             "openai": openai_meta,
+            "backend": "paddleocr",
             **({"ocr_text": ocr_text} if warnings else {}),
         }
+        return self._receipt_multipart_response(
+            request,
+            credentials,
+            payload,
+            pdf_bytes,
+            warnings,
+            openai_meta,
+            ocr_text=ocr_text,
+            artifacts_dir=artifacts_dir,
+        )
+
+    def _receipt_multipart_response(
+        self,
+        request,
+        credentials,
+        payload,
+        pdf_bytes,
+        warnings,
+        openai_meta,
+        *,
+        ocr_text="",
+        artifacts_dir=None,
+    ):
+        if artifacts_dir is None:
+            artifacts_dir = payload.get("artifacts_dir") or ""
+        if artifacts_dir:
+            try:
+                ReceiptOcrLog.objects.create(
+                    user=request.user,
+                    account_email=credentials.email,
+                    artifacts_dir=artifacts_dir,
+                    draft_subject=(payload.get("draft") or {}).get("subject", ""),
+                    draft_body=(payload.get("draft") or {}).get("body", ""),
+                    openai_model=str(openai_meta.get("model") or ""),
+                    openai_duration_ms=int(openai_meta.get("duration_ms") or 0),
+                    warnings=json.dumps(warnings, ensure_ascii=False),
+                    ocr_text_excerpt=_ocr_excerpt(ocr_text, 1000),
+                )
+            except Exception:
+                logger.warning("Failed to persist ReceiptOcrLog for artifacts_dir=%r", artifacts_dir, exc_info=True)
 
         boundary = f"receipt_ocr_{secrets.token_urlsafe(18)}"
         json_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2182,8 +2277,7 @@ class ReceiptOcrView(APIView):
             b"--" + boundary.encode("ascii") + b"--\r\n",
         ]
         body = b"".join(parts)
-        response = HttpResponse(body, content_type=f"multipart/mixed; boundary={boundary}", status=200)
-        return response
+        return HttpResponse(body, content_type=f"multipart/mixed; boundary={boundary}", status=200)
 
 
 class NewMailHookView(APIView):

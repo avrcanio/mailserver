@@ -1,8 +1,11 @@
+import base64
 import json
 import logging
 import time
 
 from django.conf import settings
+
+from .receipt_artifacts import ReceiptImageInputError, validate_receipt_image
 
 logger = logging.getLogger("mailops.receipt_draft")
 
@@ -181,7 +184,23 @@ class ReceiptDraftUnavailableError(RuntimeError):
 
 
 class ReceiptDraftFailedError(RuntimeError):
-    pass
+    def __init__(self, code="openai_failed", detail=""):
+        super().__init__(code)
+        self.code = code
+        self.detail = detail or code
+
+
+_RECEIPT_SYSTEM_PROMPT = (
+    "You extract Croatian receipt data and draft an email for bookkeeping. "
+    "Return ONLY JSON matching the provided schema: {receipt, draft, posting}. "
+    "The receipt object must follow the R-1 schema. Use empty strings/nulls when values are missing. "
+    "Use the receipt image as the primary source and do not hallucinate. "
+    "For posting (journal entry suggestion), propose debit/credit entries for Croatian bookkeeping. "
+    "Use posting.entries[] with fields: side (debit/credit), account (string), label, amount_eur. "
+    "All amounts must be POSITIVE numbers in EUR (do not use minus). "
+    "Prefer a minimal balanced journal entry based on receipt.totals (net, tax, gross) and payment/vendor context. "
+    "If you cannot propose reliably, return posting.entries as an empty array."
+)
 
 
 def _clamp_text(value: str, max_chars: int) -> str:
@@ -196,32 +215,40 @@ class ReceiptDraftService:
         self.openai_client = openai_client
 
     def create_receipt_and_draft(self, *, ocr_text: str) -> dict:
-        client = self.openai_client or self._build_openai_client()
-        model = settings.OPENAI_RECEIPT_DRAFT_MODEL or settings.OPENAI_TRANSLATION_MODEL
         max_chars = int(getattr(settings, "OPENAI_RECEIPT_DRAFT_MAX_INPUT_CHARS", 12000) or 12000)
         payload = {
             "ocr_text": _clamp_text(ocr_text or "", max_chars),
         }
+        return self._create_receipt_and_draft(
+            user_content=json.dumps(payload, ensure_ascii=False),
+            source_label="ocr_text",
+        )
+
+    def create_receipt_and_draft_from_image_bytes(self, *, image_bytes: bytes, content_type: str) -> dict:
+        header_ct = validate_receipt_image(image_bytes, content_type)
+        encoded = base64.standard_b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{header_ct};base64,{encoded}"
+        return self._create_receipt_and_draft(
+            user_content=[
+                {
+                    "type": "input_text",
+                    "text": "Extract Croatian receipt data from this image and draft the bookkeeping email.",
+                },
+                {"type": "input_image", "image_url": data_url},
+            ],
+            source_label="image",
+        )
+
+    def _create_receipt_and_draft(self, *, user_content, source_label: str) -> dict:
+        client = self.openai_client or self._build_openai_client()
+        model = settings.OPENAI_RECEIPT_DRAFT_MODEL or settings.OPENAI_TRANSLATION_MODEL
         start = time.monotonic()
         try:
             response = client.responses.create(
                 model=model,
                 input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You extract Croatian receipt data and draft an email for bookkeeping. "
-                            "Return ONLY JSON matching the provided schema: {receipt, draft, posting}. "
-                            "The receipt object must follow the R-1 schema. Use empty strings/nulls when values are missing. "
-                            "Prefer OCR text as the primary source and do not hallucinate."
-                            "For posting (journal entry suggestion), propose debit/credit entries for Croatian bookkeeping. "
-                            "Use posting.entries[] with fields: side (debit/credit), account (string), label, amount_eur. "
-                            "All amounts must be POSITIVE numbers in EUR (do not use minus). "
-                            "Prefer a minimal balanced journal entry based on receipt.totals (net, tax, gross) and payment/vendor context. "
-                            "If you cannot propose reliably, return posting.entries as an empty array."
-                        ),
-                    },
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    {"role": "system", "content": _RECEIPT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
                 ],
                 text={
                     "format": {
@@ -233,8 +260,11 @@ class ReceiptDraftService:
                 },
             )
         except Exception as exc:
-            logger.warning("Receipt draft failed model=%s error=%s", model, exc)
-            raise ReceiptDraftFailedError("openai_failed") from exc
+            logger.warning("Receipt draft failed source=%s model=%s error=%s", source_label, model, exc)
+            detail = str(exc)
+            if "insufficient_quota" in detail:
+                raise ReceiptDraftFailedError("openai_quota_exceeded", detail) from exc
+            raise ReceiptDraftFailedError("openai_failed", detail) from exc
         duration_ms = int((time.monotonic() - start) * 1000)
         parsed = self._parse_response_json(response)
         receipt = parsed.get("receipt") if isinstance(parsed, dict) else None

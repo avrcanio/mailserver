@@ -2,8 +2,16 @@ import logging
 from dataclasses import replace
 from email import policy as email_policy
 from email.message import EmailMessage
+from pathlib import Path
 
-from .exceptions import MailAttachmentLimitError, MailForwardAttachmentNotFoundError, MailForwardAttachmentNotVisibleError
+from django.conf import settings
+
+from .exceptions import (
+    MailAttachmentLimitError,
+    MailForwardAttachmentNotFoundError,
+    MailForwardAttachmentNotVisibleError,
+    MailInvalidOperationError,
+)
 from .imap_client import ImapClient
 from .schemas import SendMailAttachment
 from .smtp_client import SmtpClient
@@ -62,6 +70,16 @@ class MailboxService:
             client.login(credentials)
             return client.fetch_message_detail(folder=folder, uid=uid)
 
+    def peek_message_detail(self, credentials, folder, uid):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.peek_message_detail(folder=folder, uid=uid)
+
+    def search_message_summaries(self, credentials, folder="INBOX", query="", since=None, limit=50):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.search_message_summaries(folder=folder, query=query, since=since, limit=limit)
+
     def set_message_read_state(self, credentials, folder, uid, read):
         with self.imap_client_factory() as client:
             client.login(credentials)
@@ -69,6 +87,11 @@ class MailboxService:
                 client.mark_message_seen(folder=folder, uid=uid)
             else:
                 client.mark_message_unseen(folder=folder, uid=uid)
+
+    def store_message_flags(self, credentials, folder, uid, add=(), remove=()):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.store_message_flags(folder=folder, uid=uid, add=add, remove=remove)
 
     def get_attachment(self, credentials, folder, uid, attachment_id):
         with self.imap_client_factory() as client:
@@ -84,6 +107,11 @@ class MailboxService:
         with self.imap_client_factory() as client:
             client.login(credentials)
             return client.move_messages_to_trash(folder=folder, uids=uids)
+
+    def permanently_delete_messages(self, credentials, folder, uids):
+        with self.imap_client_factory() as client:
+            client.login(credentials)
+            return client.permanently_delete_messages(folder=folder, uids=uids)
 
     def restore_messages_from_trash(self, credentials, folder, target_folder, uids):
         with self.imap_client_factory() as client:
@@ -106,8 +134,19 @@ class MailboxService:
 
     def prepare_send_request(self, credentials, request):
         request = self._resolve_forwarded_attachments(credentials, request)
+        request = self._normalize_from_email(credentials, request)
         _validate_attachment_limits(request.attachments)
         return request
+
+    def _normalize_from_email(self, credentials, request):
+        mailbox = (credentials.email or "").strip().lower()
+        requested = (request.from_email or "").strip().lower()
+        if not requested or requested == mailbox:
+            return replace(request, from_email=mailbox)
+        allowed = resolve_allowed_from_addresses(mailbox, postfix_virtual_path())
+        if requested not in allowed:
+            raise MailInvalidOperationError("from_not_allowed")
+        return replace(request, from_email=requested)
 
     def append_sent_copy(self, credentials, sent_message):
         if not isinstance(sent_message, EmailMessage):
@@ -147,6 +186,38 @@ class MailboxService:
                 )
             )
         return replace(request, attachments=tuple(forwarded) + tuple(request.attachments))
+
+
+def postfix_virtual_path():
+    configured = (getattr(settings, "POSTFIX_VIRTUAL_PATH", None) or "").strip()
+    if configured:
+        return Path(configured)
+    blocklist_path = Path(getattr(settings, "BLOCKLIST_CONFIG_PATH", "/app/shared-config/postfix-sender-blocklist"))
+    return blocklist_path.parent / "postfix-virtual.cf"
+
+
+def resolve_allowed_from_addresses(mailbox_email, virtual_path=None):
+    """Return mailbox email plus aliases that forward to it in postfix-virtual.cf."""
+    mailbox = (mailbox_email or "").strip().lower()
+    allowed = {mailbox} if mailbox else set()
+    path = Path(virtual_path) if virtual_path is not None else postfix_virtual_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Could not read postfix virtual map at %s", path)
+        return allowed
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        alias = parts[0].strip().lower()
+        targets = [part.strip().lower() for part in parts[1].split(",") if part.strip()]
+        if mailbox and mailbox in targets and alias:
+            allowed.add(alias)
+    return allowed
 
 
 def _validate_attachment_limits(attachments):

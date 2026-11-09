@@ -1,6 +1,6 @@
 services:
   mailserver:
-    image: ghcr.io/docker-mailserver/docker-mailserver:15.1.0
+    image: ghcr.io/docker-mailserver/docker-mailserver:17.0.0
     container_name: mailserver
     hostname: ${MAIL_HOSTNAME}
     domainname: ${MAIL_DOMAIN}
@@ -22,8 +22,8 @@ services:
       - ./docker-data/dms/mail-state:/var/mail-state
       - ./docker-data/dms/mail-logs:/var/log/mail
       - ./docker-data/dms/config:/tmp/docker-mailserver
-      - ./docker-data/dms/config/dovecot-fcm-after.sieve:/usr/lib/dovecot/sieve-global/after/90-fcm-notify.sieve
       - ./scripts/dovecot-fcm-notify.py:/usr/lib/dovecot/sieve-pipe/fcm-notify
+      - ./scripts/sieve-fake-reject-bounce.py:/usr/lib/dovecot/sieve-pipe/fake-reject-bounce
       - ./docker-data/dms/config/fcm-hook-secret:/run/secrets/fcm-hook-secret:ro
       - ./docker-data/certbot/certs:/etc/letsencrypt
       - /etc/localtime:/etc/localtime:ro
@@ -68,6 +68,10 @@ services:
       PADDLEOCR_OCRMYPDF_LANG: ${PADDLEOCR_OCRMYPDF_LANG:-hrv+eng}
       PADDLEOCR_OCRMYPDF_ARGS: ${PADDLEOCR_OCRMYPDF_ARGS:-}
       PADDLEOCR_ARTIFACT_ROOT: ${PADDLEOCR_ARTIFACT_ROOT:-}
+      RECEIPT_OCR_BACKEND: ${RECEIPT_OCR_BACKEND:-openai}
+      RECEIPT_ARTIFACT_ROOT: ${RECEIPT_ARTIFACT_ROOT:-/app/receipt-artifacts}
+      RECEIPT_ALLOWED_CONTENT_TYPES: ${RECEIPT_ALLOWED_CONTENT_TYPES:-image/jpeg,image/png,image/webp}
+      RECEIPT_MAX_IMAGE_BYTES: ${RECEIPT_MAX_IMAGE_BYTES:-12582912}
       MAILBOX_AUTO_CREATE_FROM_USER_ADMIN: ${MAILBOX_AUTO_CREATE_FROM_USER_ADMIN:-false}
       MAILBOX_AUTO_CREATE_SKIP_STAFF: ${MAILBOX_AUTO_CREATE_SKIP_STAFF:-true}
       BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
@@ -94,6 +98,7 @@ services:
     volumes:
       - ./docker-data/dms/config:/app/shared-config
       - ./docker-data/secrets/firebase-adminsdk.json:/run/secrets/firebase-adminsdk.json:ro
+      - ./docker-data/receipt-artifacts:/app/receipt-artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - default
@@ -207,6 +212,57 @@ services:
     networks:
       - default
       - postgis
+    depends_on:
+      mailserver:
+        condition: service_started
+      mailadmin:
+        condition: service_started
+    restart: unless-stopped
+
+  mail-mcp:
+    build:
+      context: ./blocklist-admin
+      dockerfile: Dockerfile.mcp
+    container_name: mailserver-mail-mcp
+    environment:
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://${BLOCKLIST_DB_USER:-mailblocklist}:${BLOCKLIST_DB_PASSWORD:-mailblocklist-dev}@postgis:5432/${BLOCKLIST_DB_NAME:-mailblocklist}
+      DJANGO_SECRET_KEY: ${MAILADMIN_SECRET_KEY:-change-me-too}
+      DJANGO_ALLOWED_HOSTS: ${MAIL_MCP_HOST:-mail-mcp.example.com},127.0.0.1,localhost,mail-mcp
+      MAILADMIN_HOST: ${MAILADMIN_HOST:-mailadmin.example.com}
+      BLOCKLIST_CONFIG_PATH: /app/shared-config/postfix-sender-blocklist
+      MAILSERVER_CONTAINER_NAME: mailserver
+      BLOCKLIST_REJECT_MESSAGE: Blocked by local policy
+      MAIL_NOTIFY_HOOK_SECRET: ${MAIL_NOTIFY_HOOK_SECRET}
+      DEVICE_REGISTRATION_SECRET: ${DEVICE_REGISTRATION_SECRET}
+      MAILBOX_CREDENTIAL_ENCRYPTION_KEY: ${MAILBOX_CREDENTIAL_ENCRYPTION_KEY}
+      MAIL_IMAP_HOST: ${MAIL_HOSTNAME}
+      MAIL_SMTP_HOST: ${MAIL_HOSTNAME}
+      MAIL_INDEX_SYNC_STALE_AFTER_SECONDS: ${MAIL_INDEX_SYNC_STALE_AFTER_SECONDS:-600}
+      MAIL_MCP_HOST: ${MAIL_MCP_HOST:-mail-mcp.example.com}
+      MAIL_MCP_MAILBOX_EMAIL: ${MAIL_MCP_MAILBOX_EMAIL}
+      MAIL_MCP_MAILBOX_PASSWORD: ${MAIL_MCP_MAILBOX_PASSWORD}
+      MAIL_MCP_TOKEN: ${MAIL_MCP_TOKEN}
+      MAIL_MCP_INDEX_USERNAME: ${MAIL_MCP_INDEX_USERNAME:-}
+      MAIL_MCP_STALE_AFTER_SECONDS: ${MAIL_MCP_STALE_AFTER_SECONDS:-1200}
+      MAIL_MCP_MAX_LIMIT: ${MAIL_MCP_MAX_LIMIT:-50}
+      MAIL_MCP_MAX_BODY_CHARS: ${MAIL_MCP_MAX_BODY_CHARS:-20000}
+    ports:
+      - "127.0.0.1:8082:8000"
+    volumes:
+      - ./docker-data/dms/config:/app/shared-config
+    networks:
+      - default
+      - postgis
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.mail-mcp.rule=Host(`${MAIL_MCP_HOST}`)
+      - traefik.http.routers.mail-mcp.entrypoints=websecure
+      - traefik.http.routers.mail-mcp.tls=true
+      - traefik.http.routers.mail-mcp.tls.certresolver=cloudflare
+      - traefik.http.services.mail-mcp.loadbalancer.server.port=8000
     depends_on:
       mailserver:
         condition: service_started

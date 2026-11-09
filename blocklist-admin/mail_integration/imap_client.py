@@ -6,6 +6,7 @@ import re
 import socket
 import ssl
 from collections import defaultdict
+from datetime import date, datetime
 from html.parser import HTMLParser
 from email.header import decode_header, make_header
 from email import policy
@@ -38,6 +39,7 @@ from .schemas import (
     MailMessageMoveFailure,
     MailMessageMoveResult,
     MailMessageMoveToTrashResult,
+    MailMessagePermanentDeleteResult,
     MailMessageRestoreResult,
     MailMessageSummary,
     MailMessageSummaryPage,
@@ -289,6 +291,40 @@ class ImapClient:
         self.mark_message_seen(folder, uid, select_folder=False)
         return replace(detail, flags=_flags_with_seen(detail.flags))
 
+    def peek_message_detail(self, folder, uid):
+        """Fetch message content without marking it \\Seen."""
+        metadata, message = self._fetch_full_message(folder, uid, readonly=True)
+        return _parse_detail_message(folder, str(uid), metadata, message)
+
+    def search_message_summaries(self, folder="INBOX", query="", since=None, limit=50):
+        """IMAP SEARCH fallback for body/non-indexed folders. Returns newest-first summaries."""
+        if limit < 1:
+            return MailMessageSummaryPage()
+        query = (query or "").strip()
+        if not query:
+            return MailMessageSummaryPage()
+        try:
+            uid_ints = self._search_uid_ints(folder, query=query, since=since)
+            selected_uid_ints = list(reversed(uid_ints[-limit:]))
+            has_more = len(uid_ints) > len(selected_uid_ints)
+            summaries = self._fetch_conversation_summaries_for_uid_ints(
+                folder, selected_uid_ints, select_folder=False
+            )
+            next_before_uid = summaries[-1].uid if has_more and summaries else None
+            return MailMessageSummaryPage(
+                messages=tuple(summaries),
+                has_more=has_more,
+                next_before_uid=next_before_uid,
+            )
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out searching IMAP folder {folder}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP search connection failure for {folder}: {exc}") from exc
+        except ValueError as exc:
+            raise MailProtocolError(f"IMAP search failed for {folder}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP search failed for {folder}") from exc
+
     def fetch_attachment(self, folder, uid, attachment_id):
         metadata, message = self._fetch_full_message(folder, uid)
         attachments = _extract_attachments(message)
@@ -309,6 +345,14 @@ class ImapClient:
         self.select_folder(folder, readonly=True)
         status, data = connection.uid("search", None, "UNDELETED")
         self._expect_ok(status, data, f"IMAP conversation search failed for {folder}")
+        return _parse_uid_list(data[0] or b"")
+
+    def _search_uid_ints(self, folder, query="", since=None):
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=True)
+        criteria = _build_imap_search_criteria(query=query, since=since)
+        status, data = connection.uid("search", None, criteria)
+        self._expect_ok(status, data, f"IMAP text search failed for {folder}")
         return _parse_uid_list(data[0] or b"")
 
     def _fetch_conversation_summaries_for_uid_ints(self, folder, uid_ints, select_folder=True):
@@ -360,6 +404,70 @@ class ImapClient:
         except imaplib.IMAP4.error as exc:
             raise MailProtocolError(f"IMAP mark unseen failed for UID {uid}") from exc
         self._expect_ok(status, data, f"IMAP mark unseen failed for UID {uid}")
+
+    def store_message_flags(self, folder, uid, add=(), remove=()):
+        """Add/remove \\Seen, \\Flagged, \\Answered via UID STORE."""
+        add_flags = _normalize_store_flags(add)
+        remove_flags = _normalize_store_flags(remove)
+        if not add_flags and not remove_flags:
+            raise MailInvalidOperationError("empty_flag_update")
+        overlap = set(add_flags) & set(remove_flags)
+        if overlap:
+            raise MailInvalidOperationError("flag_add_remove_overlap")
+        connection = self._require_connection()
+        self.select_folder(folder, readonly=False)
+        try:
+            if add_flags:
+                status, data = connection.uid("STORE", str(uid), "+FLAGS.SILENT", _imap_flags_arg(add_flags))
+                self._expect_ok(status, data, f"IMAP add flags failed for UID {uid}")
+            if remove_flags:
+                status, data = connection.uid("STORE", str(uid), "-FLAGS.SILENT", _imap_flags_arg(remove_flags))
+                self._expect_ok(status, data, f"IMAP remove flags failed for UID {uid}")
+        except socket.timeout as exc:
+            raise MailTimeoutError(f"Timed out updating IMAP flags for UID {uid}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"IMAP flag update connection failure for UID {uid}: {exc}") from exc
+        except imaplib.IMAP4.error as exc:
+            raise MailProtocolError(f"IMAP flag update failed for UID {uid}") from exc
+        return {
+            "uid": str(uid),
+            "folder": folder,
+            "added": tuple(flag.lstrip("\\") for flag in add_flags),
+            "removed": tuple(flag.lstrip("\\") for flag in remove_flags),
+        }
+
+    def permanently_delete_messages(self, folder, uids):
+        """Mark messages \\Deleted and EXPUNGE them from the folder."""
+        connection = self._require_connection()
+        normalized_uids = tuple(str(uid) for uid in uids)
+        if not normalized_uids:
+            return MailMessagePermanentDeleteResult()
+        self.select_folder(folder, readonly=False)
+        deleted = []
+        failed = []
+        for uid in normalized_uids:
+            try:
+                status, data = connection.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
+                self._expect_ok(status, data, f"IMAP permanent delete mark failed for UID {uid}")
+            except socket.timeout as exc:
+                raise MailTimeoutError(f"Timed out permanently deleting IMAP message {uid}") from exc
+            except (OSError, ssl.SSLError) as exc:
+                raise MailConnectionError(f"IMAP permanent delete connection failure for UID {uid}: {exc}") from exc
+            except (MailProtocolError, imaplib.IMAP4.error) as exc:
+                failed.append(MailMessageMoveFailure(uid=uid, error="delete_failed", detail=str(exc)))
+            else:
+                deleted.append(uid)
+        if deleted:
+            try:
+                status, data = connection.expunge()
+                self._expect_ok(status, data, f"IMAP EXPUNGE failed for folder {folder}")
+            except socket.timeout as exc:
+                raise MailTimeoutError(f"Timed out during IMAP EXPUNGE for {folder}") from exc
+            except (OSError, ssl.SSLError) as exc:
+                raise MailConnectionError(f"IMAP EXPUNGE connection failure for {folder}: {exc}") from exc
+            except imaplib.IMAP4.error as exc:
+                raise MailProtocolError(f"IMAP EXPUNGE failed for {folder}") from exc
+        return MailMessagePermanentDeleteResult(deleted=tuple(deleted), failed=tuple(failed))
 
     def _fetch_full_message(self, folder, uid, readonly=True):
         connection = self._require_connection()
@@ -1211,6 +1319,61 @@ def _metadata_value(pattern, metadata):
     if not match:
         return None
     return _safe_decode(match.group(1))
+
+
+def _build_imap_search_criteria(query="", since=None):
+    parts = ["UNDELETED"]
+    normalized_query = (query or "").strip()
+    if normalized_query:
+        parts.append(f'TEXT "{_imap_quoted_string(normalized_query)}"')
+    if since is not None:
+        parts.append(f"SINCE {_imap_since_date(since)}")
+    if len(parts) == 1:
+        return parts[0]
+    return f"({' '.join(parts)})"
+
+
+_ALLOWED_STORE_FLAGS = {
+    "seen": r"\Seen",
+    "flagged": r"\Flagged",
+    "answered": r"\Answered",
+}
+
+
+def _normalize_store_flags(flags):
+    normalized = []
+    seen = set()
+    for raw in flags or ():
+        key = str(raw or "").strip().lstrip("\\").lower()
+        if not key:
+            raise MailInvalidOperationError("empty_flag")
+        if key not in _ALLOWED_STORE_FLAGS:
+            raise MailInvalidOperationError("unsupported_flag")
+        value = _ALLOWED_STORE_FLAGS[key]
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return tuple(normalized)
+
+
+def _imap_flags_arg(flags):
+    return "(" + " ".join(flags) + ")"
+
+
+def _imap_quoted_string(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _imap_since_date(value):
+    if isinstance(value, datetime):
+        day = value.date()
+    elif isinstance(value, date):
+        day = value
+    elif isinstance(value, str):
+        day = datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    else:
+        raise ValueError(f"Unsupported SINCE date value: {value!r}")
+    return day.strftime("%d-%b-%Y")
 
 
 def _parse_uid_list(raw_uids):

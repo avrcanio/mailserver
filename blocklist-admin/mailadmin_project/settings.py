@@ -96,9 +96,6 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 MAILADMIN_HOST = os.environ.get("MAILADMIN_HOST", "mailadmin.example.com")
 BLOCKLIST_CONFIG_PATH = Path(os.environ.get("BLOCKLIST_CONFIG_PATH", "/app/shared-config/postfix-sender-blocklist"))
-POSTFIX_MAIN_CF_PATH = Path(
-    os.environ.get("POSTFIX_MAIN_CF_PATH", str(BLOCKLIST_CONFIG_PATH.parent / "postfix-main.cf"))
-)
 MAILSERVER_CONTAINER_NAME = os.environ.get("MAILSERVER_CONTAINER_NAME", "mailserver")
 PADDLEOCR_CONTAINER_NAME = (os.environ.get("PADDLEOCR_CONTAINER_NAME") or "").strip()
 PADDLEOCR_IMAGE_TO_R1_JSON = (os.environ.get("PADDLEOCR_IMAGE_TO_R1_JSON") or "").strip() or "/workspace/PaddleOCR/tools/hr_r1/image_to_r1_json.py"
@@ -115,6 +112,23 @@ PADDLEOCR_PDF_ENABLED = env_bool("PADDLEOCR_PDF_ENABLED", True)
 PADDLEOCR_OCRMYPDF_LANG = (os.environ.get("PADDLEOCR_OCRMYPDF_LANG") or "").strip() or "hrv+eng"
 PADDLEOCR_OCRMYPDF_ARGS = (os.environ.get("PADDLEOCR_OCRMYPDF_ARGS") or "").strip()
 PADDLEOCR_ARTIFACT_ROOT = (os.environ.get("PADDLEOCR_ARTIFACT_ROOT") or "").strip()
+RECEIPT_OCR_BACKEND = (os.environ.get("RECEIPT_OCR_BACKEND") or "openai").strip().lower()
+RECEIPT_ARTIFACT_ROOT = (
+    (os.environ.get("RECEIPT_ARTIFACT_ROOT") or "").strip()
+    or PADDLEOCR_ARTIFACT_ROOT
+    or "/app/receipt-artifacts"
+)
+_receipt_allowed_ct = os.environ.get(
+    "RECEIPT_ALLOWED_CONTENT_TYPES",
+    os.environ.get("PADDLEOCR_ALLOWED_CONTENT_TYPES", "image/jpeg,image/png,image/webp"),
+)
+RECEIPT_ALLOWED_CONTENT_TYPES = tuple(part.strip().lower() for part in _receipt_allowed_ct.split(",") if part.strip())
+RECEIPT_MAX_IMAGE_BYTES = int(
+    os.environ.get(
+        "RECEIPT_MAX_IMAGE_BYTES",
+        os.environ.get("PADDLEOCR_MAX_IMAGE_BYTES", str(12 * 1024 * 1024)),
+    )
+)
 MAILBOX_AUTO_CREATE_FROM_USER_ADMIN = env_bool("MAILBOX_AUTO_CREATE_FROM_USER_ADMIN", False)
 MAILBOX_AUTO_CREATE_SKIP_STAFF = env_bool("MAILBOX_AUTO_CREATE_SKIP_STAFF", True)
 BLOCKLIST_REJECT_MESSAGE = os.environ.get("BLOCKLIST_REJECT_MESSAGE", "Blocked by local policy")
@@ -179,4 +193,28 @@ SPECTACULAR_SETTINGS = {
     "DESCRIPTION": "Backend mail API for Finestar Android clients.",
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+}
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+        },
+    },
+    "loggers": {
+        "mailops": {
+            "handlers": ["console"],
+            "level": "INFO",
+        },
+        "mailops.receipt_draft": {
+            "handlers": ["console"],
+            "level": "WARNING",
+        },
+        "mailops.api": {
+            "handlers": ["console"],
+            "level": "WARNING",
+        },
+    },
 }

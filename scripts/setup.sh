@@ -10,7 +10,7 @@ DESIRED_CONFIG_PATH=
 DIR="$(pwd)"
 DMS_CONFIG='/tmp/docker-mailserver'
 IMAGE_NAME=
-DEFAULT_IMAGE_NAME='ghcr.io/docker-mailserver/docker-mailserver:15.1.0'
+DEFAULT_IMAGE_NAME='ghcr.io/docker-mailserver/docker-mailserver:17.0.0'
 INFO=
 PODMAN_ROOTLESS=false
 USE_SELINUX=
@@ -23,7 +23,7 @@ OPTIONS
   Config path, container or image adjustments
     -i IMAGE_NAME
       Docker Mailserver image name. Default:
-      ghcr.io/docker-mailserver/docker-mailserver:15.1.0
+      ghcr.io/docker-mailserver/docker-mailserver:17.0.0
 
     -c CONTAINER_NAME
       Running container name.

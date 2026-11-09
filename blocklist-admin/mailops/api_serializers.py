@@ -2,6 +2,8 @@ import json
 from email.utils import getaddresses
 
 from django.conf import settings
+
+from .receipt_artifacts import receipt_allowed_content_types, receipt_max_image_bytes
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from drf_spectacular.utils import extend_schema_field
@@ -147,12 +149,12 @@ class ReceiptOcrUploadSerializer(serializers.Serializer):
     image = serializers.FileField()
 
     def validate_image(self, value):
-        max_bytes = int(getattr(settings, "PADDLEOCR_MAX_IMAGE_BYTES", 12 * 1024 * 1024))
+        max_bytes = receipt_max_image_bytes()
         size = getattr(value, "size", None)
         if size is not None and size > max_bytes:
             raise serializers.ValidationError(f"Image must be at most {max_bytes} bytes.")
         declared = (getattr(value, "content_type", None) or "").split(";")[0].strip().lower()
-        allowed = getattr(settings, "PADDLEOCR_ALLOWED_CONTENT_TYPES", ())
+        allowed = receipt_allowed_content_types()
         if declared not in allowed:
             raise serializers.ValidationError("Unsupported or missing image content type.")
         return value

@@ -278,6 +278,8 @@ Portal je pripremljen i za kasnije sirenje prema:
 
 Interni mailbox JSON endpointi za staff korisnike dokumentirani su u [docs/mailbox-api.md](/opt/stacks/mailserver/docs/mailbox-api.md).
 
+Read/write MCP sidecar za Grok (jedan mailbox, Bearer token, index-first search + move/flags/send) dokumentiran je u [docs/mail-mcp.md](/opt/stacks/mailserver/docs/mail-mcp.md).
+
 ### OpenAI prijevod mailova
 
 Za on-demand prijevod mailova kroz Django API postavi:

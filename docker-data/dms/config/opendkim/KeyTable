@@ -9,3 +9,9 @@ mail._domainkey.barakags.hr barakags.hr:mail:/etc/opendkim/keys/barakags.hr/mail
 mail._domainkey.stay.hr stay.hr:mail:/etc/opendkim/keys/stay.hr/mail.private
 mail._domainkey.predix.club predix.club:mail:/etc/opendkim/keys/predix.club/mail.private
 mail._domainkey.roamkit.net roamkit.net:mail:/etc/opendkim/keys/roamkit.net/mail.private
+mail._domainkey.omnimsg.io omnimsg.io:mail:/etc/opendkim/keys/omnimsg.io/mail.private
+mail._domainkey.tablio.hr tablio.hr:mail:/etc/opendkim/keys/tablio.hr/mail.private
+mail._domainkey.andrijavrcan.from.hr andrijavrcan.from.hr:mail:/etc/opendkim/keys/andrijavrcan.from.hr/mail.private
+mail._domainkey.antevrcan.from.hr antevrcan.from.hr:mail:/etc/opendkim/keys/antevrcan.from.hr/mail.private
+mail._domainkey.aurosys.de aurosys.de:mail:/etc/opendkim/keys/aurosys.de/mail.private
+mail._domainkey.quede.se quede.se:mail:/etc/opendkim/keys/quede.se/mail.private

@@ -417,6 +417,98 @@ class ImapClientTests(SimpleTestCase):
         connection.uid.assert_any_call("search", None, "UNSEEN")
         connection.uid.assert_any_call("search", None, "FLAGGED")
 
+    def test_search_message_summaries_builds_text_and_since_criteria(self):
+        from datetime import date
+
+        from mail_integration.imap_client import _build_imap_search_criteria
+
+        self.assertEqual(
+            _build_imap_search_criteria(query='acme "quote"', since=date(2026, 1, 15)),
+            '(UNDELETED TEXT "acme \\"quote\\"" SINCE 15-Jan-2026)',
+        )
+
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [
+            ("OK", [b"10 11 12"]),
+            ("OK", [(b"12 (UID 12 FLAGS () RFC822.SIZE 20 BODY[HEADER.FIELDS ...] {20}", b"Subject: 12\r\n\r\n")]),
+            ("OK", [(b"11 (UID 11 FLAGS () RFC822.SIZE 10 BODY[HEADER.FIELDS ...] {20}", b"Subject: 11\r\n\r\n")]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            page = ImapClient().connect().search_message_summaries(
+                folder="INBOX", query="invoice", since=date(2026, 3, 1), limit=2
+            )
+
+        self.assertEqual([summary.uid for summary in page.messages], ["12", "11"])
+        self.assertTrue(page.has_more)
+        connection.uid.assert_any_call("search", None, '(UNDELETED TEXT "invoice" SINCE 01-Mar-2026)')
+
+    def test_peek_message_detail_does_not_mark_seen(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        raw = (
+            b"From: a@example.com\r\n"
+            b"To: b@example.com\r\n"
+            b"Subject: Peek\r\n"
+            b"Message-ID: <peek@example.com>\r\n"
+            b"Date: Wed, 15 Apr 2026 12:00:00 +0000\r\n"
+            b"\r\n"
+            b"hello body\r\n"
+        )
+        connection.uid.side_effect = [
+            ("OK", [(b"42 (UID 42 FLAGS (\\Seen) RFC822.SIZE %d RFC822 {%d}" % (len(raw), len(raw)), raw)]),
+        ]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            detail = ImapClient().connect().peek_message_detail(folder="INBOX", uid="42")
+
+        self.assertEqual(detail.subject, "Peek")
+        self.assertIn("hello body", detail.text_body)
+        store_calls = [call for call in connection.uid.call_args_list if call.args and call.args[0] == "STORE"]
+        self.assertEqual(store_calls, [])
+
+    def test_store_message_flags_adds_and_removes_whitelisted_flags(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"1"])
+        connection.uid.side_effect = [("OK", [b""]), ("OK", [b""])]
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            result = (
+                ImapClient()
+                .connect()
+                .store_message_flags(folder="INBOX", uid="9", add=["Flagged", "Seen"], remove=["Answered"])
+            )
+
+        self.assertEqual(result["added"], ("Flagged", "Seen"))
+        self.assertEqual(result["removed"], ("Answered",))
+        connection.uid.assert_any_call("STORE", "9", "+FLAGS.SILENT", r"(\Flagged \Seen)")
+        connection.uid.assert_any_call("STORE", "9", "-FLAGS.SILENT", r"(\Answered)")
+
+    def test_store_message_flags_rejects_unsupported_flag(self):
+        from mail_integration.exceptions import MailInvalidOperationError
+
+        connection = Mock()
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            client = ImapClient().connect()
+            with self.assertRaises(MailInvalidOperationError):
+                client.store_message_flags(folder="INBOX", uid="9", add=["Deleted"])
+
+    def test_permanently_delete_messages_marks_deleted_then_expunges(self):
+        connection = Mock()
+        connection.select.return_value = ("OK", [b"2"])
+        connection.uid.side_effect = [("OK", [b""]), ("OK", [b""])]
+        connection.expunge.return_value = ("OK", [b""])
+
+        with patch("mail_integration.imap_client.imaplib.IMAP4_SSL", return_value=connection):
+            result = ImapClient().connect().permanently_delete_messages("Trash", ("11", "12"))
+
+        self.assertEqual(result.deleted, ("11", "12"))
+        self.assertEqual(result.failed, ())
+        connection.uid.assert_any_call("STORE", "11", "+FLAGS.SILENT", r"(\Deleted)")
+        connection.uid.assert_any_call("STORE", "12", "+FLAGS.SILENT", r"(\Deleted)")
+        connection.expunge.assert_called_once_with()
+
     def test_fetch_message_summary_page_uses_before_uid_cursor(self):
         connection = Mock()
         connection.select.return_value = ("OK", [b"5"])
@@ -1408,6 +1500,80 @@ class SmtpClientTests(SimpleTestCase):
         self.assertEqual([attachment.get_filename() for attachment in attachments], ["report.txt", "data.bin"])
         self.assertEqual(attachments[0].get_content(), "report content")
         self.assertEqual(attachments[1].get_payload(decode=True), b"\x00\x01")
+
+    def test_send_uses_from_email_override_for_header_and_envelope(self):
+        connection = Mock()
+
+        with patch("mail_integration.smtp_client.smtplib.SMTP", return_value=connection):
+            SmtpClient().connect().send_mail(
+                MailboxCredentials("avrcan@finestar.hr", "secret"),
+                SendMailRequest(
+                    to=("to@example.com",),
+                    subject="Alias from",
+                    text_body="Body",
+                    from_email="accounting@finestar.hr",
+                    from_display_name="Accounting",
+                ),
+            )
+
+        sent_message = connection.send_message.call_args.args[0]
+        self.assertIn("accounting@finestar.hr", str(sent_message["From"]))
+        self.assertEqual(connection.send_message.call_args.kwargs["from_addr"], "accounting@finestar.hr")
+
+    def test_resolve_allowed_from_addresses_includes_virtual_aliases(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from mail_integration.mailbox_service import resolve_allowed_from_addresses
+
+        with TemporaryDirectory() as tmp:
+            virtual = Path(tmp) / "postfix-virtual.cf"
+            virtual.write_text(
+                "# comment\n"
+                "accounting@finestar.hr avrcan@finestar.hr\n"
+                "hello@finestar.hr avrcan@finestar.hr\n"
+                "other@finestar.hr someone@finestar.hr\n",
+                encoding="utf-8",
+            )
+            allowed = resolve_allowed_from_addresses("avrcan@finestar.hr", virtual)
+        self.assertEqual(
+            allowed,
+            {"avrcan@finestar.hr", "accounting@finestar.hr", "hello@finestar.hr"},
+        )
+
+    def test_prepare_send_request_rejects_disallowed_from(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from mail_integration.exceptions import MailInvalidOperationError
+        from mail_integration.mailbox_service import MailboxService
+
+        with TemporaryDirectory() as tmp:
+            virtual = Path(tmp) / "postfix-virtual.cf"
+            virtual.write_text("accounting@finestar.hr avrcan@finestar.hr\n", encoding="utf-8")
+            service = MailboxService()
+            with patch("mail_integration.mailbox_service.postfix_virtual_path", return_value=virtual):
+                with self.assertRaises(MailInvalidOperationError):
+                    service.prepare_send_request(
+                        MailboxCredentials("avrcan@finestar.hr", "secret"),
+                        SendMailRequest(
+                            to=("to@example.com",),
+                            subject="Nope",
+                            text_body="Body",
+                            from_email="spoof@evil.example",
+                        ),
+                    )
+                normalized = service.prepare_send_request(
+                    MailboxCredentials("avrcan@finestar.hr", "secret"),
+                    SendMailRequest(
+                        to=("to@example.com",),
+                        subject="Ok",
+                        text_body="Body",
+                        from_email="accounting@finestar.hr",
+                    ),
+                )
+        self.assertEqual(normalized.from_email, "accounting@finestar.hr")
 
     def test_smtp_errors_are_normalized(self):
         with patch("mail_integration.smtp_client.smtplib.SMTP", side_effect=socket.timeout):

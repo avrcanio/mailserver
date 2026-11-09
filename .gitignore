@@ -54,6 +54,7 @@ uzorita.hr.txt
 dalekopro.hr.txt
 
 # Python / Django
-blocklist-admin/__pycache__/
+**/__pycache__/
+*.py[cod]
 blocklist-admin/.pytest_cache/
 blocklist-admin/staticfiles/
